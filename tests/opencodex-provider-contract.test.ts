@@ -28,19 +28,26 @@ function providerUrl(baseUrl: string, responsesPath?: string): string {
 }
 
 /**
- * Mirror the two OpenCodex request sanitizers this bridge depends on at the non-canonical
- * openai-responses boundary: private ChatGPT item metadata is removed, and store:false removes
- * all item ids. client_metadata is deliberately preserved and remains the native turn authority.
+ * Mirror the OpenCodex request sanitizers this bridge depends on at the non-canonical
+ * openai-responses boundary (minimum supported OpenCodex: 2.57.0; latest end-to-end
+ * verified: 2.58.0): top-level access_programs is removed for non-OpenAI-operated
+ * destinations, private ChatGPT item metadata is removed, and store:false removes all item
+ * ids. client_metadata is deliberately preserved and remains the native turn authority.
+ *
+ * This is a narrow behavioral simulation of the OpenCodex routing contract, not code
+ * imported from OpenCodex itself.
  */
 function openCodexRoutedBody(body: Record<string, unknown>): Record<string, unknown> {
-  const input = Array.isArray(body.input) ? body.input : [];
+  const { access_programs: _droppedAccessPrograms, ...rest } = body;
+  void _droppedAccessPrograms;
+  const input = Array.isArray(rest.input) ? rest.input : [];
   return {
-    ...body,
+    ...rest,
     input: input.map(value => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return value;
       const item = { ...(value as Record<string, unknown>) };
       delete item.internal_chat_message_metadata_passthrough;
-      if (body.store === false) delete item.id;
+      if (rest.store === false) delete item.id;
       return item;
     }),
   };
@@ -70,6 +77,9 @@ test("OpenCodex store:false sanitization preserves current-turn authority in cli
     model: "chatgpt-web/high",
     store: false,
     stream: true,
+    // Harmless synthetic field standing in for a native-style access_programs block:
+    // OpenCodex 2.58 removes it for non-OpenAI-operated destinations before it reaches us.
+    access_programs: [{ type: "synthetic-test-access", server: "synthetic-test-server" }],
     client_metadata: {
       "x-codex-turn-metadata": JSON.stringify(metadata),
     },
@@ -95,6 +105,7 @@ test("OpenCodex store:false sanitization preserves current-turn authority in cli
   const routedInput = routed.input as Array<Record<string, unknown>>;
   expect(routedInput.every(item => item.id === undefined)).toBe(true);
   expect(routedInput.every(item => item.internal_chat_message_metadata_passthrough === undefined)).toBe(true);
+  expect("access_programs" in routed).toBe(false);
   expect(routed.client_metadata).toEqual(original.client_metadata);
 
   const parsed = parseRequest(routed);

@@ -88,7 +88,9 @@ automatic route takeover.
 
 ## OpenCodex registration
 
-Verified against OpenCodex `2.57.0` / `main@44de45dfdc33d30af22502d2bed98014fe16d83b`.
+Minimum supported OpenCodex version: `2.57.0` (`main@44de45dfdc33d30af22502d2bed98014fe16d83b`).
+Latest end-to-end verified version: OpenCodex `2.58.0`
+(`6fe4cd0de85d63b8cdd0c3552e5e8883c0a029ee`).
 The `openai-responses` adapter posts to `{baseUrl}/v1/responses` unless `responsesPath` is set, so
 `baseUrl` may be either `http://127.0.0.1:17841` or `http://127.0.0.1:17841/v1`; OpenCodex
 normalizes both to the same Responses endpoint.
@@ -102,9 +104,19 @@ ocx provider add chatgpt-web \
   --allow-private-network
 ```
 
-Custom providers use live model discovery unless it is explicitly disabled, so once this bridge is
-running OpenCodex can read its `/v1/models` catalog. The bridge itself does not require an API key;
+On `provider add`, `--allow-private-network` is a bare boolean flag (there is no
+`--allow-private-network on` spelling), and there is no `--live-models` flag: absent
+`liveModels` already means live model discovery is enabled, so once this bridge is running
+OpenCodex can read its `/v1/models` catalog. The `on|off` spellings
+(`--allow-private-network <on|off>`, `--live-models <on|off>`) belong to
+`ocx provider edit`. Flag spellings are version-sensitive and describe OpenCodex 2.58; recheck
+them when moving to a newer OpenCodex. The bridge itself does not require an API key;
 ChatGPT authentication stays in the browser session owned by this process.
+
+`ocx provider add` persists the provider to the OpenCodex configuration but does not adopt it
+into an already-running OpenCodex process. After registering, restart OpenCodex (`ocx restart`)
+so the running process picks up the new provider, then refresh the Codex model catalog
+(`ocx sync`) and select a `chatgpt-web/...` model.
 
 OpenCodex stores its persistent configuration in `$OPENCODEX_HOME/config.json` (normally
 `~/.opencodex/config.json`, or `%USERPROFILE%\.opencodex\config.json` on Windows). An equivalent
@@ -116,14 +128,15 @@ provider object is:
     "chatgpt-web": {
       "adapter": "openai-responses",
       "baseUrl": "http://127.0.0.1:17841/v1",
-      "allowPrivateNetwork": true,
-      "liveModels": true
+      "allowPrivateNetwork": true
     }
   }
 }
 ```
 
-Merge that provider entry into the existing config rather than replacing the whole file.
+Merge that provider entry into the existing config rather than replacing the whole file. The same
+restart-then-sync note above applies when editing the config file by hand: a hand-edited provider
+is picked up on restart, not by the already-running process.
 
 Keep Codex pointed at OpenCodex. Do not point Codex `openai_base_url` at this bridge, and do not
 point this bridge at OpenCodex. Unknown models return an explicit error instead of falling back to
@@ -131,10 +144,11 @@ official Codex or another OpenCodex route.
 
 ## Wire compatibility contract
 
-For a non-canonical `openai-responses` destination, current OpenCodex intentionally removes
-`internal_chat_message_metadata_passthrough` from input items. When the request has `store: false`,
-it also removes every `input[*].id`, because those IDs would otherwise be interpreted as references
-to stored upstream items.
+For a non-canonical `openai-responses` destination such as this bridge, OpenCodex 2.58 removes
+top-level `access_programs` (destination-sensitive removal for non-OpenAI-operated destinations)
+and `internal_chat_message_metadata_passthrough` from input items. When the request has
+`store: false`, it also removes every `input[*].id`, because those IDs would otherwise be
+interpreted as references to stored upstream items.
 
 Current Codex also places its turn metadata in
 `client_metadata["x-codex-turn-metadata"]`. OpenCodex preserves that body metadata when routing to
@@ -143,8 +157,31 @@ before accepting a stripped OpenCodex request, and recovers the current instruct
 only when the remaining request structure is consistent with it. Arbitrary user-authored
 environment XML is never sufficient authority on its own.
 
+Compaction through this provider class is a routed summarizer over the normal `/v1/responses`
+endpoint: OpenCodex converts the summary back to the compaction form Codex expects. The bridge
+still exposes `/v1/responses/compact` as its own canonical endpoint contract (used by Direct
+mode and the dev harness), but a normal `chatgpt-web` OpenCodex route does not send compaction
+there.
+
+The OpenCodex-routed catalog may project a gateway ingestion capability (`supports_tool_use`) on
+these rows even though the bridge catalog itself reports `supports_tools: false`. That projection
+describes OpenCodex-side ingestion, not local Codex tool execution: browser-only turns have no
+access to the local Codex computer, and the bridge says so explicitly in its turn commentary
+rather than executing anything locally.
+
 This contract is covered by compatibility tests so changes in either OpenCodex's request
 sanitization or Codex's turn metadata shape fail visibly during an upstream sync.
+
+## Verified end-to-end status
+
+- Phase A (bridge to real ChatGPT Web inference): PASS.
+- Phase B (real OpenCodex 2.58 to bridge to ChatGPT Web): PASS.
+- Phase C (real Codex CLI to OpenCodex 2.58 to bridge to ChatGPT Web High, with the response
+  returned to real Codex): PASS. The real Codex to OpenCodex to ChatGPT Web core path is proven.
+
+Verification ran on Windows with a headed browser. Windows headless authenticated composer parity
+is not established and is outside the scope of this release; do not treat headless Windows as a
+verified target.
 
 ## Recovery
 
