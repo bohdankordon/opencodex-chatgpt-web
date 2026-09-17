@@ -58,6 +58,8 @@ import {
   CHATGPT_TEMPORARY_CHAT_URL,
   CHATGPT_USER_TURN_SELECTOR,
   activateChatGptEffortMenu,
+  chatGptComposer,
+  chatGptComposerWithin,
   detectChatGptAccountCapabilities,
   parseChatGptEffortSliderState,
 } from "../../chatgpt-session";
@@ -1330,7 +1332,7 @@ export async function setChatGptThinkMode(
   }
   const target = enabled ? "true" : "false";
   if (pressed !== target) {
-    const composer = composerForm.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();
+    const composer = chatGptComposerWithin(composerForm).filter({ visible: true }).first();
     const composerState = () => composer.evaluate(element => {
       const copy = element.cloneNode(true) as HTMLElement;
       const pills = [...copy.querySelectorAll('[data-id^="plugin:"][data-keyword]')];
@@ -2507,7 +2509,7 @@ export class ChatGptBrowserWorker {
     timeoutMs = 30_000,
     abortSignal?: AbortSignal,
   ): Promise<Locator> {
-    const composers = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });
+    const composers = chatGptComposer(page).filter({ visible: true });
     const deadline = Date.now() + timeoutMs;
     let count = 0;
     while (Date.now() < deadline) {

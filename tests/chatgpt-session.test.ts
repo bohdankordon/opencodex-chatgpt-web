@@ -170,6 +170,7 @@ test("a complete authenticated composer with no effort selector is Luna-only", a
     locator: () => composerForm,
   };
   const page = {
+    getByRole: () => ({ or: (other: unknown) => other }),
     locator: () => composer,
     evaluate: async () => true,
   };
@@ -200,6 +201,7 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
     locator: () => composerForm,
   };
   const page = {
+    getByRole: () => ({ or: (other: unknown) => other }),
     locator: () => composers,
     evaluate: async () => true,
   };
@@ -247,6 +249,7 @@ function reasoningPicker(options: { max?: string; delay?: number; missing?: bool
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
   const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
   const page = {
+    getByRole: () => ({ or: (other: unknown) => other }),
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
       if (selector === CHATGPT_EFFORT_MENU_SELECTOR) return menu;

@@ -7,6 +7,29 @@ export const CHATGPT_COMPOSER_SELECTOR = [
   "#prompt-textarea",
   '[contenteditable="true"][data-lexical-editor="true"]',
 ].join(", ");
+export const CHATGPT_COMPOSER_ACCESSIBLE_NAME = "Chat with ChatGPT";
+
+/**
+ * Shared ChatGPT composer discovery contract.
+ *
+ * The current ChatGPT surface exposes the composer semantically as a textbox
+ * named "Chat with ChatGPT", while older surfaces expose only the legacy
+ * structural CSS hooks. Both resolve to the same logical composer. The
+ * semantic branch is bound to the exact known composer name so an unrelated
+ * textbox (for example Search) never authenticates.
+ */
+export function chatGptComposer(page: Page): Locator {
+  return page.getByRole("textbox", { name: CHATGPT_COMPOSER_ACCESSIBLE_NAME }).or(
+    page.locator(CHATGPT_COMPOSER_SELECTOR),
+  );
+}
+
+/** Scoped variant for composer lookups that start from a known ancestor. */
+export function chatGptComposerWithin(scope: Locator): Locator {
+  return scope.getByRole("textbox", { name: CHATGPT_COMPOSER_ACCESSIBLE_NAME }).or(
+    scope.locator(CHATGPT_COMPOSER_SELECTOR),
+  );
+}
 export const CHATGPT_EFFORT_CONTROL_SELECTOR = [
   'button[aria-haspopup="menu"][data-tone="neutral"]',
   'button[data-testid="model-switcher-dropdown-button"][aria-haspopup="menu"]',
@@ -160,9 +183,7 @@ async function anyVisible(locator: Locator): Promise<boolean> {
 }
 
 export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
-  const composer = page.locator(
-    CHATGPT_COMPOSER_SELECTOR,
-  );
+  const composer = chatGptComposer(page);
   if (!await anyVisible(composer)) {
     throw new Error("ChatGPT authentication could not be verified: no visible composer is present");
   }
@@ -180,7 +201,7 @@ export async function detectChatGptAccountCapabilities(
   page: Page,
   options: { selectorTimeoutMs?: number; stableAbsenceMs?: number } = {},
 ): Promise<ChatGptWebAccountCapabilities & { extraHighAvailable: boolean }> {
-  const composers = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true });
+  const composers = chatGptComposer(page).filter({ visible: true });
   const composer = composers.last();
   const composerForm = composer.locator("xpath=ancestor::form[1]");
   const effortButton = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).last();

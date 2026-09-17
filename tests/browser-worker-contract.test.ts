@@ -1038,6 +1038,7 @@ test("active composer resolution waits for exactly one visible editor", async ()
     first: () => composer,
   };
   const page = {
+    getByRole: () => ({ or: (other: unknown) => other }),
     locator: () => ({
       filter: (options: { visible: boolean }) => {
         expect(options).toEqual({ visible: true });
@@ -2337,7 +2338,13 @@ function thinkSlashFixture() {
       }
     },
   };
-  const composerForm = { getByRole: () => ({ filter: () => controls }), locator: () => composer, page: () => page };
+  const composerForm = {
+    getByRole: (role: string) => role === "textbox"
+      ? { or: (other: unknown) => other }
+      : { filter: () => controls },
+    locator: () => composer,
+    page: () => page,
+  };
   return { state, composer, composerForm, page };
 }
 
