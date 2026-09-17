@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
-import type { AppConfig } from "./config";
-import { getConfigPath, loadConfig, saveConfig } from "./config";
+import type { AppConfig, IntegrationMode } from "./config";
+import { getConfigPath, isExternalProviderMode, loadConfig, readPersistedIntegrationMode, saveConfig } from "./config";
 import { installCodexInterruptHook, installCodexInterruptHookCommand } from "./codex-interrupt-hook";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
@@ -99,6 +99,59 @@ function journalProtocol(journal: Exclude<AnyCodexIntegrationJournal, { version:
     : "native";
 }
 
+/**
+ * All Codex route mutations pass through this boundary. The external-provider mode intentionally
+ * fails closed: a missing or stale external router is an operational problem, not permission for
+ * this process to take ownership of the user's Codex configuration.
+ */
+function configuredIntegrationMode(): IntegrationMode {
+  // Ownership guards intentionally parse only the ownership fields. Full runtime validation may
+  // reject an otherwise usable Direct config for unrelated reasons (for example a missing tunnel),
+  // while malformed ownership itself must still fail closed.
+  return readPersistedIntegrationMode();
+}
+
+export function assertDirectCodexIntegration(
+  config?: Pick<AppConfig, "integrationMode"> | { integrationMode?: unknown; codexIntegrationMode?: unknown },
+): void {
+  if (isExternalProviderMode(config ?? { integrationMode: configuredIntegrationMode() })) {
+    throw new Error(
+      "Codex routing is managed by an external provider in external-provider mode; "
+      + "route connect, disconnect, install, and restore are disabled",
+    );
+  }
+}
+
+/**
+ * Switching ownership is not permission to silently restore or replace a Codex route. A previous
+ * Direct installation must already have released its managed route before external-provider setup
+ * can persist the new ownership mode. The raw direct URL check also catches an unjournaled manual
+ * route that still points Codex straight at this bridge.
+ */
+export function assertExternalProviderCodexRouteReleased(config: AppConfig): void {
+  if (!isExternalProviderMode(config)) return;
+  const status = inspectCodexIntegration();
+  if (status.errors.length > 0) {
+    throw new Error(
+      "Existing codex-chatgpt-web Direct integration is inconsistent; repair or disconnect it in Direct mode before switching to external-provider",
+    );
+  }
+  if (status.installed && status.active) {
+    throw new Error(
+      "Existing codex-chatgpt-web Direct route is still active; run `codex-chatgpt-web route disconnect` before switching to external-provider mode",
+    );
+  }
+  const configPath = getCodexConfigPath();
+  if (!existsSync(configPath)) return;
+  const directUrl = routeUrl(config).replace(/\/+$/, "");
+  const configuredUrl = findTopLevelAssignment(splitLines(readFileSync(configPath, "utf8")), "openai_base_url").value;
+  if (typeof configuredUrl === "string" && configuredUrl.replace(/\/+$/, "") === directUrl) {
+    throw new Error(
+      "Codex still points directly at codex-chatgpt-web; point Codex at OpenCodex before switching to external-provider mode",
+    );
+  }
+}
+
 export {
   getCodexConfigPath,
   getCodexHome,
@@ -128,6 +181,7 @@ export function setCodexSubagentProtocol(
   config: AppConfig,
   protocol: AppConfig["subagentProtocol"],
 ): CodexIntegrationJournal {
+  assertDirectCodexIntegration(config);
   const status = inspectCodexIntegration();
   if (!status.installed) throw new Error("Codex integration is not installed; run setup first");
   if (!status.active) {
@@ -170,6 +224,7 @@ export function preflightCodexIntegration(
   config: AppConfig,
   options: InstallCodexIntegrationOptions = {},
 ): void {
+  assertDirectCodexIntegration(config);
   const configPath = getCodexConfigPath();
   const configSnapshot = snapshotFile(configPath, { followSymlink: true });
   const configExists = configSnapshot.exists;
@@ -226,10 +281,12 @@ export function preflightCodexIntegration(
     options.replaceExistingRoute === true,
   );
 }
+
 export function installCodexIntegration(
   config: AppConfig,
   options: InstallCodexIntegrationOptions = {},
 ): CodexIntegrationJournal {
+  assertDirectCodexIntegration(config);
   const configPath = getCodexConfigPath();
   mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
   const configExists = existsSync(configPath);
@@ -342,6 +399,7 @@ export function installCodexIntegration(
 }
 
 export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
+  assertDirectCodexIntegration();
   const existing = readJournal();
   if (!existing) return { changed: false, active: false };
   if (existing.version === 2) {
@@ -371,6 +429,7 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
 }
 
 export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
+  assertDirectCodexIntegration();
   const existing = readJournal();
   if (!existing) throw new Error("Codex integration is not installed");
   if (existing.version === 2) {
@@ -437,7 +496,12 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
   return { changed: true, active: true };
 }
 
-export function uninstallCodexIntegration(): UninstallCodexIntegrationResult {
+export function uninstallCodexIntegration(
+  config?: Pick<AppConfig, "integrationMode"> | { integrationMode?: unknown; codexIntegrationMode?: unknown },
+): UninstallCodexIntegrationResult {
+  if (isExternalProviderMode(config ?? { integrationMode: configuredIntegrationMode() })) {
+    return { changed: false };
+  }
   const journal = readJournal();
   if (!journal) return { changed: false };
   if (!existsSync(journal.configPath)) throw new Error(`Codex config is missing: ${journal.configPath}`);

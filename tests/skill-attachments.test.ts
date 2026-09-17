@@ -44,6 +44,16 @@ test("only native selected-skill provenance enables attachment transport; defaul
   }
 });
 
+test("external-provider transport trust does not synthesize selected-skill provenance", () => {
+  const skill = text();
+  const parsed = parse([{ role: "user", content: [{ type: "input_text", text: skill }] }]);
+  parsed._externalProviderTrusted = true;
+  expect((parsed.context.messages.at(-1) as { origin?: unknown } | undefined)?.origin).toBeUndefined();
+  const compiled = compileChatGptWebPrompt(parsed, capabilities, token, { experimentalSkillAttachments: true });
+  expect(compiled.skillFiles).toBeUndefined();
+  expect(compiled.text).toContain("Read references/checks.md");
+});
+
 test("files preserve resource authority and distinguish same-named versions without a persistent cache", () => {
   const first = text("../plugin:test", '<resource_access>{"main_resource":"skill://test","package":"plugin"}</resource_access>\nfirst');
   const changed = first.replace("\nfirst", "\nsecond");
