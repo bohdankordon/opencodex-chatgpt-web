@@ -55,6 +55,17 @@ function runChecked(command, args) {
   }
 }
 
+function envFlagEnabled(value) {
+  return typeof value === "string" && ["1", "true", "yes", "y", "on"].includes(value.trim().toLowerCase());
+}
+
+function shouldVerifyMacCodeSignature() {
+  const unsignedPullRequestBuild = env.GITHUB_ACTIONS === "true"
+    && env.GITHUB_EVENT_NAME === "pull_request"
+    && !envFlagEnabled(env.CSC_FOR_PULL_REQUEST);
+  return !unsignedPullRequestBuild;
+}
+
 function verifySignedMacArchive() {
   const archives = fs.readdirSync(staging)
     .filter(name => /-mac-(?:arm64|x64)\.zip$/.test(name));
@@ -65,7 +76,11 @@ function verifySignedMacArchive() {
   try {
     runChecked("ditto", ["-x", "-k", path.join(staging, archives[0]), verificationRoot]);
     const appBundle = path.join(verificationRoot, `${launcherManifest.build.productName}.app`);
-    runChecked("codesign", ["--verify", "--deep", "--strict", appBundle]);
+    if (shouldVerifyMacCodeSignature()) {
+      runChecked("codesign", ["--verify", "--deep", "--strict", appBundle]);
+    } else {
+      console.log("Skipping macOS code-signature verification because electron-builder does not sign pull-request builds.");
+    }
     validateRuntimeBundle(path.join(appBundle, "Contents", "Resources", "runtime"), {
       version: launcherManifest.version,
       platform: "darwin",

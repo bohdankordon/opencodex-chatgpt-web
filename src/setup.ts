@@ -2,12 +2,13 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
-import type { AppConfig, BrowserInteractionMode, RuntimeMode, SubagentProtocol } from "./config";
+import type { AppConfig, BrowserInteractionMode, IntegrationMode, RuntimeMode, SubagentProtocol } from "./config";
 import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
   defaultConfig,
   getConfigPath,
+  isExternalProviderMode,
   loadConfigForSetup,
   resolveInteractionConnectorIdentities,
   saveConfig,
@@ -20,6 +21,8 @@ import {
   storedBrowserLoginCapabilities,
 } from "./browser-login";
 import {
+  assertExternalProviderCodexRouteReleased,
+  commitExternalProviderOwnershipHandoff,
   installCodexIntegration,
   preflightCodexIntegration,
   readCodexSubagentProtocol,
@@ -44,6 +47,7 @@ import { VERSION } from "./version";
 
 export interface SetupOptions {
   mode: RuntimeMode;
+  integrationMode?: IntegrationMode;
   browserInteractionMode?: BrowserInteractionMode;
   subagentProtocol?: SubagentProtocol;
   port?: number;
@@ -69,8 +73,30 @@ export interface SetupResult {
   loginCreated: boolean;
   serviceLoaded: boolean;
   tunnelReady: boolean | null;
-  codexRestartRequired: true;
+  codexRestartRequired: boolean;
   connectorSetupRequired: boolean;
+  integrationMode: IntegrationMode;
+}
+
+export function formatSetupReport(result: SetupResult): string {
+  const lines = [
+    `Setup complete: ${result.mode}`,
+    `Config: ${result.configPath}`,
+    `Integration mode: ${result.integrationMode}`,
+  ];
+  if (result.integrationMode === "external-provider") {
+    lines.push("Codex routing was not changed; register this loopback /v1 provider in OpenCodex.");
+  }
+  if (result.connectorSetupRequired) {
+    lines.push("One account-level step remains: attach the tunnel to the ChatGPT connector named in config.");
+    lines.push("Open: https://chatgpt.com/#settings/Plugins");
+  }
+  if (result.codexRestartRequired) {
+    lines.push("Restart the Codex app once so its native model catalog refreshes through the installed route.");
+  } else if (result.integrationMode === "external-provider") {
+    lines.push("Keep Codex pointed at OpenCodex, then choose a ChatGPT Web model from that provider.");
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 interface PreparedSetup {
@@ -126,6 +152,7 @@ function loadExistingConfig(): AppConfig | undefined {
 function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
   return JSON.stringify({
     mode: before.mode,
+    integrationMode: before.integrationMode,
     subagentProtocol: before.subagentProtocol,
     releaseVersion: before.releaseVersion,
     host: before.host,
@@ -155,6 +182,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     manualTunnel: before.manualTunnel,
   }) !== JSON.stringify({
     mode: after.mode,
+    integrationMode: after.integrationMode,
     subagentProtocol: after.subagentProtocol,
     releaseVersion: after.releaseVersion,
     host: after.host,
@@ -205,12 +233,13 @@ async function assertPortAvailable(host: string, port: number): Promise<void> {
 
 export function setupProxyIsReady(
   health: Record<string, unknown>,
-  config: Pick<AppConfig, "mode" | "releaseVersion">,
+  config: Pick<AppConfig, "mode" | "releaseVersion"> & Partial<Pick<AppConfig, "integrationMode">>,
 ): boolean {
   return health.service === "codex-chatgpt-web"
     && health.status === "ok"
     && health.mode === config.mode
     && health.version === config.releaseVersion
+    && (config.integrationMode === undefined || health.integration_mode === config.integrationMode)
     && health.accepting_turns === true;
 }
 
@@ -248,6 +277,7 @@ function baseConfig(
 ): AppConfig {
   const config = existing ? structuredClone(existing) : defaultConfig(options.mode);
   config.mode = options.mode;
+  if (options.integrationMode) config.integrationMode = options.integrationMode;
   if (options.browserInteractionMode) config.browserInteractionMode = options.browserInteractionMode;
   Object.assign(config, resolveInteractionConnectorIdentities(
     config.browserInteractionMode,
@@ -307,6 +337,9 @@ function baseConfig(
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();
   if (!config.acknowledgedUnofficialAt) {
     throw new Error("Setup requires explicit acknowledgement that this is unofficial browser automation. Pass --acknowledge-unofficial.");
+  }
+  if (config.integrationMode === "external-provider" && options.replaceCodexRoute === true) {
+    throw new Error("--replace-codex-route cannot be used in external-provider mode; OpenCodex owns Codex routing");
   }
   return config;
 }
@@ -427,7 +460,11 @@ function prepareSetup(options: SetupOptions): PreparedSetup {
   const config = baseConfig(existing, {
     ...options,
     subagentProtocol: options.subagentProtocol
-      ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1"),
+      ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1", {
+        repairJournal: !isExternalProviderMode({
+          integrationMode: options.integrationMode ?? existing?.integrationMode,
+        }),
+      }),
   });
   delete config.purpose;
   const launcherOwned = config.browserHost === "launcher";
@@ -442,6 +479,7 @@ function prepareSetup(options: SetupOptions): PreparedSetup {
 
 export function preflightSetup(options: SetupOptions): void {
   const { existing, config } = prepareSetup(options);
+  if (isExternalProviderMode(config)) assertExternalProviderCodexRouteReleased(config);
   if (config.mode === "full") {
     const saved = existing?.mode === "full"
       ? tunnelConfigForInteractionMode(existing, config.browserInteractionMode)
@@ -473,16 +511,22 @@ export function preflightSetup(options: SetupOptions): void {
       throw new Error("Automatic and Zero Risk require different Tunnel IDs and separate ChatGPT connectors");
     }
   }
-  preflightCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  if (!isExternalProviderMode(config)) {
+    preflightCodexIntegration(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    });
+  }
 }
 
 export async function setup(options: SetupOptions): Promise<SetupResult> {
   const { existing, config, launcherOwned } = prepareSetup(options);
-  preflightCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  if (isExternalProviderMode(config)) {
+    assertExternalProviderCodexRouteReleased(config);
+  } else {
+    preflightCodexIntegration(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    });
+  }
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
   const beforeService = getServiceStatus();
@@ -576,7 +620,8 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
   if (!launcherOwned) {
-    saveConfig(config);
+    if (isExternalProviderMode(config)) commitExternalProviderOwnershipHandoff(config);
+    else saveConfig(config);
     installService(config);
     if (changedWhileLoaded && options.restartService && existing) await restartService(existing);
     await waitForProxy(config);
@@ -616,16 +661,21 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
     await uninstallService(existing!);
   }
-  if (launcherOwned) saveConfig(config);
+  if (launcherOwned) {
+    if (isExternalProviderMode(config)) commitExternalProviderOwnershipHandoff(config);
+    else saveConfig(config);
+  }
   // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
   // setup removes it once the launcher-owned configuration is already the established baseline.
   const migratingTerminalRuntime = Boolean(
     launcherOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
-  installCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  if (!isExternalProviderMode(config)) {
+    installCodexIntegration(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    });
+  }
 
   return {
     mode: config.mode,
@@ -633,8 +683,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     loginCreated,
     serviceLoaded: launcherOwned ? false : getServiceStatus().loaded,
     tunnelReady,
-    codexRestartRequired: true,
+    codexRestartRequired: config.integrationMode === "direct",
     connectorSetupRequired: config.mode === "full",
+    integrationMode: config.integrationMode,
   };
 }
 

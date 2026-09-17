@@ -411,6 +411,51 @@ export function verifyRestoredRoute(
   }
 }
 
+/**
+ * Verify a released Direct installation without treating route assignments now owned by another
+ * router as corruption. Only route fields owned by the journal generation are substituted in
+ * memory; the existing strict restoration verifier still checks every marker, hook, feature, and
+ * Compatibility V1 baseline against the actual file.
+ */
+export function verifyExternalProviderOwnershipHandoff(
+  text: string,
+  journal: CodexIntegrationJournal | LegacyCodexIntegrationJournalV9 | LegacyCodexIntegrationJournalV8 | LegacyCodexIntegrationJournalV7 | LegacyCodexIntegrationJournalV6 | LegacyCodexIntegrationJournalV5 | LegacyCodexIntegrationJournalV4,
+): void {
+  const document = parseDocument(text);
+  const routeBaselines: Array<readonly [string, PreviousAssignment]> = [
+    ["openai_base_url", journal.previous.openai_base_url],
+    ...(journal.version === 4 || journal.version === 5 || journal.version === 6
+      ? [
+          ["model_provider", journal.previous.model_provider],
+          ["model_catalog_json", journal.previous.model_catalog_json],
+        ] as Array<readonly [string, PreviousAssignment]>
+      : []),
+    ...(journal.version === 9 || journal.version === 10
+      ? [[
+          "experimental_realtime_webrtc_call_base_url",
+          journal.previousRealtimeWebrtcCallBaseUrl,
+        ] as const]
+      : []),
+  ];
+  const currentIndices = routeBaselines
+    .flatMap(([key]) => {
+      const current = findTopLevelAssignment(document.lines, key);
+      return current.index === undefined ? [] : [current.index];
+    })
+    .sort((left, right) => right - left);
+  for (const index of currentIndices) removeDocumentLine(document, index);
+
+  const previous = routeBaselines
+    .filter(([, assignment]) => assignment.present)
+    .sort(([, left], [, right]) => (left.index ?? Number.MAX_SAFE_INTEGER) - (right.index ?? Number.MAX_SAFE_INTEGER));
+  for (const [key, assignment] of previous) {
+    if (!assignment.rawLine) throw new Error(`Codex integration journal is missing the prior ${key} line`);
+    const index = Math.min(assignment.index ?? firstTableIndex(document.lines), firstTableIndex(document.lines));
+    insertDocumentLine(document, index, assignment.rawLine);
+  }
+  verifyRestoredRoute(renderDocument(document), journal);
+}
+
 export function assertPreservedPreviousAssignments(
   actual: CodexIntegrationJournal["previous"],
   expected: CodexIntegrationJournal["previous"],

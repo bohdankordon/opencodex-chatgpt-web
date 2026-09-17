@@ -147,7 +147,9 @@ function journalMatchesConfig(journal: AnyCodexIntegrationJournal): boolean {
   }
 }
 
-export function readJournal(): AnyCodexIntegrationJournal | undefined {
+export function readJournal(
+  options: { repair?: boolean } = {},
+): AnyCodexIntegrationJournal | undefined {
   const primaryPath = getCodexJournalPath();
   const recoveryPath = getCodexJournalRecoveryPath();
   let primary: AnyCodexIntegrationJournal | undefined;
@@ -166,6 +168,13 @@ export function readJournal(): AnyCodexIntegrationJournal | undefined {
     return undefined;
   }
   if (primary && recovery && serializeJournal(primary) === serializeJournal(recovery)) return primary;
+  if (options.repair === false) {
+    if (primaryError) throw primaryError;
+    if (recoveryError) throw recoveryError;
+    if (primary && !recovery) return primary;
+    if (recovery && !primary) return recovery;
+    throw new Error("Codex integration journal copies contain different baselines for the same config");
+  }
   if (primary && !recovery && !recoveryError) {
     atomicWriteFile(recoveryPath, serializeJournal(primary));
     return primary;
