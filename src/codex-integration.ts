@@ -1,7 +1,14 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import type { AppConfig, IntegrationMode } from "./config";
-import { getConfigPath, isExternalProviderMode, loadConfig, readPersistedIntegrationMode, saveConfig } from "./config";
+import {
+  getConfigPath,
+  isExternalProviderMode,
+  loadConfig,
+  preserveUtf8Bom,
+  readPersistedIntegrationMode,
+  saveConfig,
+} from "./config";
 import { installCodexInterruptHook, installCodexInterruptHookCommand } from "./codex-interrupt-hook";
 import {
   CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
@@ -13,6 +20,7 @@ import {
   routeUrl,
   sha256,
   snapshotFile,
+  writeFilesWithCompensation,
   writeFileSnapshot,
   writeIntegrationState,
 } from "./codex-integration-shared";
@@ -45,6 +53,7 @@ import {
   restoreLegacyV2,
   restoreManagedRoute,
   verifyInstalledRoute,
+  verifyExternalProviderOwnershipHandoff,
   verifyManagedJournalState,
   verifyRestoredRoute,
 } from "./codex-integration-route";
@@ -128,28 +137,65 @@ export function assertDirectCodexIntegration(
  * can persist the new ownership mode. The raw direct URL check also catches an unjournaled manual
  * route that still points Codex straight at this bridge.
  */
-export function assertExternalProviderCodexRouteReleased(config: AppConfig): void {
+export function validateExternalProviderOwnershipHandoff(
+  config: AppConfig,
+): AnyCodexIntegrationJournal | undefined {
   if (!isExternalProviderMode(config)) return;
-  const status = inspectCodexIntegration();
-  if (status.errors.length > 0) {
-    throw new Error(
-      "Existing codex-chatgpt-web Direct integration is inconsistent; repair or disconnect it in Direct mode before switching to external-provider",
-    );
-  }
-  if (status.installed && status.active) {
-    throw new Error(
-      "Existing codex-chatgpt-web Direct route is still active; run `codex-chatgpt-web route disconnect` before switching to external-provider mode",
-    );
+  const journal = readJournal({ repair: false });
+  if (journal) {
+    if (journal.version === 2 || journal.version === 3 || journal.active) {
+      throw new Error(
+        "Existing codex-chatgpt-web Direct route is still active; run `codex-chatgpt-web route disconnect` before switching to external-provider mode",
+      );
+    }
   }
   const configPath = getCodexConfigPath();
-  if (!existsSync(configPath)) return;
-  const directUrl = routeUrl(config).replace(/\/+$/, "");
+  if (journal) {
+    assertJournalTargetsConfig(journal, configPath);
+    if (!existsSync(journal.configPath)) throw new Error(`Codex config is missing: ${journal.configPath}`);
+    try {
+      verifyExternalProviderOwnershipHandoff(readFileSync(journal.configPath, "utf8"), journal);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        "Existing codex-chatgpt-web Direct integration did not cleanly release its non-route state; "
+        + `repair or disconnect it in Direct mode before switching to external-provider: ${detail}`,
+      );
+    }
+  }
+  if (!existsSync(configPath)) return journal;
   const configuredUrl = findTopLevelAssignment(splitLines(readFileSync(configPath, "utf8")), "openai_base_url").value;
-  if (typeof configuredUrl === "string" && configuredUrl.replace(/\/+$/, "") === directUrl) {
+  const directUrls = new Set([
+    routeUrl(config),
+    ...(journal ? [journal.installed.openai_base_url] : []),
+  ].map(url => url.replace(/\/+$/, "")));
+  if (typeof configuredUrl === "string" && directUrls.has(configuredUrl.replace(/\/+$/, ""))) {
     throw new Error(
       "Codex still points directly at codex-chatgpt-web; point Codex at OpenCodex before switching to external-provider mode",
     );
   }
+  return journal;
+}
+
+export function assertExternalProviderCodexRouteReleased(config: AppConfig): void {
+  validateExternalProviderOwnershipHandoff(config);
+}
+
+/** Persist external ownership and retire only the obsolete Direct ownership records as one write. */
+export function commitExternalProviderOwnershipHandoff(config: AppConfig): { retired: boolean } {
+  if (!isExternalProviderMode(config)) {
+    throw new Error("External-provider ownership handoff requires external-provider mode");
+  }
+  const journal = validateExternalProviderOwnershipHandoff(config);
+  const configPath = getConfigPath();
+  const original = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+  writeFilesWithCompensation([
+    {
+      path: configPath,
+      data: preserveUtf8Bom(`${JSON.stringify(config, null, 2)}\n`, original),
+    },
+  ], journal ? [getCodexJournalRecoveryPath(), getCodexJournalPath()] : []);
+  return { retired: Boolean(journal) };
 }
 
 export {
@@ -170,8 +216,9 @@ export type {
 
 export function readCodexSubagentProtocol(
   fallback: AppConfig["subagentProtocol"] = "compatibility-v1",
+  options: { repairJournal?: boolean } = {},
 ): AppConfig["subagentProtocol"] {
-  const journal = readJournal();
+  const journal = readJournal({ repair: options.repairJournal });
   return journal?.version === 8 || journal?.version === 9 || journal?.version === 10
     ? journal.installed.subagent_protocol
     : fallback;

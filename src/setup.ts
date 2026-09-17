@@ -22,6 +22,7 @@ import {
 } from "./browser-login";
 import {
   assertExternalProviderCodexRouteReleased,
+  commitExternalProviderOwnershipHandoff,
   installCodexIntegration,
   preflightCodexIntegration,
   readCodexSubagentProtocol,
@@ -459,7 +460,11 @@ function prepareSetup(options: SetupOptions): PreparedSetup {
   const config = baseConfig(existing, {
     ...options,
     subagentProtocol: options.subagentProtocol
-      ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1"),
+      ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1", {
+        repairJournal: !isExternalProviderMode({
+          integrationMode: options.integrationMode ?? existing?.integrationMode,
+        }),
+      }),
   });
   delete config.purpose;
   const launcherOwned = config.browserHost === "launcher";
@@ -615,7 +620,8 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
   if (!launcherOwned) {
-    saveConfig(config);
+    if (isExternalProviderMode(config)) commitExternalProviderOwnershipHandoff(config);
+    else saveConfig(config);
     installService(config);
     if (changedWhileLoaded && options.restartService && existing) await restartService(existing);
     await waitForProxy(config);
@@ -655,7 +661,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
     await uninstallService(existing!);
   }
-  if (launcherOwned) saveConfig(config);
+  if (launcherOwned) {
+    if (isExternalProviderMode(config)) commitExternalProviderOwnershipHandoff(config);
+    else saveConfig(config);
+  }
   // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
   // setup removes it once the launcher-owned configuration is already the established baseline.
   const migratingTerminalRuntime = Boolean(

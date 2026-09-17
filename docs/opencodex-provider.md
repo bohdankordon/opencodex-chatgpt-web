@@ -71,6 +71,9 @@ is still in Direct mode:
 codex-chatgpt-web route disconnect
 ```
 
+Disconnect restores every Codex setting owned by the Direct integration and leaves the route free
+for another router to take over.
+
 Then configure Codex/OpenCodex so Codex points at OpenCodex, not directly at this bridge. After
 OpenCodex owns the Codex route, run setup with the explicit external-provider mode:
 
@@ -82,9 +85,10 @@ Use `--full` instead of `--browser-only` when the ChatGPT Web route should retai
 tool flow.
 
 Setup deliberately refuses the ownership switch while the previous managed Direct route is still
-active, while that integration is inconsistent, or while `openai_base_url` still points directly at
-this bridge. Those are migration errors to fix explicitly rather than conditions that permit an
-automatic route takeover.
+active, while its non-route managed state is inconsistent, or while `openai_base_url` still points
+directly at this bridge. After a clean handoff, setup retires the obsolete Direct ownership record
+without modifying the route now owned by OpenCodex. Those checks make migration errors explicit
+rather than permitting an automatic route takeover.
 
 ## OpenCodex registration
 
