@@ -847,12 +847,16 @@ test("failed first-time setup removes its route before restoring the unconfigure
   };
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--browser-only"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
+      host.runSetup(
+        "core-setup",
+        ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
+        { ownershipPolicy: directTransactionPolicy("setup-core") },
+      ),
       /synthetic setup failure; incomplete first-time setup was rolled back/,
     );
     assert.deepEqual(calls.map((args) => args.join(" ")), [
-      "setup --browser-only --preflight-only",
-      "setup --browser-only",
+      "setup --browser-only --integration-mode direct --replace-codex-route --preflight-only",
+      "setup --browser-only --integration-mode direct --replace-codex-route",
     ]);
     assert.equal(fs.existsSync(configPath), false);
     assert.equal(fs.existsSync(journalPath), false);
@@ -893,7 +897,11 @@ test("a failed setup preflight leaves the previous runtime running and untouched
   };
   try {
     await assert.rejects(
-      host.runSetup("runtime-upgrade", ["setup", "--browser-only"], { ownershipPolicy: directTransactionPolicy("runtime-upgrade") }),
+      host.runSetup(
+        "runtime-upgrade",
+        ["setup", "--browser-only", "--integration-mode", "direct"],
+        { ownershipPolicy: directTransactionPolicy("runtime-upgrade") },
+      ),
       /multi_agent_v2 in Codex \[features\] is unsupported$/,
     );
     assert.equal(stops, 0);
@@ -937,10 +945,14 @@ test("a browser-mode commit failure restores the previous runtime inside setup",
   host.run = async () => ({ code: 0, stdout: "", stderr: "" });
 
   await assert.rejects(
-    host.runSetup("browser-interaction-mode", ["setup", "--full"], {
-      afterRuntimeReady: async () => { throw new Error("surface ownership failed"); },
-      ownershipPolicy: directTransactionPolicy("browser-interaction-mode"),
-    }),
+    host.runSetup(
+      "browser-interaction-mode",
+      ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+      {
+        afterRuntimeReady: async () => { throw new Error("surface ownership failed"); },
+        ownershipPolicy: directTransactionPolicy("browser-interaction-mode"),
+      },
+    ),
     /surface ownership failed/,
   );
   assert.equal(stops, 1);
@@ -981,7 +993,11 @@ test("launcher delegates an existing terminal-managed installation to the migrat
     return { code: 0, stdout: "", stderr: "" };
   };
 
-  await host.runSetup("core-setup", ["setup", "--full"], { ownershipPolicy: directTransactionPolicy("setup-core") });
+  await host.runSetup(
+    "core-setup",
+    ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+    { ownershipPolicy: directTransactionPolicy("setup-core") },
+  );
   assert.equal(prepared, 1);
   assert.equal(launcherStops, 0);
 });
@@ -1013,12 +1029,16 @@ test("failed terminal migration verifies the unchanged previous runtime instead 
   };
 
   await assert.rejects(
-    host.runSetup("core-setup", ["setup", "--browser-only"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
+    host.runSetup(
+      "core-setup",
+      ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
+      { ownershipPolicy: directTransactionPolicy("setup-core") },
+    ),
     /synthetic migration failure$/,
   );
   assert.deepEqual(calls, [
-    "setup --browser-only --preflight-only",
-    "setup --browser-only",
+    "setup --browser-only --integration-mode direct --replace-codex-route --preflight-only",
+    "setup --browser-only --integration-mode direct --replace-codex-route",
     "doctor --json",
   ]);
 });
@@ -1102,7 +1122,11 @@ test("failed launcher update restores every mutable setup file before restarting
 
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--full"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
+      host.runSetup(
+        "core-setup",
+        ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+        { ownershipPolicy: directTransactionPolicy("setup-core") },
+      ),
       /synthetic updated runtime startup failure$/,
     );
     assert.equal(startAttempts, 2);
@@ -1184,7 +1208,11 @@ test("failed terminal migration restores removed launchd ownership before verify
 
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--full"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
+      host.runSetup(
+        "core-setup",
+        ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+        { ownershipPolicy: directTransactionPolicy("setup-core") },
+      ),
       /synthetic launcher startup failure$/,
     );
     assert.equal(startAttempts, 1);
@@ -1192,8 +1220,8 @@ test("failed terminal migration restores removed launchd ownership before verify
     assert.equal(fs.readFileSync(daemonPlist, "utf8"), "old daemon plist\n");
     assert.equal(fs.readFileSync(tunnelPlist, "utf8"), "old tunnel plist\n");
     assert.deepEqual(calls, [
-      "setup --full --preflight-only",
-      "setup --full",
+      "setup --full --integration-mode direct --replace-codex-route --preflight-only",
+      "setup --full --integration-mode direct --replace-codex-route",
       "service install",
       "tunnel start",
       "doctor --json",
@@ -1513,7 +1541,7 @@ test("G2 runSetup requires a trusted ownership policy before mutation", async ()
   };
   await assert.rejects(
     host.runSetup("core-setup", ["setup", "--browser-only"], {}),
-    /requires an ownership policy/,
+    /requires a canonical ownership policy/,
   );
   assert.equal(spawns, 0);
 });
@@ -1827,6 +1855,216 @@ test("G2.33 first-time External rollback stays bridge-only", async () => {
     assert.equal(fs.existsSync(fixture.configPath), false);
     assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), "pre-existing router route\n");
     assert.equal(cleared, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+// G2 blocker-fix transaction tests: canonical policy/command binding at the
+// runSetup boundary. Every case asserts zero preflight spawn, zero checkpoint
+// capture, zero supervisor stop, and zero real setup spawn.
+
+async function expectTransactionBoundaryReject(fixture, options) {
+  let spawns = 0;
+  let captures = 0;
+  fixture.host.run = async () => {
+    spawns += 1;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const capture = fixture.host.captureSetupCheckpoint.bind(fixture.host);
+  fixture.host.captureSetupCheckpoint = (snapshot, scope) => {
+    captures += 1;
+    return capture(snapshot, scope);
+  };
+  await assert.rejects(
+    fixture.host.runSetup(options.name || "core-setup", options.args, {
+      ownershipPolicy: options.policy,
+      message: "boundary",
+      timeoutMs: 1000,
+    }),
+    options.match,
+  );
+  assert.equal(spawns, 0);
+  assert.equal(captures, 0);
+  assert.equal(fixture.stops(), 0);
+}
+
+function externalPolicyFor(operation) {
+  return buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation, profile: "production" });
+}
+
+test("K canonical External policy with replace-route raw args rejects", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: externalPolicyFor("setup-core"),
+      args: ["setup", "--browser-only", "--integration-mode", "external-provider", "--replace-codex-route"],
+      match: /unexpected --replace-codex-route/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("L canonical External policy with Direct mode raw args rejects", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: externalPolicyFor("setup-core"),
+      args: ["setup", "--browser-only", "--integration-mode", "direct"],
+      match: /expected --integration-mode external-provider/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("M canonical External policy with missing mode flag rejects", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: externalPolicyFor("setup-core"),
+      args: ["setup", "--browser-only", "--acknowledge-unofficial"],
+      match: /exactly one --integration-mode/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("N canonical Direct replace policy with missing replace flag rejects", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: directTransactionPolicy("setup-core"),
+      args: ["setup", "--browser-only", "--integration-mode", "direct"],
+      match: /expected exactly one --replace-codex-route/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("O canonical Direct upgrade policy with unexpected replace flag rejects", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: directTransactionPolicy("runtime-upgrade"),
+      name: "runtime-upgrade",
+      args: ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
+      match: /unexpected --replace-codex-route/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("P duplicate integration-mode flags reject", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: directTransactionPolicy("setup-core"),
+      args: ["setup", "--browser-only", "--integration-mode", "direct", "--integration-mode", "direct"],
+      match: /exactly one --integration-mode/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("Q duplicate replace flags reject", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: directTransactionPolicy("setup-core"),
+      args: ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route", "--replace-codex-route"],
+      match: /expected exactly one --replace-codex-route/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("R DEV Direct policy with production ownership flags rejects", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    await expectTransactionBoundaryReject(fixture, {
+      policy: directTransactionPolicy("setup-core", "development"),
+      args: ["dev", "setup", "--browser-only", "--integration-mode", "direct"],
+      match: /must not emit --integration-mode/,
+    });
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.13 External rollback keeps absent journals absent", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  const artifacts = routeArtifactPaths(fixture);
+  assert.equal(fs.existsSync(artifacts.journal), false);
+  assert.equal(fs.existsSync(artifacts.recovery), false);
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(fixture.configPath, JSON.stringify({ mode: "full", browserHost: "launcher" }));
+    throw new Error("synthetic absent-journal External failure");
+  };
+  try {
+    await assert.rejects(
+      fixture.host.setupCore({ integrationMode: "external-provider" }),
+      /synthetic absent-journal External failure/,
+    );
+    assert.equal(
+      fs.readFileSync(fixture.configPath, "utf8"),
+      JSON.stringify({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }),
+    );
+    assert.equal(fs.existsSync(artifacts.journal), false);
+    assert.equal(fs.existsSync(artifacts.recovery), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.14 failed External Full transaction restores tunnel files, not Codex routes", async () => {
+  const fixture = transactionHost({ mode: "full", browserHost: "launcher", integrationMode: "external-provider" });
+  const artifacts = routeArtifactPaths(fixture);
+  const keyPath = path.join(fixture.coreHome, "secrets", "custom-external.key");
+  const profileDir = path.join(fixture.coreHome, "tunnel", "profiles");
+  const profilePath = path.join(profileDir, "custom-external.yaml");
+  fs.writeFileSync(keyPath, "before-key\n");
+  fs.writeFileSync(profilePath, "before-profile\n");
+  fs.writeFileSync(
+    fixture.configPath,
+    JSON.stringify({
+      mode: "full",
+      browserHost: "launcher",
+      integrationMode: "external-provider",
+      automaticTunnel: {
+        tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+        runtimeKeyFile: keyPath,
+        profileDir,
+        profileName: "custom-external",
+      },
+    }),
+  );
+  fs.writeFileSync(artifacts.codexConfig, "router route\n");
+  fs.writeFileSync(artifacts.journal, "router journal\n");
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(keyPath, "mutated-key\n");
+    fs.writeFileSync(profilePath, "mutated-profile\n");
+    fs.writeFileSync(artifacts.codexConfig, "router route changed\n");
+    fs.writeFileSync(artifacts.journal, "router journal changed\n");
+    throw new Error("synthetic External Full failure");
+  };
+  try {
+    await assert.rejects(
+      fixture.host.setupCore({ integrationMode: "external-provider" }),
+      /synthetic External Full failure/,
+    );
+    assert.equal(fs.readFileSync(keyPath, "utf8"), "before-key\n");
+    assert.equal(fs.readFileSync(profilePath, "utf8"), "before-profile\n");
+    assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), "router route changed\n");
+    assert.equal(fs.readFileSync(artifacts.journal, "utf8"), "router journal changed\n");
   } finally {
     fixture.cleanup();
   }

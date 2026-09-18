@@ -55,34 +55,39 @@ function normalizeSetupOperation(operation) {
 
 function buildSetupOwnershipPolicy(options) {
   const settings = options || {};
+  // Validate ALL inputs before any profile branching: malformed, missing, or
+  // external modes, operations, or profiles must never silently become policy.
+  if (!isLauncherIntegrationMode(settings.integrationMode)) {
+    throw new Error("Setup ownership policy requires direct or external-provider");
+  }
   const operation = normalizeSetupOperation(settings.operation);
+  if (settings.profile !== "production" && settings.profile !== "development") {
+    throw new Error("Setup ownership policy profile must be production or development");
+  }
   if (settings.profile === "development") {
-    return Object.freeze({
+    if (settings.integrationMode !== DIRECT) {
+      throw new Error("DEV setup ownership is Direct-only; external-provider is unavailable in the isolated DEV launcher profile");
+    }
+    return brandPolicy({
       integrationMode: DIRECT,
-      operation,
+      operation: operation,
       profile: "development",
-      integrationArgs: Object.freeze([]),
+      integrationArgs: [],
       replaceCodexRoute: false,
       checkpointScope: DIRECT_INTEGRATION_SCOPE,
     });
-  }
-  if (settings.profile !== undefined && settings.profile !== "production") {
-    throw new Error("Setup ownership policy profile must be production or development");
-  }
-  if (!isLauncherIntegrationMode(settings.integrationMode)) {
-    throw new Error("Setup ownership policy requires direct or external-provider");
   }
   const replaceCodexRoute = settings.integrationMode === DIRECT
     && DIRECT_REPLACE_BY_OPERATION[operation] === true;
   if (settings.integrationMode === EXTERNAL_PROVIDER && replaceCodexRoute) {
     throw new Error("External-provider setup must never replace the Codex route");
   }
-  return Object.freeze({
+  return brandPolicy({
     integrationMode: settings.integrationMode,
-    operation,
+    operation: operation,
     profile: "production",
-    integrationArgs: Object.freeze(["--integration-mode", settings.integrationMode]),
-    replaceCodexRoute,
+    integrationArgs: ["--integration-mode", settings.integrationMode],
+    replaceCodexRoute: replaceCodexRoute,
     checkpointScope: settings.integrationMode === EXTERNAL_PROVIDER ? BRIDGE_ONLY_SCOPE : DIRECT_INTEGRATION_SCOPE,
   });
 }
@@ -94,29 +99,100 @@ function ownershipArgs(policy) {
   return [...checked.integrationArgs, ...(checked.replaceCodexRoute ? ["--replace-codex-route"] : [])];
 }
 
-// Structural gate for transaction entry: rejects forged, partial, or
-// self-contradictory policies (notably external-provider + replace).
+// Canonical-policy provenance. Only the builder may create a trusted policy:
+// the module-private brand cannot be forged through IPC, renderer input, JSON
+// round-trips (symbols do not survive serialization), or object spread into an
+// unfrozen object. The brand is deliberately not exported.
+const SETUP_POLICY_BRAND = Symbol("launcherSetupOwnershipPolicy");
+
+function brandPolicy(fields) {
+  return Object.freeze({
+    integrationMode: fields.integrationMode,
+    operation: fields.operation,
+    profile: fields.profile,
+    integrationArgs: Object.freeze([...fields.integrationArgs]),
+    replaceCodexRoute: fields.replaceCodexRoute,
+    checkpointScope: fields.checkpointScope,
+    [SETUP_POLICY_BRAND]: true,
+  });
+}
+
+// Canonical gate for transaction entry: requires a branded, frozen policy
+// whose stored derived fields exactly match a fresh re-derivation from its
+// own mode, operation and profile. Hand-built lookalikes fail on the brand;
+// frozen tampered clones fail on re-derivation (notably external-provider
+// paired with a direct-integration scope or Direct args).
 function assertSetupOwnershipPolicy(policy) {
   if (!policy || typeof policy !== "object" || Array.isArray(policy)) {
-    throw new Error("Setup transaction requires an ownership policy");
+    throw new Error("Setup transaction requires a canonical ownership policy");
   }
-  normalizeSetupOperation(policy.operation);
-  if (!isLauncherIntegrationMode(policy.integrationMode)) {
-    throw new Error("Setup transaction requires direct or external-provider");
+  if (policy[SETUP_POLICY_BRAND] !== true) {
+    throw new Error("Setup transaction requires a canonical ownership policy");
   }
-  if (policy.checkpointScope !== DIRECT_INTEGRATION_SCOPE && policy.checkpointScope !== BRIDGE_ONLY_SCOPE) {
-    throw new Error("Setup transaction requires a direct-integration or bridge-only checkpoint scope");
+  if (!Object.isFrozen(policy) || !Array.isArray(policy.integrationArgs) || !Object.isFrozen(policy.integrationArgs)) {
+    throw new Error("Setup transaction ownership policy is not canonical");
   }
-  if (!Array.isArray(policy.integrationArgs)) {
-    throw new Error("Setup transaction requires explicit integration-mode args");
-  }
-  if (policy.integrationMode === EXTERNAL_PROVIDER && policy.replaceCodexRoute === true) {
-    throw new Error("External-provider setup must never replace the Codex route");
-  }
-  if (policy.profile === "development" && (policy.integrationArgs.length > 0 || policy.replaceCodexRoute === true)) {
-    throw new Error("DEV setup must not emit routing ownership flags");
+  const expected = buildSetupOwnershipPolicy({
+    integrationMode: policy.integrationMode,
+    operation: policy.operation,
+    profile: policy.profile,
+  });
+  if (expected.integrationMode !== policy.integrationMode
+      || expected.operation !== policy.operation
+      || expected.profile !== policy.profile
+      || expected.replaceCodexRoute !== policy.replaceCodexRoute
+      || expected.checkpointScope !== policy.checkpointScope
+      || expected.integrationArgs.length !== policy.integrationArgs.length
+      || expected.integrationArgs.some((arg, index) => arg !== policy.integrationArgs[index])) {
+    throw new Error("Setup transaction ownership policy is not canonical");
   }
   return policy;
+}
+
+// Exact ownership-flag scan over a final setup arg array. Counts literal
+// occurrences anywhere in the array, so duplicated, missing, misplaced, or
+// trailing flags without values all fail the binding check below.
+function scanOwnershipFlags(args) {
+  if (!Array.isArray(args)) {
+    throw new Error("Setup transaction requires a command argument array");
+  }
+  let modeFlags = 0;
+  let modeValue;
+  let replaceFlags = 0;
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === "--integration-mode") {
+      modeFlags += 1;
+      modeValue = args[index + 1];
+    } else if (args[index] === "--replace-codex-route") {
+      replaceFlags += 1;
+    }
+  }
+  return { modeFlags: modeFlags, modeValue: modeValue, replaceFlags: replaceFlags };
+}
+
+// Binds the actual setup command to its canonical policy: the ownership
+// flags present in the final args must match the policy derivation exactly.
+// Production requires exactly one mode flag with the policy value;
+// replace-codex-route must be present exactly when the policy requires it.
+// DEV requires zero ownership flags. Call before preflight, checkpoint,
+// supervisor stop and real setup.
+function assertArgsMatchPolicy(policy, args, action) {
+  const checked = assertSetupOwnershipPolicy(policy);
+  const found = scanOwnershipFlags(args);
+  const where = action ? " for " + action : "";
+  const fail = (detail) => {
+    throw new Error("Setup command ownership flags do not match the canonical policy" + where + ": " + detail);
+  };
+  if (checked.profile === "development") {
+    if (found.modeFlags !== 0) fail("DEV setup must not emit --integration-mode");
+    if (found.replaceFlags !== 0) fail("DEV setup must not emit --replace-codex-route");
+    return checked;
+  }
+  if (found.modeFlags !== 1) fail("expected exactly one --integration-mode flag");
+  if (found.modeValue !== checked.integrationMode) fail("expected --integration-mode " + checked.integrationMode);
+  if (checked.replaceCodexRoute && found.replaceFlags !== 1) fail("expected exactly one --replace-codex-route flag");
+  if (!checked.replaceCodexRoute && found.replaceFlags !== 0) fail("unexpected --replace-codex-route flag");
+  return checked;
 }
 
 module.exports = {
@@ -124,6 +200,7 @@ module.exports = {
   DIRECT_INTEGRATION_SCOPE,
   DIRECT_REPLACE_BY_OPERATION,
   SETUP_OPERATIONS,
+  assertArgsMatchPolicy,
   assertSetupOwnershipPolicy,
   buildSetupOwnershipPolicy,
   normalizeSetupOperation,

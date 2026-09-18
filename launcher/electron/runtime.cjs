@@ -24,6 +24,7 @@ const {
 const {
   BRIDGE_ONLY_SCOPE,
   DIRECT_INTEGRATION_SCOPE,
+  assertArgsMatchPolicy,
   assertSetupOwnershipPolicy,
   buildSetupOwnershipPolicy,
   ownershipArgs,
@@ -1528,7 +1529,11 @@ class RuntimeHost {
     // The transaction policy is fixed here, before mutation, from the trusted
     // ownership context each setup path validated. Rollback below restores
     // exactly this captured scope even if config changes mid-transaction.
+    // Boundary order: canonical branded policy first, then exact command
+    // binding, then scope selection. Nothing invalid reaches checkpoint
+    // capture, preflight spawn, supervisor stop, or real setup.
     const ownershipPolicy = assertSetupOwnershipPolicy(options ? options.ownershipPolicy : undefined);
+    assertArgsMatchPolicy(ownershipPolicy, args, name);
     const previousRuntime = this.runtimeConfigSnapshot();
     const checkpoint = this.captureSetupCheckpoint(previousRuntime, ownershipPolicy.checkpointScope);
     this.lifecycleOperation = name;

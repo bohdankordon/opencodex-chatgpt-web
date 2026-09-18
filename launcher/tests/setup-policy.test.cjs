@@ -85,8 +85,11 @@ test("no operation and mode combination can construct external with replace-rout
       replaceCodexRoute: true,
       checkpointScope: BRIDGE_ONLY_SCOPE,
     }),
-    /must never replace the Codex route/,
+    /canonical ownership policy/,
   );
+  const canonicalExternal = buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-core", profile: "production" });
+  const tamperedReplace = Object.freeze({ ...canonicalExternal, replaceCodexRoute: true });
+  assert.throws(() => assertSetupOwnershipPolicy(tamperedReplace), /not canonical/);
 });
 
 test("dev policy preserves the isolated-harness contract for every operation", () => {
@@ -115,32 +118,115 @@ test("policy rejects malformed mode, profile and scope", () => {
   for (const bad of [null, undefined, {}, { operation: "setup-core" }, { integrationMode: "direct" }]) {
     assert.throws(() => assertSetupOwnershipPolicy(bad), /requires|must be one of/);
   }
+  const canonicalScope = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
   assert.throws(
-    () => assertSetupOwnershipPolicy({
-      integrationMode: "direct",
-      operation: "setup-core",
-      profile: "production",
-      integrationArgs: ["--integration-mode", "direct"],
-      replaceCodexRoute: true,
-      checkpointScope: "everything",
-    }),
-    /checkpoint scope/,
+    () => assertSetupOwnershipPolicy(Object.freeze({ ...canonicalScope, checkpointScope: "everything" })),
+    /not canonical/,
   );
-  assert.throws(
-    () => assertSetupOwnershipPolicy({
-      integrationMode: "direct",
-      operation: "setup-core",
-      profile: "development",
-      integrationArgs: ["--integration-mode", "direct"],
-      replaceCodexRoute: false,
-      checkpointScope: DIRECT_INTEGRATION_SCOPE,
-    }),
-    /must not emit routing ownership flags/,
-  );
+  const canonicalDev = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "development" });
+  const tamperedDev = Object.freeze({ ...canonicalDev, integrationArgs: ["--integration-mode", "direct"] });
+  assert.throws(() => assertSetupOwnershipPolicy(tamperedDev), /not canonical/);
 });
 
 test("policies are frozen", () => {
   const policy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
   assert.ok(Object.isFrozen(policy));
   assert.ok(Object.isFrozen(policy.integrationArgs));
+});
+
+// Blocker-fix regression tests: canonical branded policies, re-derivation,
+// DEV builder strictness, and mutation resistance.
+
+function tamperedClone(policy, patch) {
+  return Object.freeze({ ...policy, ...patch });
+}
+
+test("A hand-built External policy with a Direct scope fails", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-core", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { checkpointScope: "direct-integration" })),
+    /not canonical/,
+  );
+});
+
+test("B hand-built External policy with Direct args fails", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-mcp", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { integrationArgs: ["--integration-mode", "direct"] })),
+    /not canonical/,
+  );
+});
+
+test("C hand-built Direct policy with a bridge-only scope fails", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { checkpointScope: "bridge-only" })),
+    /not canonical/,
+  );
+});
+
+test("D unknown profile fails even on a branded clone", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { profile: "qa" })),
+    /profile must be production or development/,
+  );
+});
+
+test("E unknown operation fails even on a branded clone", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { operation: "uninstall" })),
+    /operation must be one of/,
+  );
+});
+
+test("F/G truthy non-boolean replaceCodexRoute fails", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { replaceCodexRoute: 1 })),
+    /not canonical/,
+  );
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { replaceCodexRoute: "true" })),
+    /not canonical/,
+  );
+});
+
+test("H mutable lookalike objects fail", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.throws(
+    () => assertSetupOwnershipPolicy({ ...canonical }),
+    /canonical/,
+  );
+});
+
+test("I brand-less shape-identical objects fail", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-mcp", profile: "production" });
+  const roundTripped = JSON.parse(JSON.stringify(canonical));
+  assert.deepEqual(roundTripped.integrationArgs, ["--integration-mode", "external-provider"]);
+  assert.throws(() => assertSetupOwnershipPolicy(roundTripped), /canonical ownership policy/);
+});
+
+test("J policy arg arrays resist post-construction mutation", () => {
+  const canonical = buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-core", profile: "production" });
+  assert.throws(() => canonical.integrationArgs.push("--replace-codex-route"), TypeError);
+  assert.deepEqual(canonical.integrationArgs, ["--integration-mode", "external-provider"]);
+  assertSetupOwnershipPolicy(canonical);
+});
+
+test("DEV builder accepts only explicit direct", () => {
+  const dev = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "development" });
+  assert.equal(dev.profile, "development");
+  assertSetupOwnershipPolicy(dev);
+  assert.throws(
+    () => buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-core", profile: "development" }),
+    /Direct-only/,
+  );
+  for (const bad of [undefined, null, "direct ", "DIRECT", 42]) {
+    assert.throws(
+      () => buildSetupOwnershipPolicy({ integrationMode: bad, operation: "setup-core", profile: "development" }),
+      /requires direct or external-provider/,
+    );
+  }
 });
