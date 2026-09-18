@@ -253,6 +253,37 @@ function buildUpgradeCompletionPatch({ upgrade, snapshotConfig }) {
   };
 }
 
+// Repair completion state (G4). External repairs preserve restart/catalog
+// flags instead of inventing Direct ones: an External repair touches only
+// the Launcher-owned bridge, never the Codex route, so it must not claim
+// Codex needs a restart or reset bridge-side catalog verification with
+// Direct semantics. Direct repairs keep existing behavior. DEV is always
+// Direct (enforced by resolveSetupOwnership) and keeps its own flags.
+function repairCompletionPatch(ownership, directPatch) {
+  if (ownership && ownership.integrationMode === EXTERNAL_INTEGRATION_MODE) {
+    const { codexCatalogVerified, codexRestartRequired, ...rest } = directPatch;
+    return rest;
+  }
+  return directPatch;
+}
+
+// Post-repair bridge health (G4). Reuses the G3 ownership-health validator
+// with the trusted repair ownership: the live bridge must report the same
+// integration mode, routing owner and canonical provider URL. Never probes
+// the external router itself and never claims it is healthy; an External
+// router outage alone cannot fail this check because only the bridge
+// /healthz is read. Throws fail-closed on mismatch so repair never completes
+// against a wrong-owner bridge.
+async function validateRepairBridgeHealth(ownership, action) {
+  const config = runtimeSupervisor.readConfig();
+  const health = await runtimeSupervisor.proxyHealthPayload(config);
+  validateRuntimeOwnershipHealth({
+    config,
+    integrationMode: ownership.integrationMode,
+    health,
+  });
+}
+
 // Ownership-aware bridge startup reconciliation (G3). Takes an already
 // established trusted startup ownership context plus explicit collaborators,
 // so the sequence is unit-testable without Electron. Direct startups keep
@@ -921,7 +952,14 @@ function registerIpc({ logger, stateStore }) {
     const result = IS_DEV_PROFILE
       ? await runtimeHost.setupDevCore(input, ownership.expectation)
       : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode }, ownership.expectation);
-    stateStore.update({
+    // G4 repair continuity + health: the setup subprocess may have rewritten
+    // config, so revalidate the SAME trusted expectation before marking
+    // repair complete. Drift (mode flip, missing, damaged) fails closed with
+    // zero route mutation and truthful failure state. Health proves the live
+    // bridge reports the repaired ownership; wrong-owner bridges fail here.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-core");
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "setup-core");
+    stateStore.update(repairCompletionPatch(ownership, {
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
@@ -935,14 +973,20 @@ function registerIpc({ logger, stateStore }) {
         mcpRuntimeInstalled: false,
         mcpGuideStep: 0,
       }),
-    });
+    }));
     await browserHost.returnToIdle().catch((error) => {
       logger.warn("browser.idle_cleanup_failed", {
         message: error instanceof Error ? error.message : String(error),
       });
     });
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
-    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+    // G4 truthful restart: an External repair touches no Codex route, so it
+    // must not claim a restart is required merely because the bridge was
+    // repaired. Direct preserves existing guidance.
+    const restartRequired = ownership.integrationMode === EXTERNAL_INTEGRATION_MODE
+      ? false
+      : !IS_DEV_PROFILE;
+    return { ok: true, stdout: result.stdout, restartRequired };
   });
   handle("launcher:setup-mcp", async (_event, input) => {
     const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-mcp");
@@ -974,7 +1018,12 @@ function registerIpc({ logger, stateStore }) {
     const result = interactionModeChange
       ? await browserHost.withInteractionModeChange(interactionMode, runSetup)
       : await runSetup();
-    const state = stateStore.update({
+    // G4 repair continuity + health: revalidate SAME expectation after the
+    // setup subprocess rewrote config; drift fails closed with zero route
+    // mutation. Health proves the repaired bridge reports repaired ownership.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-mcp");
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "setup-mcp");
+    const state = stateStore.update(repairCompletionPatch(ownership, {
       browserInteractionMode: interactionMode,
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
@@ -984,7 +1033,7 @@ function registerIpc({ logger, stateStore }) {
       mcpSetupComplete: false,
       mcpGuideStep: 2,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
-    });
+    }));
     send("launcher:state-changed", state);
     if (interactionModeChange) send("launcher:browser-state", browserHost.snapshot());
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
@@ -1007,11 +1056,16 @@ function registerIpc({ logger, stateStore }) {
   handle("launcher:bigger-context", async (_event, enabled, options) => {
     const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
     const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
-    const state = stateStore.update({
+    // G4 repair continuity + health: revalidate SAME expectation after setup
+    // mutation; drift fails closed. Health proves the live bridge still
+    // reports the trusted ownership.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "bigger-context");
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "bigger-context");
+    const state = stateStore.update(repairCompletionPatch(ownership, {
       experimentalBiggerContext: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
-    });
+    }));
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
@@ -1022,6 +1076,11 @@ function registerIpc({ logger, stateStore }) {
       throw new Error("Finish or cancel active ChatGPT turns before changing Skills as files");
     }
     const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
+    // G4 repair continuity + health: revalidate SAME expectation after setup
+    // mutation; drift fails closed. Skill state itself is bridge-owned and
+    // already truthful, so no restart/catalog patch to strip.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "skill-attachments");
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "skill-attachments");
     const state = stateStore.update({ experimentalSkillAttachments: result.enabled });
     send("launcher:state-changed", state);
     return state;
@@ -1037,11 +1096,15 @@ function registerIpc({ logger, stateStore }) {
       );
     }
     const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
-    const state = stateStore.update({
+    // G4 repair continuity + health: revalidate SAME expectation after setup
+    // mutation; drift fails closed. External preserves restart/catalog flags.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "zero-risk-pro");
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "zero-risk-pro");
+    const state = stateStore.update(repairCompletionPatch(ownership, {
       zeroRiskProEnabled: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE,
       codexRestartRequired: !IS_DEV_PROFILE,
-    });
+    }));
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
@@ -1071,14 +1134,20 @@ function registerIpc({ logger, stateStore }) {
       mode,
       afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady, { integrationMode: ownership.integrationMode }, ownership.expectation),
     );
-    const state = stateStore.update({
+    // G4 repair continuity + health: revalidate SAME expectation after the
+    // interaction-mode transaction rewrote config; drift fails closed.
+    // External preserves restart/catalog flags (bridge-only change).
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "browser-interaction-mode");
+    if (!IS_DEV_PROFILE && result.configured) await validateRepairBridgeHealth(ownership, "browser-interaction-mode");
+    const directPatch = {
       browserInteractionMode: mode,
       ...(mode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       ...(result.configured ? {
         codexCatalogVerified: IS_DEV_PROFILE,
         codexRestartRequired: !IS_DEV_PROFILE,
       } : {}),
-    });
+    };
+    const state = stateStore.update(repairCompletionPatch(ownership, directPatch));
     send("launcher:state-changed", state);
     send("launcher:browser-state", browserHost.snapshot());
     if (!IS_DEV_PROFILE && result.configured) startCatalogVerificationMonitor({ logger, stateStore });

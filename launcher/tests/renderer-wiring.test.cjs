@@ -116,6 +116,9 @@ test("setup preserves session-check failures and never installs without verified
       },
       extractRequestedIntegrationMode,
       smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
+      validateRepairBridgeHealth: async () => {},
+      repairCompletionPatch: (_ownership, directPatch) => directPatch,
+      EXTERNAL_INTEGRATION_MODE: "external-provider",
     });
     await assert.rejects(setup, error => error.message === browser.message);
     assert.equal(installs, 0);
@@ -398,7 +401,7 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
   );
   const modeTransaction = modeSwitchHandler.indexOf("await browserHost.withInteractionModeChange(");
   const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady,");
-  const stateModeCommit = modeSwitchHandler.indexOf("const state = stateStore.update({");
+  const stateModeCommit = modeSwitchHandler.indexOf("stateStore.update(");
   const ownershipResolution = modeSwitchHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(options),");
   assert.ok(ownershipResolution >= 0 && ownershipResolution < modeTransaction);
   assert.ok(modeTransaction >= 0 && modeTransaction < runtimeModeCommit);
@@ -410,7 +413,7 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
   );
   const runtimeMcpCommit = mcpSetupHandler.indexOf("const runSetup = afterRuntimeReady => setup({");
   const mcpTransaction = mcpSetupHandler.indexOf("await browserHost.withInteractionModeChange(interactionMode, runSetup)");
-  const stateMcpCommit = mcpSetupHandler.indexOf("const state = stateStore.update({");
+  const stateMcpCommit = mcpSetupHandler.indexOf("stateStore.update(");
   const mcpOwnership = mcpSetupHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(input),");
   assert.ok(mcpOwnership >= 0 && mcpOwnership < runtimeMcpCommit);
   assert.ok(runtimeMcpCommit >= 0 && runtimeMcpCommit < mcpTransaction);
