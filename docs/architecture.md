@@ -41,6 +41,25 @@ launcher-owned codex-chatgpt-web daemon
   `wait_agent` contract as direct and structured calls.
 - Tool calls and results remain in the same ChatGPT response while Codex executes them locally.
 
+### Routing ownership: `direct` vs `external-provider`
+
+Routing ownership is an axis independent of the runtime profile (`browser-only`/`full`):
+
+- **Direct** (default): the Launcher installs and manages the Codex route (`openai_base_url`)
+  and restores the previous route when the bridge is removed.
+- **External-provider**: Codex routing is owned by an external router (for example OpenCodex).
+  The Launcher owns only the bridge/browser runtime and performs zero Codex route mutations:
+  no route install, replace, restore, or probe of the external router. Provider registration
+  with the router is the user's manual responsibility.
+
+- The canonical routing mode lives in the runtime config; the Launcher renderer only sends
+  first-install intent, and Direct-to-External migration in either direction is CLI-only.
+- Core lifecycle mutators (setup, repair, reinstall, remove, startup upgrade) run under a shared
+  cross-process lifecycle lock, revalidate trusted ownership provenance before and inside the
+  transaction, and roll back Direct route artifacts on validation failure.
+  An External bridge that passes ownership-health validation is Launcher-ready without a Direct
+  catalog fetch or a Codex restart.
+
 ### Repository DEV driver
 
 The DEV chat is not another provider or browser implementation. It is a synthetic outer-Codex

@@ -28,6 +28,8 @@
 
 完整 harness 模式通过 MCP 将 ChatGPT 连接到当前任务的文件、终端、工具和审批流程。对话始终关联到你的 Codex 任务，上下文增长时也能继续工作。
 
+使用 OpenCodex 等外部路由器？请参阅[外部 Provider 模式](docs/opencodex-provider.md)。
+
 <div id="get-started"><a id="quick-start"></a></div>
 
 ## 开始使用

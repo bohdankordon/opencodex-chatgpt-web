@@ -1019,6 +1019,47 @@ code {
   border-top: 1px solid var(--color-border);
 }
 
+.routing-picker {
+  display: grid;
+  gap: 8px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.routing-picker-label {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.routing-option {
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.routing-option small {
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.routing-option.is-active {
+  border-color: rgb(64 201 119 / 45%);
+  background: rgb(64 201 119 / 8%);
+}
+
+.routing-option:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .setup-row {
   display: grid;
   min-height: 82px;

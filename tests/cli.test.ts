@@ -579,6 +579,10 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
       "uninstall",
       "--yes",
       "--launcher-control",
+      "--expected-installation-kind",
+      "configured",
+      "--expected-integration-mode",
+      "direct",
     ], {
       ...process.env,
       CODEX_HOME: codexHome,

@@ -5,6 +5,11 @@ const path = require("node:path");
 
 const launcherRoot = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(launcherRoot, "src", "App.tsx"), "utf8");
+const {
+  assertOwnershipExpectationCurrent,
+  extractRequestedIntegrationMode,
+  resolveOwnershipContext,
+} = require("../electron/integration-mode.cjs");
 const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"), "utf8");
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
@@ -92,23 +97,187 @@ test("setup preserves session-check failures and never installs without verified
     let installs = 0;
     let browser = { authenticated: false, status: "error", message: "ChatGPT session verification failed (HTTP 503)." };
     const state = { browserInteractionMode: "automatic", coreSetupComplete: false };
-    const run = async () => { installs++; return { mode: "browser-only", stdout: "" }; };
+    const ownershipRequests = [];
+    let lastInput;
+    const runWithOwnership = async (input) => { installs++; lastInput = input; return { mode: "browser-only", stdout: "" }; };
     vm.runInNewContext(source, {
       handle: (_name, handler) => { setup = handler; }, IS_DEV_PROFILE: dev,
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
-      runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
+      runtimeHost: {
+        setupCore: runWithOwnership,
+        setupDevCore: runWithOwnership,
+        runtimeConfigSnapshot: () => ({ config: {} }),
+        assertOwnershipExpectationCurrent: () => ({ kind: "missing" }),
+      },
+      resolveSetupOwnership: (requestedMode, action) => {
+        ownershipRequests.push({ requestedMode, action });
+        return { integrationMode: "direct", newInstallation: true, canonical: { kind: "missing" } };
+      },
+      extractRequestedIntegrationMode,
       smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
+      validateRepairBridgeHealth: async () => {},
+      repairCompletionPatch: (_ownership, directPatch) => directPatch,
+      EXTERNAL_INTEGRATION_MODE: "external-provider",
+      createRepairRuntimeValidation: () => undefined,
     });
     await assert.rejects(setup, error => error.message === browser.message);
     assert.equal(installs, 0);
+    assert.deepEqual(ownershipRequests, [{ requestedMode: undefined, action: "setup-core" }]);
     browser = { authenticated: false, status: "signed-out", message: "Sign in to ChatGPT" };
     await assert.rejects(setup, /Sign in to/);
     assert.equal(installs, 0);
     browser = { authenticated: true, status: "ready", message: "ChatGPT is ready" };
     assert.equal((await setup()).ok, true);
     assert.equal(installs, 1);
+    if (!dev) assert.equal(lastInput.integrationMode, "direct");
   }
+});
+
+test("setup IPC threads an optional routing-ownership mode without trusting the renderer", () => {
+  assert.match(preloadSource, /setupCore: \(input\) => ipcRenderer\.invoke\("launcher:setup-core", input\)/);
+  assert.match(preloadSource, /setBiggerContext: \(enabled, options\) => ipcRenderer\.invoke\("launcher:bigger-context", enabled, options\)/);
+  assert.match(preloadSource, /setBrowserInteractionMode: \(mode, options\) =>/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(input\), "setup-core"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(input\), "setup-mcp"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "bigger-context"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "skill-attachments"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "zero-risk-pro"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "browser-interaction-mode"\)/);
+});
+
+test("setup-core revalidates ownership before browser-visible work", () => {
+  const setupCoreHandler = electronMain.slice(
+    electronMain.indexOf("handle(\"launcher:setup-core\","),
+    electronMain.indexOf("handle(\"launcher:setup-mcp\","),
+  );
+  const recheck = setupCoreHandler.indexOf("assertOwnershipExpectationCurrent(ownership.expectation,");
+  assert.ok(recheck >= 0 && recheck < setupCoreHandler.indexOf("browserHost.probeAuthentication("));
+});
+
+test("B7 setup-core revalidates ownership before the authentication probe", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:setup-core",'),
+    electronMain.indexOf('handle("launcher:setup-mcp",'),
+  );
+  const reads = [{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }, null];
+  let readCalls = 0;
+  const supervisor = { readSetupConfig: () => reads[Math.min(readCalls++, reads.length - 1)] };
+  let setup;
+  let installs = 0;
+  let probes = 0;
+  const state = { browserInteractionMode: "automatic", coreSetupComplete: true };
+  vm.runInNewContext(source, {
+    handle: (_name, handler) => { setup = handler; },
+    IS_DEV_PROFILE: false,
+    stateStore: { read: () => state, update() {} },
+    browserHost: {
+      probeAuthentication: async () => { probes += 1; return { authenticated: true }; },
+      returnToIdle: async () => {},
+    },
+    runtimeHost: {
+      supervisor,
+      setupCore: async () => { installs += 1; return { mode: "browser-only", stdout: "" }; },
+      setupDevCore: async () => { installs += 1; return { mode: "browser-only", stdout: "" }; },
+      runtimeConfigSnapshot: () => ({ config: {} }),
+      assertOwnershipExpectationCurrent: (expectation, action) => assertOwnershipExpectationCurrent({ supervisor, expectation, action }),
+    },
+    resolveSetupOwnership: (requestedMode, action) => resolveOwnershipContext({ requestedMode, supervisor, action }),
+    extractRequestedIntegrationMode,
+    smokePassedThisSession: false,
+    send() {},
+    startCatalogVerificationMonitor() {},
+    logger: {},
+  });
+  await assert.rejects(setup(undefined), /changed while preparing setup-core/);
+  assert.equal(probes, 0);
+  assert.equal(installs, 0);
+  assert.equal(readCalls, 2);
+});
+
+test("B8 setup-mcp revalidates ownership before browser reveal", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:setup-mcp",'),
+    electronMain.indexOf('handle("launcher:set-mcp-step",'),
+  );
+  const reads = [{ mode: "full", browserHost: "launcher", integrationMode: "external-provider" }, null];
+  let readCalls = 0;
+  const supervisor = { readSetupConfig: () => reads[Math.min(readCalls++, reads.length - 1)] };
+  let setup;
+  let reveals = 0;
+  let installs = 0;
+  const state = { browserInteractionMode: "automatic" };
+  vm.runInNewContext(source, {
+    handle: (_name, handler) => { setup = handler; },
+    IS_DEV_PROFILE: false,
+    stateStore: { read: () => state, update() {} },
+    browserHost: {
+      reveal: async () => { reveals += 1; return {}; },
+      withInteractionModeChange: async () => { throw new Error("must not switch modes"); },
+    },
+    runtimeHost: {
+      supervisor,
+      setupMcp: async () => { installs += 1; return { ok: true, stdout: "" }; },
+      runtimeConfigSnapshot: () => ({ config: {} }),
+      assertOwnershipExpectationCurrent: (expectation, action) => assertOwnershipExpectationCurrent({ supervisor, expectation, action }),
+    },
+    resolveSetupOwnership: (requestedMode, action) => resolveOwnershipContext({ requestedMode, supervisor, action }),
+    extractRequestedIntegrationMode,
+    send() {},
+    startCatalogVerificationMonitor() {},
+    logger: {},
+    createRepairRuntimeValidation: () => undefined,
+    composeAfterRuntimeReady: (existing) => existing,
+    repairCompletionPatch: (_ownership, directPatch) => directPatch,
+    validateRepairBridgeHealth: async () => {},
+    EXTERNAL_INTEGRATION_MODE: "external-provider",
+  });
+  await assert.rejects(setup(undefined), /changed while preparing setup-mcp/);
+  assert.equal(reveals, 0);
+  assert.equal(installs, 0);
+  assert.equal(readCalls, 2);
+});
+
+test("B9 browser interaction change revalidates ownership before mutating the browser", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:browser-interaction-mode",'),
+    electronMain.indexOf('handle("launcher:set-preference",'),
+  );
+  const reads = [{ mode: "full", browserHost: "launcher", integrationMode: "external-provider" }, null];
+  let readCalls = 0;
+  const supervisor = { readSetupConfig: () => reads[Math.min(readCalls++, reads.length - 1)] };
+  let setup;
+  let switches = 0;
+  const state = { browserInteractionMode: "automatic" };
+  vm.runInNewContext(source, {
+    handle: (_name, handler) => { setup = handler; },
+    IS_DEV_PROFILE: false,
+    validateBrowserInteractionMode: (mode) => mode,
+    stateStore: { read: () => state, update: () => state },
+    browserHost: {
+      activeTraceId: null,
+      currentOperation: () => null,
+      withInteractionModeChange: async () => { switches += 1; return {}; },
+      snapshot: () => ({}),
+    },
+    runtimeHost: {
+      supervisor,
+      mcpCredentialsConfigured: () => true,
+      setBrowserInteractionMode: async () => ({ configured: true }),
+      assertOwnershipExpectationCurrent: (expectation, action) => assertOwnershipExpectationCurrent({ supervisor, expectation, action }),
+    },
+    resolveSetupOwnership: (requestedMode, action) => resolveOwnershipContext({ requestedMode, supervisor, action }),
+    extractRequestedIntegrationMode,
+    send() {},
+    startCatalogVerificationMonitor() {},
+    logger: {},
+  });
+  await assert.rejects(setup({}, "manual"), /changed while preparing browser-interaction-mode/);
+  assert.equal(switches, 0);
+  assert.equal(readCalls, 2);
 });
 
 test("startup failure stays visible on another launch and Retry exits the failed instance", async () => {
@@ -197,7 +366,7 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
   assert.match(appSource, /data-profile=\{snapshot\.profile\}/);
   assert.match(appSource, /manualBiggerContextUnavailable[\s\S]*?copy\.biggerContextBody/);
   assert.match(appSource, /api!\.setBiggerContext\(enabled\)/);
-  assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true\)/);
+  assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true,/);
   assert.doesNotMatch(electronMain, /IS_DEV_PROFILE && key === "experimentalBiggerContext"/);
 });
 
@@ -237,8 +406,10 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
     electronMain.indexOf('handle("launcher:set-preference"'),
   );
   const modeTransaction = modeSwitchHandler.indexOf("await browserHost.withInteractionModeChange(");
-  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady)");
-  const stateModeCommit = modeSwitchHandler.indexOf("const state = stateStore.update({");
+  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode,");
+  const stateModeCommit = modeSwitchHandler.indexOf("stateStore.update(");
+  const ownershipResolution = modeSwitchHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(options),");
+  assert.ok(ownershipResolution >= 0 && ownershipResolution < modeTransaction);
   assert.ok(modeTransaction >= 0 && modeTransaction < runtimeModeCommit);
   assert.ok(runtimeModeCommit < stateModeCommit);
 
@@ -248,7 +419,9 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
   );
   const runtimeMcpCommit = mcpSetupHandler.indexOf("const runSetup = afterRuntimeReady => setup({");
   const mcpTransaction = mcpSetupHandler.indexOf("await browserHost.withInteractionModeChange(interactionMode, runSetup)");
-  const stateMcpCommit = mcpSetupHandler.indexOf("const state = stateStore.update({");
+  const stateMcpCommit = mcpSetupHandler.indexOf("stateStore.update(");
+  const mcpOwnership = mcpSetupHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(input),");
+  assert.ok(mcpOwnership >= 0 && mcpOwnership < runtimeMcpCommit);
   assert.ok(runtimeMcpCommit >= 0 && runtimeMcpCommit < mcpTransaction);
   assert.ok(mcpTransaction < stateMcpCommit);
   assert.match(browserHostSource, /bindManualTurnContents\(tab\)/);
@@ -329,12 +502,19 @@ test("saved ChatGPT authentication is refreshed before setup is presented", () =
   const productionStartup = electronMain.indexOf("} else void (async () => {");
   const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
   const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
-  const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
-  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart);
+  const runtimeStart = electronMain.indexOf("startConfiguredBridgeRuntime({", upgrade);
   assert.ok(refreshBarrier > productionStartup, "production startup must wait for saved-session refresh");
   assert.ok(upgrade > refreshBarrier, "runtime upgrade must not inspect the browser before refresh settles");
-  assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
-  assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
+  assert.ok(runtimeStart > upgrade, "configured runtime must reconcile after any upgrade");
+  const reconciler = electronMain.indexOf("async function startConfiguredBridgeRuntime({");
+  const reconcilerStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", reconciler);
+  const reconcilerHealth = electronMain.indexOf("validateRuntimeOwnershipHealth({", reconciler);
+  const reconcilerConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", reconciler);
+  const reconcilerGate = electronMain.indexOf("if (!policy.connectDirectRoute)", reconciler);
+  assert.ok(reconcilerStart > reconciler, "reconciler must start the runtime first");
+  assert.ok(reconcilerHealth > reconcilerStart, "bridge ownership health must validate before any route action");
+  assert.ok(reconcilerGate > reconcilerHealth, "route connect must sit behind the ownership policy gate");
+  assert.ok(reconcilerConnect > reconcilerGate, "Codex route must connect only after ownership validation");
   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);
 });
 

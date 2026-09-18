@@ -28,6 +28,8 @@
 
 Full ハーネスモードでは、MCP を通じて ChatGPT を現在のタスクのファイル、ターミナル、ツール、承認に接続します。会話は Codex タスクに紐付いたままなので、コンテキストが増えても作業を続けられます。
 
+OpenCodex などの外部ルーターをお使いですか？[外部プロバイダーモード](docs/opencodex-provider.md)をご覧ください。
+
 <div id="get-started"><a id="quick-start"></a></div>
 
 ## 使い始める

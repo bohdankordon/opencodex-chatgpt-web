@@ -28,6 +28,8 @@ Use the ChatGPT Web models available on your account, including Pro, from Codexâ
 
 Full harness mode connects ChatGPT to the current taskâ€™s files, terminal, tools, and approvals through MCP. Conversations stay tied to your Codex task, so you can keep working as the context grows.
 
+Using an external router such as OpenCodex? See [External provider mode](docs/opencodex-provider.md).
+
 <div id="get-started"><a id="quick-start"></a></div>
 
 ## Get started

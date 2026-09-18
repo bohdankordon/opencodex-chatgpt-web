@@ -38,6 +38,17 @@ const {
   validateSidebarState,
 } = require("./state.cjs");
 const {
+  DIRECT: DIRECT_INTEGRATION_MODE,
+  assertOwnershipExpectationCurrent,
+  assertOwnershipContinuity,
+  EXTERNAL_PROVIDER: EXTERNAL_INTEGRATION_MODE,
+  extractRequestedIntegrationMode,
+  readIntegrationInstallationState,
+  resolveOwnershipContext,
+} = require("./integration-mode.cjs");
+const { validateRuntimeOwnershipHealth } = require("./runtime-health.cjs");
+const { buildStartupRoutePolicy } = require("./startup-route-policy.cjs");
+const {
   MIN_WINDOW_BOUNDS,
   readWindowState,
   trackWindowState,
@@ -153,6 +164,16 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
         const reason = typeof result.failure?.code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(result.failure.code)
           ? result.failure.code
           : ["config", "request", "transport", "upstream", "catalog"].includes(result.failure?.stage) ? result.failure.stage : "catalog";
+        // External bridges serve their catalog to the router, not directly to
+        // Codex: a Direct-worded catalog failure must not mark an External
+        // install broken. Keep observing quietly; readiness was proven by
+        // ownership-health validation at startup.
+        if (config.integrationMode === "external-provider") {
+          logger.debug("codex.model_catalog_verification_pending", {
+            status: result.status, reason, request: result.request,
+          });
+          return;
+        }
         const state = stateStore.update({ codexRestartRequired: false });
         send("launcher:state-changed", state);
         logger.warn("codex.model_catalog_failed", { status: result.status, reason, request: result.request });
@@ -207,6 +228,196 @@ async function restoreCodexRouteAfterRuntimeFailure({ logger, stateStore }) {
   }
 }
 
+// Upgrade completion state (G3 fix). Restart/catalog reset follows the
+// trusted upgrade ownership instead of assuming Direct: core computes
+// codexRestartRequired from integration mode, and an External upgrade
+// touches no Codex route. Pre-existing flags are preserved, never invented,
+// for External; later lifecycle stages own their cleanup.
+function buildUpgradeCompletionPatch({ upgrade, snapshotConfig }) {
+  return {
+    coreSetupComplete: true,
+    ...(upgrade.integrationMode === EXTERNAL_INTEGRATION_MODE
+      ? {}
+      : { codexCatalogVerified: false, codexRestartRequired: true }),
+    experimentalBiggerContext: snapshotConfig?.experimentalBiggerContext === true,
+    experimentalSkillAttachments: snapshotConfig?.experimentalSkillAttachments === true,
+    zeroRiskProEnabled: snapshotConfig?.zeroRiskProEnabled === true,
+    ...(upgrade.mode === "full" ? {
+      mcpRuntimeInstalled: true,
+      mcpSetupComplete: false,
+      mcpGuideStep: 2,
+    } : {
+      mcpRuntimeInstalled: false,
+      mcpSetupComplete: false,
+      mcpGuideStep: 0,
+    }),
+  };
+}
+
+// Repair completion state (G4). External repairs preserve restart/catalog
+// flags instead of inventing Direct ones: an External repair touches only
+// the Launcher-owned bridge, never the Codex route, so it must not claim
+// Codex needs a restart or reset bridge-side catalog verification with
+// Direct semantics. Direct repairs keep existing behavior. DEV is always
+// Direct (enforced by resolveSetupOwnership) and keeps its own flags.
+function repairCompletionPatch(ownership, directPatch) {
+  if (ownership && ownership.integrationMode === EXTERNAL_INTEGRATION_MODE) {
+    const { codexCatalogVerified, codexRestartRequired, ...rest } = directPatch;
+    return rest;
+  }
+  return directPatch;
+}
+
+// Post-repair bridge health (G4). Reuses the G3 ownership-health validator
+// with the trusted repair ownership: the live bridge must report the same
+// integration mode, routing owner and canonical provider URL. Never probes
+// the external router itself and never claims it is healthy; an External
+// router outage alone cannot fail this check because only the bridge
+// /healthz is read. Throws fail-closed on mismatch so repair never completes
+// against a wrong-owner bridge.
+async function validateRepairBridgeHealth(ownership, action) {
+  const config = runtimeSupervisor.readConfig();
+  const health = await runtimeSupervisor.proxyHealthPayload(config);
+  validateRuntimeOwnershipHealth({
+    config,
+    integrationMode: ownership.integrationMode,
+    health,
+  });
+}
+
+// Repair transaction validator (G4 blocker fix). Runs INSIDE RuntimeHost
+// runSetup via afterRuntimeReady, while the G2 checkpoint is still live:
+// capture checkpoint -> preflight -> setup subprocess (may mutate Direct
+// route) -> runtime start -> continuity + health -> commit/return. A hook
+// failure enters the existing runSetup catch/rollback, so Direct route
+// artifacts are restored and External stays bridge-only. Successful return
+// from runSetup is the commit point; main must not add a second mandatory
+// post-return check that could invalidate the repair without compensation.
+function createRepairRuntimeValidation(ownership, action) {
+  return async () => {
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, action);
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, action);
+  };
+}
+
+// Compose an existing runtime-ready callback (e.g. the browser interaction
+// commit passed through withInteractionModeChange) with the repair
+// validator. Existing browser behavior runs first, then repair validation,
+// both inside the same runSetup transaction. Each runs at most once.
+function composeAfterRuntimeReady(existing, validator) {
+  if (!existing) return validator;
+  if (!validator) return existing;
+  let called = false;
+  return async () => {
+    if (called) throw new Error("Runtime ready callback was executed more than once");
+    called = true;
+    await existing();
+    await validator();
+  };
+}
+
+// Ownership-aware bridge startup reconciliation (G3). Takes an already
+// established trusted startup ownership context plus explicit collaborators,
+// so the sequence is unit-testable without Electron. Direct startups keep
+// existing semantics (health validation, then route connect); external
+// startups validate the same bridge health contract but never touch route
+// commands, never demand a direct Codex route, and never probe the external
+// router (router health stays unknown by design).
+async function startConfiguredBridgeRuntime({ startupOwnership, runtimeHost, runtimeSupervisor }) {
+  if (!startupOwnership || !startupOwnership.expectation) {
+    throw new Error("Bridge startup requires a trusted ownership context");
+  }
+  const runtime = await runtimeSupervisor.startIfConfigured();
+  if (runtime.status !== "ready") return { runtime, startupOwnership };
+  assertOwnershipExpectationCurrent({
+    supervisor: runtimeSupervisor,
+    expectation: startupOwnership.expectation,
+    action: "runtime-startup-health",
+  });
+  const config = runtimeSupervisor.readConfig();
+  const health = await runtimeSupervisor.proxyHealthPayload(config);
+  validateRuntimeOwnershipHealth({
+    config,
+    integrationMode: startupOwnership.integrationMode,
+    health,
+  });
+  const policy = buildStartupRoutePolicy(startupOwnership.integrationMode);
+  if (!policy.connectDirectRoute) {
+    return { runtime: { ...runtime, bridgeRouteChanged: false }, startupOwnership };
+  }
+  assertOwnershipExpectationCurrent({
+    supervisor: runtimeSupervisor,
+    expectation: startupOwnership.expectation,
+    action: "runtime-startup-connect",
+  });
+  const route = await runtimeHost.connectBridgeRoute();
+  return { runtime: { ...runtime, bridgeRouteChanged: route.changed === true }, startupOwnership };
+}
+
+// Ready-state publishing split for testability (G3). coreSetupComplete marks
+// the Launcher bridge installation ready once its own runtime/health contract
+// is valid; it never claims the external router is configured. For External
+// installs codexCatalogVerified records health-validated bridge readiness
+// (which the MCP UI needs), never a claim that Codex fetched the catalog
+// through the router (FINAL-A).
+function completeStartupReadyState({ stateStore, send, config, bridgeRouteChanged, integrationMode, startMonitor }) {
+  const current = stateStore.read();
+  const patch = {
+    coreSetupComplete: true,
+    mcpRuntimeInstalled: config.mode === "full",
+    experimentalBiggerContext: config.experimentalBiggerContext === true,
+    experimentalSkillAttachments: config.experimentalSkillAttachments === true,
+    zeroRiskProEnabled: config.zeroRiskProEnabled === true,
+    ...(bridgeRouteChanged ? {
+      codexCatalogVerified: false,
+      codexRestartRequired: true,
+    } : {}),
+    // FINAL-A: a health-validated External bridge is Launcher-ready. This
+    // flag means the bridge passed ownership-health validation at startup,
+    // NOT proof that Codex directly fetched the catalog. The Direct catalog
+    // monitor never starts for External (see below).
+    ...(integrationMode === EXTERNAL_INTEGRATION_MODE ? {
+      codexCatalogVerified: true,
+      codexRestartRequired: false,
+    } : {}),
+    ...(config.mode === "browser-only" ? {
+      mcpSetupComplete: false,
+      mcpGuideStep: 0,
+    } : {}),
+  };
+  if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
+    const state = stateStore.update(patch);
+    send("launcher:state-changed", state);
+  }
+  // External bridges must not be gated by Direct Codex-catalog assumptions;
+  // readiness was already proven by ownership-health validation.
+  if (integrationMode === DIRECT_INTEGRATION_MODE) startMonitor();
+}
+
+// Startup failure route compensation (G3). Decided from the pre-upgrade
+// ownership capture: an External or unknown startup NEVER reaches Direct
+// route restoration, even if config disappeared or changed mid-startup.
+// Proven-Direct startups revalidate provenance before touching the route.
+// Never throws: resolves to the same shape as the restore helper.
+async function recoverStartupRoute({ startupOwnership, logger, stateStore }) {
+  if (!startupOwnership || startupOwnership.integrationMode !== DIRECT_INTEGRATION_MODE) {
+    return { restored: false, skipped: true };
+  }
+  try {
+    assertOwnershipExpectationCurrent({
+      supervisor: runtimeSupervisor,
+      expectation: startupOwnership.expectation,
+      action: "runtime-startup-recovery",
+    });
+  } catch (error) {
+    logger.warn("runtime.startup_recovery_ownership_changed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { restored: false, skipped: true, ownershipChanged: true };
+  }
+  return restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+}
+
 function trayImage() {
   if (process.platform !== "darwin") {
     return nativeImage.createFromPath(APP_ICON_PATH).resize({ width: 18, height: 18 });
@@ -225,8 +436,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "Cancel",
     remove: "Remove",
     removeTitle: "Remove Codex Web GPT",
-    removeMessage: "Remove the ChatGPT Web models from Codex and restore the previous model route?",
-    removeDetail: "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
+    removeMessage: "Remove the local ChatGPT Web bridge and its Codex integration?",
+    removeDetail: "Removes the Launcher-managed bridge runtime. If this installation owns a Direct Codex route, that route is restored; external router or provider configuration is left untouched. Restart Codex only if the Launcher reports it is required.",
     retry: "Retry",
     startupTitle: "Codex Web GPT could not start",
     startupDetail: "Retry starts the launcher again without changing your saved settings or ChatGPT profile.",
@@ -240,8 +451,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "取消",
     remove: "移除",
     removeTitle: "移除 Codex Web GPT",
-    removeMessage: "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？",
-    removeDetail: "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。",
+    removeMessage: "移除本地 ChatGPT Web bridge 及其 Codex 集成？",
+    removeDetail: "移除由启动器管理的 bridge 运行时。如果此安装拥有 Direct Codex 路由，将恢复该路由；外部路由器或 provider 配置保持不变。仅在启动器提示需要时重启 Codex。",
     retry: "重试",
     startupTitle: "Codex Web GPT 无法启动",
     startupDetail: "重试会重新启动应用，不会更改已保存的设置或 ChatGPT 登录配置。",
@@ -255,8 +466,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "取消",
     remove: "移除",
     removeTitle: "移除 Codex Web GPT",
-    removeMessage: "從 Codex 中移除 ChatGPT Web 模型並還原先前的模型路由？",
-    removeDetail: "啟動器中的 ChatGPT 登入設定檔會保留。Codex 需要重新啟動一次。",
+    removeMessage: "移除本機 ChatGPT Web bridge 及其 Codex 整合？",
+    removeDetail: "移除由啟動器管理的 bridge 執行階段。如果此安裝擁有 Direct Codex 路由，將還原該路由；外部路由器或 provider 設定保持不變。僅在啟動器提示需要時重新啟動 Codex。",
     retry: "重試",
     startupTitle: "Codex Web GPT 無法啟動",
     startupDetail: "重試會重新啟動應用程式，不會變更已儲存的設定或 ChatGPT 登入設定檔。",
@@ -270,8 +481,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "キャンセル",
     remove: "削除",
     removeTitle: "Codex Web GPT を削除",
-    removeMessage: "Codex から ChatGPT Web モデルを削除し、以前のモデルルートを復元しますか？",
-    removeDetail: "ランチャーの ChatGPT ログインプロファイルは保持されます。Codex を一度再起動する必要があります。",
+    removeMessage: "ローカルの ChatGPT Web ブリッジと Codex 統合を削除しますか？",
+    removeDetail: "ランチャーが管理するブリッジランタイムを削除します。このインストールが Direct Codex ルートを所有している場合は復元されます。外部ルーターやプロバイダーの設定は変更されません。Codex の再起動は、ランチャーが求めた場合のみ必要です。",
     retry: "再試行",
     startupTitle: "Codex Web GPT を起動できませんでした",
     startupDetail: "保存済みの設定と ChatGPT プロファイルを変更せずに、ランチャーを再起動します。",
@@ -285,8 +496,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "취소",
     remove: "제거",
     removeTitle: "Codex Web GPT 제거",
-    removeMessage: "Codex에서 ChatGPT Web 모델을 제거하고 이전 모델 경로를 복원할까요?",
-    removeDetail: "런처의 ChatGPT 로그인 프로필은 유지됩니다. Codex를 한 번 다시 시작해야 합니다.",
+    removeMessage: "로컬 ChatGPT Web 브리지와 Codex 통합을 제거할까요?",
+    removeDetail: "런처가 관리하는 브리지 런타임을 제거합니다. 이 설치가 Direct Codex 경로를 소유한 경우 해당 경로가 복원되며, 외부 라우터 또는 공급자 구성은 그대로 유지됩니다. 런처가 요청한 경우에만 Codex를 다시 시작하세요.",
     retry: "다시 시도",
     startupTitle: "Codex Web GPT를 시작할 수 없습니다",
     startupDetail: "저장된 설정이나 ChatGPT 프로필을 변경하지 않고 런처를 다시 시작합니다.",
@@ -480,6 +691,34 @@ function validateBrowserInteractionMode(value) {
   return value;
 }
 
+// G1 (PR #2): resolve routing ownership BEFORE any lifecycle mutation.
+// Renderer input is never authority: the canonical runtime config wins, an
+// omitted mode preserves it, and a mismatch rejects before browser mutation,
+// supervisor stop, checkpoint or CLI spawn. launcher-state.json is never read
+// here. G2 derives command, checkpoint and route policy from this context.
+function resolveSetupOwnership(requestedMode, action) {
+  const context = resolveOwnershipContext({
+    requestedMode: requestedMode,
+    supervisor: runtimeSupervisor || runtimeHost.supervisor,
+    action: action,
+  });
+  if (IS_DEV_PROFILE && context.integrationMode !== DIRECT_INTEGRATION_MODE) {
+    throw new Error("External provider routing is unavailable in the isolated DEV launcher profile");
+  }
+  return context;
+}
+
+// Canonical read-only installation state for the renderer snapshot (FINAL-A
+// blocker fix). Derived fresh from canonical runtime/setup config at snapshot
+// time via the G1 reader, never persisted into launcher-state.json and never
+// renderer-settable. Missing means no canonical config, configured means a
+// valid install exists, damaged means config exists but ownership cannot be
+// safely proven. Readiness flags are never consulted here.
+function getIntegrationInstallationState() {
+  const supervisor = runtimeSupervisor || runtimeHost?.supervisor;
+  return readIntegrationInstallationState(supervisor);
+}
+
 function validateBounds(value) {
   if (!value || typeof value !== "object") throw new Error("Browser bounds are required");
   for (const key of ["x", "y", "width", "height"]) {
@@ -502,6 +741,7 @@ function registerIpc({ logger, stateStore }) {
       userData: launcherUserData,
     },
     state: stateStore.read(),
+    integrationInstallationState: getIntegrationInstallationState(),
     browser: browserHost?.snapshot() ?? null,
     connectorName: runtimeHost.browserConnectorName(),
     connectorNames: {
@@ -713,18 +953,27 @@ function registerIpc({ logger, stateStore }) {
       noLink: true,
     });
     if (confirmation.response !== 1) return { cancelled: true };
+    // G5: canonical routing ownership AFTER the confirmation dialog
+    // (think-time drift) and BEFORE any destructive mutation. Renderer sends
+    // no mode; damaged config fails closed here with zero mutation.
+    const ownership = resolveSetupOwnership(undefined, "uninstall-integration");
     try {
-      await runtimeHost.uninstallIntegration();
+      await runtimeHost.uninstallIntegration(undefined, ownership.expectation);
     } finally {
       browserHost.writeDescriptor();
     }
+    // G5 truthful state: only a proven configured-Direct removal restores
+    // Codex routing and may ask for a Codex restart. External/missing removal
+    // touches no route, so it must not invent Direct restart guidance.
+    // browserInteractionMode reset is Launcher-owned UI state (existing
+    // semantics, no routing effect) and is preserved for all modes.
     const state = stateStore.update({
       coreSetupComplete: false,
       codexCatalogVerified: false,
       mcpSetupComplete: false,
       mcpRuntimeInstalled: false,
       mcpGuideStep: 0,
-      codexRestartRequired: true,
+      codexRestartRequired: ownership.integrationMode === DIRECT_INTEGRATION_MODE && !ownership.newInstallation,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
@@ -734,7 +983,11 @@ function registerIpc({ logger, stateStore }) {
     stopCatalogVerificationMonitor();
     return { cancelled: false, state };
   });
-  handle("launcher:setup-core", async () => {
+  handle("launcher:setup-core", async (_event, input) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-core");
+    // Revalidate trusted provenance BEFORE browser-visible work (probe below)
+    // and pass the SAME expectation to the runtime for its own revalidation.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-core");
     const setupState = stateStore.read();
     if (setupState.browserInteractionMode === "automatic") {
       const browser = await browserHost.probeAuthentication();
@@ -756,8 +1009,21 @@ function registerIpc({ logger, stateStore }) {
           : "Run the browser smoke test before installing the Codex integration",
       );
     }
-    const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
-    stateStore.update({
+    // G1 carries resolved ownership into the runtime call; CLI semantics unchanged (G2).
+    // G4 transaction: continuity + health run INSIDE runSetup via
+    // afterRuntimeReady, before the commit point, so a Direct route mutation
+    // is rolled back on validation failure. No post-return mandatory check.
+    const repairValidation = createRepairRuntimeValidation(ownership, "setup-core");
+    const result = IS_DEV_PROFILE
+      ? await runtimeHost.setupDevCore(input, ownership.expectation)
+      : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
+    // FINAL-A: successful External first setup / reinstall already passed G4
+    // transactional continuity + bridge ownership-health validation inside
+    // runSetup, so mark truthful External UI-ready here. codexCatalogVerified
+    // means health-validated bridge readiness, NOT Direct catalog proof, and
+    // no Codex restart is required because no Direct route was touched.
+    // Direct keeps existing catalog-monitor semantics.
+    const setupCompletion = repairCompletionPatch(ownership, {
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
@@ -772,15 +1038,31 @@ function registerIpc({ logger, stateStore }) {
         mcpGuideStep: 0,
       }),
     });
+    stateStore.update(
+      !IS_DEV_PROFILE && ownership.integrationMode === EXTERNAL_INTEGRATION_MODE
+        ? { ...setupCompletion, codexCatalogVerified: true, codexRestartRequired: false }
+        : setupCompletion,
+    );
     await browserHost.returnToIdle().catch((error) => {
       logger.warn("browser.idle_cleanup_failed", {
         message: error instanceof Error ? error.message : String(error),
       });
     });
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
-    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+    // FINAL-A: the Direct catalog monitor never starts for External; External
+    // readiness was already proven by transactional ownership-health validation.
+    if (!IS_DEV_PROFILE && ownership.integrationMode !== EXTERNAL_INTEGRATION_MODE) {
+      startCatalogVerificationMonitor({ logger, stateStore });
+    }
+    // G4 truthful restart: an External repair touches no Codex route, so it
+    // must not claim a restart is required merely because the bridge was
+    // repaired. Direct preserves existing guidance.
+    const restartRequired = ownership.integrationMode === EXTERNAL_INTEGRATION_MODE
+      ? false
+      : !IS_DEV_PROFILE;
+    return { ok: true, stdout: result.stdout, restartRequired };
   });
   handle("launcher:setup-mcp", async (_event, input) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-mcp");
     const currentMode = stateStore.read().browserInteractionMode;
     const interactionMode = input?.interactionMode === undefined
       ? currentMode
@@ -789,17 +1071,31 @@ function registerIpc({ logger, stateStore }) {
     const setup = IS_DEV_PROFILE
       ? runtimeHost.setupDevMcp.bind(runtimeHost)
       : runtimeHost.setupMcp.bind(runtimeHost);
+    // G4 transaction: repair validator composes with the browser commit hook
+    // inside runSetup, before the commit point. Existing browser behavior
+    // runs first, then continuity + health; any failure rolls back.
+    const repairValidation = IS_DEV_PROFILE ? undefined : createRepairRuntimeValidation(ownership, "setup-mcp");
     const runSetup = afterRuntimeReady => setup({
       tunnelId: typeof input?.tunnelId === "string" ? input.tunnelId.trim() : "",
       runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
       replace: input?.replace === true,
       interactionMode,
-    }, afterRuntimeReady);
-    if (!interactionModeChange && interactionMode === "automatic") await browserHost.reveal();
+      integrationMode: ownership.integrationMode,
+    }, composeAfterRuntimeReady(afterRuntimeReady, repairValidation), ownership.expectation);
+    // withInteractionModeChange writes override/descriptor state before the
+    // runtime action runs, and reveal() shows browser UI: revalidate trusted
+    // provenance BEFORE either browser-visible mutation.
+    if (!interactionModeChange && interactionMode === "automatic") {
+      runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-mcp");
+      await browserHost.reveal();
+    }
+    if (interactionModeChange) {
+      runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-mcp");
+    }
     const result = interactionModeChange
       ? await browserHost.withInteractionModeChange(interactionMode, runSetup)
       : await runSetup();
-    const state = stateStore.update({
+    const state = stateStore.update(repairCompletionPatch(ownership, {
       browserInteractionMode: interactionMode,
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
@@ -809,7 +1105,7 @@ function registerIpc({ logger, stateStore }) {
       mcpSetupComplete: false,
       mcpGuideStep: 2,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
-    });
+    }));
     send("launcher:state-changed", state);
     if (interactionModeChange) send("launcher:browser-state", browserHost.snapshot());
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
@@ -829,27 +1125,35 @@ function registerIpc({ logger, stateStore }) {
       ...autostart,
     };
   });
-  handle("launcher:bigger-context", async (_event, enabled) => {
-    const result = await runtimeHost.setBiggerContext(enabled === true);
-    const state = stateStore.update({
+  handle("launcher:bigger-context", async (_event, enabled, options) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
+    // G4 transaction: validator runs inside runSetup before commit.
+    const repairValidation = createRepairRuntimeValidation(ownership, "bigger-context");
+    const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
+    const state = stateStore.update(repairCompletionPatch(ownership, {
       experimentalBiggerContext: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
-    });
+    }));
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
-  handle("launcher:skill-attachments", async (_event, enabled) => {
+  handle("launcher:skill-attachments", async (_event, enabled, options) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "skill-attachments");
     if (browserHost.activeTraceId || browserHost.currentOperation()) {
       throw new Error("Finish or cancel active ChatGPT turns before changing Skills as files");
     }
-    const result = await runtimeHost.setSkillAttachments(enabled === true);
+    // G4 transaction: validator runs inside runSetup before commit. Skill
+    // state itself is bridge-owned and already truthful.
+    const repairValidation = createRepairRuntimeValidation(ownership, "skill-attachments");
+    const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
     const state = stateStore.update({ experimentalSkillAttachments: result.enabled });
     send("launcher:state-changed", state);
     return state;
   });
-  handle("launcher:zero-risk-pro", async (_event, enabled) => {
+  handle("launcher:zero-risk-pro", async (_event, enabled, options) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "zero-risk-pro");
     const browserOperation = browserHost.currentOperation();
     if (browserHost.activeTraceId || browserOperation) {
       throw new Error(
@@ -858,18 +1162,22 @@ function registerIpc({ logger, stateStore }) {
           : `Finish ${browserOperation} before changing Zero Risk model profiles`,
       );
     }
-    const result = await runtimeHost.setZeroRiskPro(enabled === true);
-    const state = stateStore.update({
+    // G4 transaction: validator runs inside runSetup before commit. External
+    // preserves restart/catalog flags via repairCompletionPatch below.
+    const repairValidation = createRepairRuntimeValidation(ownership, "zero-risk-pro");
+    const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
+    const state = stateStore.update(repairCompletionPatch(ownership, {
       zeroRiskProEnabled: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE,
       codexRestartRequired: !IS_DEV_PROFILE,
-    });
+    }));
     send("launcher:state-changed", state);
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
-  handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
+  handle("launcher:browser-interaction-mode", async (_event, rawMode, options) => {
     const mode = validateBrowserInteractionMode(rawMode);
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "browser-interaction-mode");
     const current = stateStore.read();
     if (current.browserInteractionMode === mode) {
       return { state: current, credentialsRequired: false, targetMode: mode };
@@ -885,18 +1193,26 @@ function registerIpc({ logger, stateStore }) {
     if (!runtimeHost.mcpCredentialsConfigured(mode)) {
       return { state: current, credentialsRequired: true, targetMode: mode };
     }
+    // withInteractionModeChange mutates override/descriptor state before the
+    // runtime action runs: revalidate trusted provenance first.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "browser-interaction-mode");
+    // G4 transaction: repair validator composes with the browser commit hook
+    // inside runSetup, before the commit point. No post-return mandatory
+    // check; success return means continuity + health already passed.
+    const repairValidation = IS_DEV_PROFILE ? undefined : createRepairRuntimeValidation(ownership, "browser-interaction-mode");
     const result = await browserHost.withInteractionModeChange(
       mode,
-      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady),
+      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, composeAfterRuntimeReady(afterRuntimeReady, repairValidation), { integrationMode: ownership.integrationMode }, ownership.expectation),
     );
-    const state = stateStore.update({
+    const directPatch = {
       browserInteractionMode: mode,
       ...(mode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
       ...(result.configured ? {
         codexCatalogVerified: IS_DEV_PROFILE,
         codexRestartRequired: !IS_DEV_PROFILE,
       } : {}),
-    });
+    };
+    const state = stateStore.update(repairCompletionPatch(ownership, directPatch));
     send("launcher:state-changed", state);
     send("launcher:browser-state", browserHost.snapshot());
     if (!IS_DEV_PROFILE && result.configured) startCatalogVerificationMonitor({ logger, stateStore });
@@ -1171,6 +1487,10 @@ async function start() {
     app.quit();
     return;
   }
+  // Pre-upgrade ownership capture for failure compensation only. A startup
+  // that began as External (or unreadable) must never enter Direct route
+  // restoration even if config disappears mid-startup.
+  let recoveryOwnership = null;
   if (IS_DEV_PROFILE) {
     let config = null;
     try {
@@ -1207,26 +1527,28 @@ async function start() {
       });
     }
   } else void (async () => {
+    // Trusted startup ownership for route compensation, captured before
+    // upgrade/setup work can change or remove the config. A startup that
+    // began as External (or unreadable) must never enter Direct route
+    // restoration, even if an upgrade failure leaves config damaged.
+    try {
+      recoveryOwnership = resolveOwnershipContext({
+        requestedMode: undefined,
+        supervisor: runtimeSupervisor,
+        action: "runtime-startup",
+      });
+    } catch (error) {
+      logger.warn("runtime.startup_ownership_unreadable", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     await startupAuthenticationRefresh;
     const upgrade = await runtimeHost.upgradeManagedRuntime();
     if (upgrade.updated) {
-      const state = stateStore.update({
-        coreSetupComplete: true,
-        codexCatalogVerified: false,
-        codexRestartRequired: true,
-        experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
-        experimentalSkillAttachments: runtimeHost.runtimeConfigSnapshot().config?.experimentalSkillAttachments === true,
-        zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
-        ...(upgrade.mode === "full" ? {
-          mcpRuntimeInstalled: true,
-          mcpSetupComplete: false,
-          mcpGuideStep: 2,
-        } : {
-          mcpRuntimeInstalled: false,
-          mcpSetupComplete: false,
-          mcpGuideStep: 0,
-        }),
-      });
+      const state = stateStore.update(buildUpgradeCompletionPatch({
+        upgrade,
+        snapshotConfig: runtimeHost.runtimeConfigSnapshot().config,
+      }));
       send("launcher:state-changed", state);
       logger.info("runtime.release_upgraded", {
         fromVersion: upgrade.fromVersion,
@@ -1248,38 +1570,46 @@ async function start() {
         send("launcher:state-changed", state);
       }
     }
-    const runtime = await runtimeSupervisor.startIfConfigured();
-    if (runtime.status !== "ready") return runtime;
-    const route = await runtimeHost.connectBridgeRoute();
-    return { ...runtime, bridgeRouteChanged: route.changed === true };
-  })().then(async (runtime) => {
+    // Fresh trusted ownership for route/health decisions: the upgrade above
+    // may have rewritten the config, so the pre-upgrade capture is used only
+    // for failure compensation, never for connect/health authority.
+    const startupOwnership = resolveOwnershipContext({
+      requestedMode: undefined,
+      supervisor: runtimeSupervisor,
+      action: "runtime-startup",
+    });
+    // Ownership continuity across the async upgrade window: a managed upgrade
+    // must preserve routing ownership, so any drift between the pre-upgrade
+    // capture and this fresh capture fails closed here, before runtime start
+    // or route decisions. Drift is never an implicit migration (CLI-only).
+    if (recoveryOwnership) {
+      assertOwnershipContinuity({
+        before: recoveryOwnership.expectation,
+        after: startupOwnership.expectation,
+        action: "runtime-startup",
+      });
+    }
+    const started = await startConfiguredBridgeRuntime({
+      startupOwnership,
+      runtimeHost,
+      runtimeSupervisor,
+    });
+    return { runtime: started.runtime, startupOwnership, recoveryOwnership };
+  })().then(async ({ runtime, startupOwnership, recoveryOwnership }) => {
     if (runtime.status === "ready") {
       const config = runtimeSupervisor.readConfig();
-      const current = stateStore.read();
-      const patch = {
-        coreSetupComplete: true,
-        mcpRuntimeInstalled: config.mode === "full",
-        experimentalBiggerContext: config.experimentalBiggerContext === true,
-        experimentalSkillAttachments: config.experimentalSkillAttachments === true,
-        zeroRiskProEnabled: config.zeroRiskProEnabled === true,
-        ...(runtime.bridgeRouteChanged ? {
-          codexCatalogVerified: false,
-          codexRestartRequired: true,
-        } : {}),
-        ...(config.mode === "browser-only" ? {
-          mcpSetupComplete: false,
-          mcpGuideStep: 0,
-        } : {}),
-      };
-      if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
-        const state = stateStore.update(patch);
-        send("launcher:state-changed", state);
-      }
-      startCatalogVerificationMonitor({ logger, stateStore });
+      completeStartupReadyState({
+        stateStore,
+        send,
+        config,
+        bridgeRouteChanged: runtime.bridgeRouteChanged === true,
+        integrationMode: startupOwnership.integrationMode,
+        startMonitor: () => startCatalogVerificationMonitor({ logger, stateStore }),
+      });
       return;
     }
     if (runtime.status === "not-configured") {
-      const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+      const routeRecovery = await recoverStartupRoute({ startupOwnership: recoveryOwnership, logger, stateStore });
       const current = stateStore.read();
       if (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete) {
         const state = stateStore.update({
@@ -1300,7 +1630,7 @@ async function start() {
       }
       return;
     }
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const routeRecovery = await recoverStartupRoute({ startupOwnership: recoveryOwnership, logger, stateStore });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     if (runtime.status === "external" || runtime.status === "needs-setup") {
@@ -1316,17 +1646,21 @@ async function start() {
           ? `${detail}; restoring the previous Codex route also failed: ${routeRecovery.error}`
           : routeRecovery.restored
             ? `${detail}; the previous Codex route was restored, restart Codex once`
-            : detail,
+            : routeRecovery.ownershipChanged
+              ? `${detail}; installation ownership changed during startup; retry the operation`
+              : detail,
       });
     }
   }).catch(async (error) => {
     const primary = error instanceof Error ? error.message : String(error);
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const routeRecovery = await recoverStartupRoute({ startupOwnership: recoveryOwnership, logger, stateStore });
     const message = routeRecovery.error
       ? `${primary}; restoring the previous Codex route also failed: ${routeRecovery.error}`
       : routeRecovery.restored
         ? `${primary}; the previous Codex route was restored, restart Codex once`
-        : primary;
+        : routeRecovery.ownershipChanged
+          ? `${primary}; installation ownership changed during startup; retry the operation`
+          : primary;
     logger.error("runtime.startup_failed", { message });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
