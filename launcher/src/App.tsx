@@ -88,7 +88,33 @@ export function App() {
     };
   }, []);
 
-  const updateState = useCallback((state: LauncherState) => {
+  // State plus canonical installation freshness. Accepts either a pure
+  // LauncherState (language, prefs, unrelated updates) which preserves the
+  // last known read-only installation field, or a full LauncherSnapshot
+  // (setup, reinstall, remove, smoke, MCP flows) which refreshes both state
+  // and canonical installation existence. The installation field itself is
+  // read-only snapshot data, never persisted locally; onStateChanged
+  // preserves it for unrelated state updates.
+  const updateState = useCallback((stateOrSnapshot: LauncherState | LauncherSnapshot) => {
+    const isSnapshot = (value: LauncherState | LauncherSnapshot): value is LauncherSnapshot =>
+      typeof value === "object"
+      && value !== null
+      && "state" in value
+      && "integrationInstallationState" in value;
+    if (isSnapshot(stateOrSnapshot)) {
+      const next = stateOrSnapshot;
+      setSnapshot((current) => current
+        ? {
+            ...current,
+            state: next.state,
+            integrationInstallationState: next.integrationInstallationState,
+            smokePassed: current.smokePassed
+              || (next.state.browserSmokePassed === true && next.state.browserSmokeVersion === next.version),
+          }
+        : next);
+      return;
+    }
+    const state = stateOrSnapshot;
     setSnapshot((current) => current
       ? {
           ...current,
@@ -152,7 +178,7 @@ function Onboarding({
   language: Language;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
-  updateState: (state: LauncherState) => void;
+  updateState: (stateOrSnapshot: LauncherState | LauncherSnapshot) => void;
 }) {
   const [stage, setStage] = useState<"language" | "interaction" | "support">(
     snapshot.state.language ? "interaction" : "language",
@@ -330,7 +356,7 @@ function LauncherShell({
   operation: OperationState | null;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
-  updateState: (state: LauncherState) => void;
+  updateState: (stateOrSnapshot: LauncherState | LauncherSnapshot) => void;
 }) {
   const interactionSetupComplete = snapshot.state.coreSetupComplete === true
     && (snapshot.state.browserInteractionMode === "manual"
@@ -1095,14 +1121,18 @@ function SetupSurface({
   setError: (error: string | null) => void;
   showMcp: () => void;
   snapshot: LauncherSnapshot;
-  updateState: (state: LauncherState) => void;
+  updateState: (stateOrSnapshot: LauncherState | LauncherSnapshot) => void;
 }) {
   const [localBusy, setLocalBusy] = useState(false);
   const manualInteraction = snapshot.state.browserInteractionMode === "manual";
-  const isNewInstall = snapshot.state.coreSetupComplete !== true;
-  // FINAL-A: first-install ownership intent, Direct by default. Never shown
-  // for configured installs (no GUI migration) or the always-Direct DEV
-  // profile. Canonical G1 config remains authoritative.
+  // Canonical first-install-only ownership intent (blocker fix). The picker is
+  // visible only when canonical installation state is genuinely missing.
+  // Configured or damaged installs never show it, even when readiness flags
+  // like coreSetupComplete are false after startup failure, repair failure,
+  // upgrade state migration, CLI-created installs, or stale launcher state.
+  // The always-Direct DEV profile never shows it. Canonical G1 config
+  // remains authoritative.
+  const isNewInstall = snapshot.integrationInstallationState === "missing";
   const [routingChoice, setRoutingChoice] = useState<LauncherIntegrationMode>("direct");
   const busy = localBusy
     || operation?.status === "running"
@@ -1131,19 +1161,19 @@ function SetupSurface({
   const smoke = () => run(async () => {
     await activateBrowser();
     await api!.smokeTest();
-    updateState((await api!.snapshot()).state);
+    updateState(await api!.snapshot());
   });
   const install = () => run(async () => {
-    // FINAL-A: first-install ownership intent only. A genuinely new
-    // installation (coreSetupComplete !== true) may request Direct (default)
-    // or External; a configured install reinstalls with no requested mode so
-    // the canonical G1 config stays authoritative. No GUI migration.
+    // Canonical first-install ownership intent only. A genuinely missing
+    // installation may request Direct (default) or External; a configured or
+    // damaged install reinstalls with no requested mode so the canonical G1
+    // config stays authoritative. No GUI migration.
     if (!devProfile && isNewInstall) {
       await api!.setupCore({ integrationMode: routingChoice });
     } else {
       await api!.setupCore();
     }
-    updateState((await api!.snapshot()).state);
+    updateState(await api!.snapshot());
   });
   const setZeroRiskPro = (enabled: boolean) => run(async () => {
     updateState(await api!.setZeroRiskPro(enabled));
@@ -1274,7 +1304,7 @@ function McpSurface({
   operation: OperationState | null;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
-  updateState: (state: LauncherState) => void;
+  updateState: (stateOrSnapshot: LauncherState | LauncherSnapshot) => void;
 }) {
   const configuringInactiveMode = interactionMode !== snapshot.state.browserInteractionMode;
   const [step, setStep] = useState(
@@ -1339,7 +1369,7 @@ function McpSurface({
       setTunnelId("");
       setCredentialsConfigured(true);
       setReplacingCredentials(false);
-      updateState((await api!.snapshot()).state);
+      updateState(await api!.snapshot());
       await move(2);
     } catch (cause) {
       setError(messageOf(cause));
@@ -1354,7 +1384,7 @@ function McpSurface({
     setDoctor(null);
     try {
       setDoctor(await api!.verifyMcp());
-      updateState((await api!.snapshot()).state);
+      updateState(await api!.snapshot());
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -1621,7 +1651,7 @@ function SettingsSurface({
   language: Language;
   setError: (error: string | null) => void;
   snapshot: LauncherSnapshot;
-  updateState: (state: LauncherState) => void;
+  updateState: (stateOrSnapshot: LauncherState | LauncherSnapshot) => void;
 }) {
   const [doctor, setDoctor] = useState<DoctorReport | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1698,7 +1728,11 @@ function SettingsSurface({
     try {
       const result = await api!.uninstallIntegration();
       if (!result.cancelled) {
-        updateState(result.state);
+        // After Remove the canonical config is gone (or damaged on failure),
+        // so refresh canonical installation existence from a fresh snapshot.
+        // The snapshot state carries the same Launcher-owned reset as
+        // result.state, plus the read-only installation field.
+        updateState(await api!.snapshot());
         setIntegrationRemoved(true);
       }
     } catch (cause) {

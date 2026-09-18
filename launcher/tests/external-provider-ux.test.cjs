@@ -14,6 +14,7 @@ const {
   DIRECT: DIRECT_INTEGRATION_MODE,
   EXTERNAL_PROVIDER: EXTERNAL_INTEGRATION_MODE,
   extractRequestedIntegrationMode,
+  readIntegrationInstallationState,
 } = require("../electron/integration-mode.cjs");
 
 function sliceMainFunction(startMarker, endMarker) {
@@ -61,20 +62,26 @@ test("FINAL-A new install can select External provider", () => {
   assert.match(appSource, /onClick=\{\(\) => setRoutingChoice\("external-provider"\)\}/);
 });
 
-test("FINAL-A ownership selector is first-install only, never a migration surface", () => {
-  assert.match(appSource, /const isNewInstall = snapshot\.state\.coreSetupComplete !== true;/);
+test("ownership selector is first-install only, never a migration surface", () => {
+  // Supplemental source audit: canonical installation state gates the picker,
+  // never readiness bookkeeping. Behavioral proof lives in the classification
+  // matrix below (configured/damaged + coreSetupComplete=false hides it).
+  assert.match(appSource, /snapshot\.integrationInstallationState === "missing"/);
+  assert.ok(!appSource.match(/const isNewInstall = snapshot\.state\.coreSetupComplete/), "readiness must not decide installation existence");
   assert.match(appSource, /\{!devProfile && isNewInstall \? \(/);
   const settingsStart = appSource.indexOf("function SettingsSurface(");
-  const contentStart = appSource.indexOf("function ContentSurface(", settingsStart);
-  assert.ok(settingsStart > 0 && contentStart > settingsStart);
-  const settingsSource = appSource.slice(settingsStart, contentStart);
+  assert.ok(settingsStart > 0, "Settings surface must exist");
+  const settingsSource = appSource.slice(settingsStart);
   assert.ok(!settingsSource.includes("routingChoice"), "no routing picker in Settings");
-  assert.ok(!settingsSource.includes("integrationMode"), "no ownership input in Settings");
+  assert.ok(!settingsSource.includes("integrationMode: routingChoice"), "no ownership input in Settings");
 });
 
-test("FINAL-A renderer exposes no canonical ownership snapshot field", () => {
+test("renderer exposes canonical installation state, never routing mode", () => {
   assert.ok(!appSource.includes("state.integrationMode"));
   assert.ok(!appSource.includes("snapshot.integrationMode"));
+  assert.match(appSource, /integrationInstallationState/);
+  assert.match(electronMain, /integrationInstallationState: getIntegrationInstallationState\(\)/);
+  assert.match(electronMain, /function getIntegrationInstallationState\(\)/);
 });
 
 test("FINAL-A renderer fixes gating through shared ready flags, not mode branches", () => {
@@ -401,4 +408,331 @@ test("FINAL-A docs describe the ownership-aware Launcher lifecycle", () => {
   assert.match(validationDoc, /migration is CLI-only/);
   const readme = fs.readFileSync(path.join(repositoryRoot, "README.md"), "utf8");
   assert.match(readme, /docs\/opencodex-provider\.md/);
+});
+
+// Canonical installation-state blocker matrix (behavioral). The picker gate
+// and the setup/Remove refreshes are not re-stated here: the shipped renderer
+// expressions are read out of App.tsx and executed, the classification comes
+// from the real G1 reader, and the snapshot protocol runs through the real
+// main.cjs handler. Every case keeps Launcher readiness coreSetupComplete=false,
+// the value that used to open a false migration surface through
+// `coreSetupComplete !== true`.
+
+function extractBalancedBlock(source, openIndex) {
+  let depth = 0;
+  let quote = null;
+  for (let index = openIndex; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (char === "\\") index += 1;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") { quote = char; continue; }
+    if (char === "{") depth += 1;
+    else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(openIndex + 1, index);
+    }
+  }
+  throw new Error("Unbalanced block while reading App.tsx");
+}
+
+// The shipped picker gate expression, executed against a snapshot fixture.
+function rendererPickerGate() {
+  const match = appSource.match(/const isNewInstall = ([^;]+);/);
+  if (!match) throw new Error("App.tsx is missing the canonical isNewInstall gate");
+  return Function("snapshot", `return (${match[1]});`);
+}
+
+// A shipped async renderer flow, executed against mocked props and a mocked
+// preload API. TypeScript syntax is transpiled so the real body runs verbatim.
+function loadRendererFlow({ marker, name, params }) {
+  const ts = require("typescript");
+  const start = appSource.indexOf(marker);
+  if (start < 0) throw new Error(`App.tsx is missing ${name}`);
+  const openIndex = start + marker.length - 1;
+  assert.equal(appSource[openIndex], "{", `${name} marker must end with an opening brace`);
+  const body = extractBalancedBlock(appSource, openIndex);
+  const output = ts.transpileModule(
+    `async function ${name}(${params}) {${body}}`,
+    { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2023 } },
+  ).outputText;
+  const loaded = { exports: {} };
+  Function("module", "exports", "require", `${output}\nmodule.exports = ${name};`)(loaded, loaded.exports, require);
+  return loaded.exports;
+}
+
+const RENDERER_INSTALL_MARKER = "const install = () => run(async () => {";
+const RENDERER_REMOVE_MARKER = "const uninstallIntegration = async () => {";
+
+// Real canonical fixture -> real classification -> real picker gate -> real
+// install() request -> real snapshot refresh. setupCore writes the canonical
+// config, so afterSetupConfig models the post-setup config the next snapshot
+// must re-read.
+async function rendererSetupRequest({ canonicalConfig, afterSetupConfig, routingChoice, devProfile = false }) {
+  const holder = { value: canonicalConfig };
+  const supervisor = { readSetupConfig: () => holder.value };
+  const installationState = readIntegrationInstallationState(supervisor);
+  const pickerVisible = rendererPickerGate()({
+    integrationInstallationState: installationState,
+    state: { coreSetupComplete: false },
+  });
+  const setupCalls = [];
+  const refreshed = [];
+  const api = {
+    setupCore: async (...args) => {
+      setupCalls.push(args);
+      if (afterSetupConfig !== undefined) holder.value = afterSetupConfig;
+    },
+    snapshot: async () => {
+      const fresh = readIntegrationInstallationState(supervisor);
+      return {
+        state: { coreSetupComplete: fresh !== "missing", browserSmokePassed: false },
+        integrationInstallationState: fresh,
+        version: "9.9.9",
+      };
+    },
+  };
+  const install = loadRendererFlow({
+    marker: RENDERER_INSTALL_MARKER,
+    name: "install",
+    params: "devProfile, isNewInstall, routingChoice, api, updateState",
+  });
+  await install(devProfile, pickerVisible, routingChoice, api, (value) => refreshed.push(value));
+  return { installationState, pickerVisible, setupCalls, refreshed };
+}
+
+// Real SettingsSurface removal flow, executed against a mocked API. The
+// snapshot it requests reports the canonical state main would observe
+// immediately after a successful Remove.
+async function rendererRemoveRequest({ installationStateAfterRemove }) {
+  const refreshed = [];
+  const markers = [];
+  let snapshotCalls = 0;
+  const api = {
+    uninstallIntegration: async () => ({ cancelled: false, state: { coreSetupComplete: false } }),
+    snapshot: async () => {
+      snapshotCalls += 1;
+      return {
+        state: { coreSetupComplete: false },
+        integrationInstallationState: installationStateAfterRemove,
+        version: "9.9.9",
+      };
+    },
+  };
+  const remove = loadRendererFlow({
+    marker: RENDERER_REMOVE_MARKER,
+    name: "uninstallIntegration",
+    params: "api, updateState, setBusy, setError, setIntegrationRemoved",
+  });
+  await remove(
+    api,
+    (value) => refreshed.push(value),
+    () => {},
+    (message) => markers.push(message),
+    () => markers.push("removed"),
+  );
+  return { snapshotCalls, refreshed, markers };
+}
+
+// The real launcher:snapshot handler, with the canonical reader wired to a
+// mutable fixture so every call re-reads canonical state.
+function loadSnapshotHandler(canonical) {
+  const source = `${sliceMainFunction("function getIntegrationInstallationState(", 'handle("launcher:set-language",')}\n}\nregisterIpc;`;
+  const handlers = {};
+  const sandbox = {
+    ipcMain: {},
+    registerLoggedIpc: (_ipcMain, _logger, channel, handler) => { handlers[channel] = handler; },
+    readIntegrationInstallationState,
+    runtimeSupervisor: { readSetupConfig: () => canonical.value },
+    runtimeHost: {
+      supervisor: { readSetupConfig: () => canonical.value },
+      browserConnectorName: () => "Codex",
+      setupConnectorName: () => "Codex Zero Risk",
+      mcpCredentialsConfigured: () => false,
+    },
+    browserHost: { snapshot: () => null },
+    LAUNCHER_PROFILE: { kind: "production", codexHome: "C:/codex" },
+    CORE_HOME: "C:/core",
+    launcherUserData: "C:/user-data",
+    GITHUB_URL: "https://github.com",
+    X_URL: "https://x.com",
+    CONNECTORS_URL: "https://connectors",
+    TUNNELS_URL: "https://tunnels",
+    KEYS_URL: "https://keys",
+    process,
+    app: { isPackaged: false, getVersion: () => "5.0.9" },
+    updateController: { getState: () => ({ status: "disabled" }) },
+    smokePassedThisSession: false,
+    lastOperation: null,
+  };
+  const registerIpc = vm.runInNewContext(source, sandbox);
+  registerIpc({
+    logger: { recent: () => [] },
+    stateStore: { read: () => ({ version: 1, language: null }) },
+  });
+  return handlers["launcher:snapshot"];
+}
+
+test("genuinely new install classifies missing and offers Direct by default", async () => {
+  const direct = await rendererSetupRequest({ canonicalConfig: null, routingChoice: "direct" });
+  assert.equal(direct.installationState, "missing");
+  assert.equal(direct.pickerVisible, true);
+  assert.deepEqual(direct.setupCalls, [[{ integrationMode: "direct" }]]);
+  const external = await rendererSetupRequest({ canonicalConfig: null, routingChoice: "external-provider" });
+  assert.equal(external.pickerVisible, true);
+  assert.deepEqual(external.setupCalls, [[{ integrationMode: "external-provider" }]]);
+});
+
+test("the picker gate reads canonical state only, never readiness bookkeeping", () => {
+  const gate = rendererPickerGate();
+  // The old gate (coreSetupComplete !== true) showed the picker in every
+  // configured case below, which is exactly the false migration surface.
+  assert.equal(gate({ integrationInstallationState: "missing", state: { coreSetupComplete: false } }), true);
+  assert.equal(gate({ integrationInstallationState: "missing", state: { coreSetupComplete: true } }), true);
+  assert.equal(gate({ integrationInstallationState: "configured", state: { coreSetupComplete: false } }), false);
+  assert.equal(gate({ integrationInstallationState: "configured", state: { coreSetupComplete: true } }), false);
+  assert.equal(gate({ integrationInstallationState: "damaged", state: { coreSetupComplete: false } }), false);
+  assert.equal(gate({ integrationInstallationState: "damaged", state: { coreSetupComplete: true } }), false);
+});
+
+test("configured Direct with false readiness hides the picker and reinstalls with no mode", async () => {
+  const result = await rendererSetupRequest({
+    canonicalConfig: { mode: "full", integrationMode: "direct" },
+    routingChoice: "external-provider",
+  });
+  assert.equal(result.installationState, "configured");
+  assert.equal(result.pickerVisible, false);
+  assert.deepEqual(result.setupCalls, [[]]);
+});
+
+test("configured External with false readiness hides the picker and reinstalls with no mode", async () => {
+  const result = await rendererSetupRequest({
+    canonicalConfig: { mode: "full", integrationMode: "external-provider" },
+    routingChoice: "direct",
+  });
+  assert.equal(result.installationState, "configured");
+  assert.equal(result.pickerVisible, false);
+  assert.deepEqual(result.setupCalls, [[]]);
+});
+
+test("CLI-created installs with absent Launcher state classify configured and hide the picker", async () => {
+  const fixtures = [
+    ["External", { mode: "browser-only", integrationMode: "external-provider" }],
+    ["Direct", { mode: "full", integrationMode: "direct" }],
+    ["legacy alias External", { mode: "full", codexIntegrationMode: "external-provider" }],
+    ["implicit Direct", { mode: "full" }],
+  ];
+  for (const [label, canonicalConfig] of fixtures) {
+    const result = await rendererSetupRequest({ canonicalConfig, routingChoice: "external-provider" });
+    assert.equal(result.installationState, "configured", label);
+    assert.equal(result.pickerVisible, false, label);
+    assert.deepEqual(result.setupCalls, [[]], label);
+  }
+});
+
+test("failure and reset style readiness never reopens first-install ownership intent", async () => {
+  const canonicalConfig = { mode: "full", integrationMode: "direct" };
+  const supervisor = { readSetupConfig: () => canonicalConfig };
+  const readinessStates = [
+    { coreSetupComplete: false },
+    { coreSetupComplete: false, codexCatalogVerified: false, codexRestartRequired: true },
+    {
+      coreSetupComplete: false,
+      mcpSetupComplete: false,
+      mcpRuntimeInstalled: false,
+      browserInteractionMode: "automatic",
+    },
+  ];
+  for (const state of readinessStates) {
+    const installationState = readIntegrationInstallationState(supervisor);
+    assert.equal(installationState, "configured");
+    assert.equal(rendererPickerGate()({ integrationInstallationState: installationState, state }), false);
+  }
+});
+
+test("DEV profile never sends first-install ownership intent", async () => {
+  const result = await rendererSetupRequest({
+    canonicalConfig: null,
+    routingChoice: "external-provider",
+    devProfile: true,
+  });
+  assert.equal(result.installationState, "missing");
+  assert.deepEqual(result.setupCalls, [[]]);
+});
+
+test("damaged canonical config hides the picker and sends no mode intent", async () => {
+  const damagedFixtures = [{ integrationMode: "opencodex" }, { integrationMode: 5 }, [], "not-an-object"];
+  for (const canonicalConfig of damagedFixtures) {
+    const result = await rendererSetupRequest({ canonicalConfig, routingChoice: "direct" });
+    assert.equal(result.installationState, "damaged", JSON.stringify(canonicalConfig));
+    assert.equal(result.pickerVisible, false, JSON.stringify(canonicalConfig));
+    assert.deepEqual(result.setupCalls, [[]], JSON.stringify(canonicalConfig));
+  }
+  const unreadable = { readSetupConfig: () => { throw new Error("Unexpected token u in JSON at position 0"); } };
+  assert.equal(readIntegrationInstallationState(unreadable), "damaged");
+  const undefinedReader = { readSetupConfig: () => undefined };
+  assert.equal(readIntegrationInstallationState(undefinedReader), "damaged");
+});
+
+test("unexpected supervisor misuse throws instead of looking damaged", () => {
+  assert.throws(() => readIntegrationInstallationState(null), /no configuration reader/);
+  assert.throws(() => readIntegrationInstallationState({}), /no configuration reader/);
+});
+
+test("setup success refreshes the renderer to configured without a restart", async () => {
+  const result = await rendererSetupRequest({
+    canonicalConfig: null,
+    afterSetupConfig: { mode: "browser-only", integrationMode: "external-provider" },
+    routingChoice: "external-provider",
+  });
+  assert.equal(result.installationState, "missing");
+  assert.deepEqual(result.setupCalls, [[{ integrationMode: "external-provider" }]]);
+  assert.equal(result.refreshed.length, 1, "setup must refresh through a full snapshot");
+  assert.equal(result.refreshed[0].integrationInstallationState, "configured");
+  assert.equal(rendererPickerGate()({
+    integrationInstallationState: result.refreshed[0].integrationInstallationState,
+    state: result.refreshed[0].state,
+  }), false);
+});
+
+test("Remove success refreshes the renderer to missing so intent may legitimately return", async () => {
+  const removed = await rendererRemoveRequest({ installationStateAfterRemove: "missing" });
+  assert.equal(removed.snapshotCalls, 1, "Remove must re-read canonical state");
+  assert.equal(removed.refreshed.length, 1, "Remove must refresh through a full snapshot");
+  assert.equal(removed.refreshed[0].integrationInstallationState, "missing");
+  assert.ok(removed.markers.includes("removed"));
+  assert.equal(rendererPickerGate()({
+    integrationInstallationState: removed.refreshed[0].integrationInstallationState,
+    state: removed.refreshed[0].state,
+  }), true);
+});
+
+test("Remove that leaves damaged canonical config refreshes to damaged with no intent", async () => {
+  const removed = await rendererRemoveRequest({ installationStateAfterRemove: "damaged" });
+  assert.equal(removed.refreshed.length, 1);
+  assert.equal(removed.refreshed[0].integrationInstallationState, "damaged");
+  assert.equal(rendererPickerGate()({
+    integrationInstallationState: removed.refreshed[0].integrationInstallationState,
+    state: removed.refreshed[0].state,
+  }), false);
+});
+
+test("initial snapshot carries canonical installation state and re-reads it per call", async () => {
+  const canonical = { value: null };
+  const snapshot = loadSnapshotHandler(canonical);
+  const first = await snapshot();
+  assert.ok(Object.prototype.hasOwnProperty.call(first, "integrationInstallationState"));
+  assert.equal(first.integrationInstallationState, "missing");
+  assert.equal(first.state.version, 1);
+  assert.ok(!("integrationMode" in first), "routing mode is never exposed to the renderer");
+  canonical.value = { mode: "full", integrationMode: "direct" };
+  assert.equal((await snapshot()).integrationInstallationState, "configured");
+  canonical.value = { mode: "full", integrationMode: "external-provider" };
+  assert.equal((await snapshot()).integrationInstallationState, "configured");
+  canonical.value = { integrationMode: "opencodex" };
+  assert.equal((await snapshot()).integrationInstallationState, "damaged");
+  canonical.value = null;
+  assert.equal((await snapshot()).integrationInstallationState, "missing");
 });

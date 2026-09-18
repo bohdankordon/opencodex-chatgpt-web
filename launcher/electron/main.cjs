@@ -43,6 +43,7 @@ const {
   assertOwnershipContinuity,
   EXTERNAL_PROVIDER: EXTERNAL_INTEGRATION_MODE,
   extractRequestedIntegrationMode,
+  readIntegrationInstallationState,
   resolveOwnershipContext,
 } = require("./integration-mode.cjs");
 const { validateRuntimeOwnershipHealth } = require("./runtime-health.cjs");
@@ -707,6 +708,17 @@ function resolveSetupOwnership(requestedMode, action) {
   return context;
 }
 
+// Canonical read-only installation state for the renderer snapshot (FINAL-A
+// blocker fix). Derived fresh from canonical runtime/setup config at snapshot
+// time via the G1 reader, never persisted into launcher-state.json and never
+// renderer-settable. Missing means no canonical config, configured means a
+// valid install exists, damaged means config exists but ownership cannot be
+// safely proven. Readiness flags are never consulted here.
+function getIntegrationInstallationState() {
+  const supervisor = runtimeSupervisor || runtimeHost?.supervisor;
+  return readIntegrationInstallationState(supervisor);
+}
+
 function validateBounds(value) {
   if (!value || typeof value !== "object") throw new Error("Browser bounds are required");
   for (const key of ["x", "y", "width", "height"]) {
@@ -729,6 +741,7 @@ function registerIpc({ logger, stateStore }) {
       userData: launcherUserData,
     },
     state: stateStore.read(),
+    integrationInstallationState: getIntegrationInstallationState(),
     browser: browserHost?.snapshot() ?? null,
     connectorName: runtimeHost.browserConnectorName(),
     connectorNames: {

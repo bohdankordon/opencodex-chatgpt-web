@@ -231,6 +231,25 @@ function extractRequestedIntegrationMode(input) {
   return normalizeRequestedIntegrationMode(input.integrationMode);
 }
 
+// Canonical read-only installation existence for the renderer snapshot
+// (FINAL-A blocker fix). Returns "missing" | "configured" | "damaged"
+// without exposing routing mode. Reuses readCanonicalIntegrationState so
+// canonical parsing/validation is never duplicated: missing/configured map
+// directly, any LAUNCHER_CONFIG_DAMAGED error maps to "damaged". Unexpected
+// internal errors (for example a missing supervisor reader) propagate so they
+// are never mistaken for damaged config. Never reads launcher-state.json,
+// readiness flags, or renderer input.
+function readIntegrationInstallationState(supervisor) {
+  try {
+    const canonical = readCanonicalIntegrationState(supervisor);
+    if (canonical.kind === "missing") return "missing";
+    return "configured";
+  } catch (error) {
+    if (error && error.code === "LAUNCHER_CONFIG_DAMAGED") return "damaged";
+    throw error;
+  }
+}
+
 module.exports = {
   DIRECT: DIRECT,
   EXTERNAL_PROVIDER: EXTERNAL_PROVIDER,
@@ -241,6 +260,7 @@ module.exports = {
   isLauncherIntegrationMode: isLauncherIntegrationMode,
   normalizeRequestedIntegrationMode: normalizeRequestedIntegrationMode,
   readCanonicalIntegrationState: readCanonicalIntegrationState,
+  readIntegrationInstallationState: readIntegrationInstallationState,
   resolveIntegrationModeFromRaw: resolveIntegrationModeFromRaw,
   resolveLauncherIntegrationMode: resolveLauncherIntegrationMode,
   resolveOwnershipContext: resolveOwnershipContext,
