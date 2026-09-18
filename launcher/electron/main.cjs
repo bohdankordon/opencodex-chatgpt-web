@@ -758,6 +758,9 @@ function registerIpc({ logger, stateStore }) {
   });
   handle("launcher:setup-core", async (_event, input) => {
     const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-core");
+    // Revalidate trusted provenance BEFORE browser-visible work (probe below)
+    // and pass the SAME expectation to the runtime for its own revalidation.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-core");
     const setupState = stateStore.read();
     if (setupState.browserInteractionMode === "automatic") {
       const browser = await browserHost.probeAuthentication();
@@ -781,8 +784,8 @@ function registerIpc({ logger, stateStore }) {
     }
     // G1 carries resolved ownership into the runtime call; CLI semantics unchanged (G2).
     const result = IS_DEV_PROFILE
-      ? await runtimeHost.setupDevCore()
-      : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode });
+      ? await runtimeHost.setupDevCore(input, ownership.expectation)
+      : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode }, ownership.expectation);
     stateStore.update({
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
@@ -822,8 +825,17 @@ function registerIpc({ logger, stateStore }) {
       replace: input?.replace === true,
       interactionMode,
       integrationMode: ownership.integrationMode,
-    }, afterRuntimeReady);
-    if (!interactionModeChange && interactionMode === "automatic") await browserHost.reveal();
+    }, afterRuntimeReady, ownership.expectation);
+    // withInteractionModeChange writes override/descriptor state before the
+    // runtime action runs, and reveal() shows browser UI: revalidate trusted
+    // provenance BEFORE either browser-visible mutation.
+    if (!interactionModeChange && interactionMode === "automatic") {
+      runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-mcp");
+      await browserHost.reveal();
+    }
+    if (interactionModeChange) {
+      runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-mcp");
+    }
     const result = interactionModeChange
       ? await browserHost.withInteractionModeChange(interactionMode, runSetup)
       : await runSetup();
@@ -859,7 +871,7 @@ function registerIpc({ logger, stateStore }) {
   });
   handle("launcher:bigger-context", async (_event, enabled, options) => {
     const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
-    const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode });
+    const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
     const state = stateStore.update({
       experimentalBiggerContext: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
@@ -874,7 +886,7 @@ function registerIpc({ logger, stateStore }) {
     if (browserHost.activeTraceId || browserHost.currentOperation()) {
       throw new Error("Finish or cancel active ChatGPT turns before changing Skills as files");
     }
-    const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode });
+    const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
     const state = stateStore.update({ experimentalSkillAttachments: result.enabled });
     send("launcher:state-changed", state);
     return state;
@@ -889,7 +901,7 @@ function registerIpc({ logger, stateStore }) {
           : `Finish ${browserOperation} before changing Zero Risk model profiles`,
       );
     }
-    const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode });
+    const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
     const state = stateStore.update({
       zeroRiskProEnabled: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE,
@@ -917,9 +929,12 @@ function registerIpc({ logger, stateStore }) {
     if (!runtimeHost.mcpCredentialsConfigured(mode)) {
       return { state: current, credentialsRequired: true, targetMode: mode };
     }
+    // withInteractionModeChange mutates override/descriptor state before the
+    // runtime action runs: revalidate trusted provenance first.
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "browser-interaction-mode");
     const result = await browserHost.withInteractionModeChange(
       mode,
-      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady, { integrationMode: ownership.integrationMode }),
+      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady, { integrationMode: ownership.integrationMode }, ownership.expectation),
     );
     const state = stateStore.update({
       browserInteractionMode: mode,

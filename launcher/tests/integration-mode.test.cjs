@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const {
   DIRECT,
   EXTERNAL_PROVIDER,
+  assertOwnershipExpectationCurrent,
   extractRequestedIntegrationMode,
   isLauncherIntegrationMode,
   normalizeRequestedIntegrationMode,
@@ -189,4 +190,183 @@ test("IPC payload extractor accepts only the structured object shape", () => {
   assert.throws(() => extractRequestedIntegrationMode(42), /payload is invalid/);
   assert.throws(() => extractRequestedIntegrationMode(["direct"]), /payload is invalid/);
   assert.throws(() => extractRequestedIntegrationMode({ integrationMode: "bogus" }), /must be direct or external-provider/);
+});
+
+// G1 blocker-fix regression tests: provenance, revalidation, sanitization.
+// Numbers map to the blocker-fix test plan (A/E sections).
+
+test("E21 unexpected undefined reader result fails closed, never missing", () => {
+  assert.throws(
+    () => readCanonicalIntegrationState({ readSetupConfig: () => undefined }),
+    /damaged/,
+  );
+  assert.throws(
+    () => resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: null }),
+    /ownership state is invalid/,
+  );
+  assert.throws(
+    () => resolveLauncherIntegrationMode({ requestedMode: "direct" }),
+    /ownership state is invalid/,
+  );
+});
+
+test("damaged errors stay bounded and keep raw detail internal", () => {
+  let malformed;
+  try {
+    readCanonicalIntegrationState({ readSetupConfig: () => ({ integrationMode: "opencodex" }) });
+  } catch (error) {
+    malformed = error;
+  }
+  assert.ok(malformed);
+  assert.match(malformed.message, /damaged/);
+  assert.match(malformed.message, /invalid integration mode/);
+  assert.ok(!malformed.message.includes("opencodex"));
+  assert.equal(malformed.code, "LAUNCHER_CONFIG_DAMAGED");
+  assert.equal(malformed.detail, "Invalid integrationMode; expected direct or external-provider");
+  let unreadable;
+  try {
+    readCanonicalIntegrationState({ readSetupConfig: () => { throw new SyntaxError("Unexpected token < in JSON"); } });
+  } catch (error) {
+    unreadable = error;
+  }
+  assert.ok(unreadable);
+  assert.match(unreadable.message, /invalid JSON/);
+  assert.ok(!unreadable.message.includes("Unexpected token"));
+});
+
+test("E18 malformed canonical with valid legacy is rejected", () => {
+  assert.throws(
+    () => resolveIntegrationModeFromRaw({ integrationMode: "bogus", codexIntegrationMode: "direct" }),
+    /Invalid integrationMode/,
+  );
+});
+
+test("E19 valid canonical with malformed legacy is rejected", () => {
+  assert.throws(
+    () => resolveIntegrationModeFromRaw({ integrationMode: "direct", codexIntegrationMode: "bogus" }),
+    /Invalid codexIntegrationMode/,
+  );
+});
+
+test("E20 malformed legacy classes are rejected", () => {
+  const bad = [null, 42, ["direct"], { mode: "direct" }, "", "   ", "external-provider "];
+  for (const candidate of bad) {
+    assert.throws(
+      () => resolveIntegrationModeFromRaw({ codexIntegrationMode: candidate }),
+      /Invalid codexIntegrationMode/,
+    );
+  }
+});
+
+function scriptedSupervisor(results) {
+  let calls = 0;
+  return {
+    calls: () => calls,
+    readSetupConfig: () => {
+      const next = results[Math.min(calls, results.length - 1)];
+      calls += 1;
+      if (next instanceof Error) throw next;
+      return next;
+    },
+  };
+}
+
+test("expectations are frozen and branded", () => {
+  const supervisor = scriptedSupervisor([null]);
+  const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
+  assert.ok(Object.isFrozen(context.expectation));
+  assert.deepEqual(
+    { expectedKind: context.expectation.expectedKind, integrationMode: context.expectation.integrationMode },
+    { expectedKind: "missing", integrationMode: "direct" },
+  );
+});
+
+test("renderer cannot invent ownership provenance", () => {
+  const supervisor = scriptedSupervisor([null]);
+  const forgedKinds = [
+    { expectedKind: "missing", integrationMode: "external-provider" },
+    { expectedKind: "configured", integrationMode: "direct" },
+    { expectedKind: "configured", integrationMode: "external-provider" },
+  ];
+  for (const forged of forgedKinds) {
+    assert.throws(
+      () => assertOwnershipExpectationCurrent({ supervisor, expectation: forged, action: "setup-core" }),
+      /expectation is invalid/,
+    );
+  }
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: undefined, action: "setup-core" }),
+    /expectation is invalid/,
+  );
+  assert.equal(supervisor.calls(), 0);
+});
+
+test("A1 configured external deleted before revalidation fails closed", () => {
+  const supervisor = scriptedSupervisor([{ integrationMode: "external-provider" }, null]);
+  const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
+  assert.equal(context.integrationMode, "external-provider");
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
+    /changed while preparing setup-core/,
+  );
+  assert.equal(supervisor.calls(), 2);
+});
+
+test("A2 configured direct deleted before revalidation fails closed", () => {
+  const supervisor = scriptedSupervisor([{ mode: "browser-only" }, null]);
+  const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-mcp" });
+  assert.equal(context.integrationMode, "direct");
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-mcp" }),
+    /changed while preparing setup-mcp/,
+  );
+});
+
+test("A3 missing with config appearing before revalidation fails closed", () => {
+  const supervisor = scriptedSupervisor([null, { mode: "browser-only" }]);
+  const context = resolveOwnershipContext({ requestedMode: "direct", supervisor, action: "setup-core" });
+  assert.equal(context.newInstallation, true);
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
+    /changed while preparing setup-core/,
+  );
+});
+
+test("A4 configured external flipping to direct fails closed", () => {
+  const supervisor = scriptedSupervisor([{ integrationMode: "external-provider" }, { integrationMode: "direct" }]);
+  const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
+    /changed while preparing setup-core/,
+  );
+});
+
+test("A5 configured direct flipping to external fails closed", () => {
+  const supervisor = scriptedSupervisor([{}, { integrationMode: "external-provider" }]);
+  const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
+  assert.equal(context.integrationMode, "direct");
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
+    /changed while preparing setup-core/,
+  );
+});
+
+test("A6 configured valid becoming malformed fails closed", () => {
+  const supervisor = scriptedSupervisor([{}, { integrationMode: "opencodex" }]);
+  const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
+  assert.throws(
+    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
+    /damaged/,
+  );
+});
+
+test("stable expectation revalidates cleanly in both kinds", () => {
+  const external = scriptedSupervisor([{ integrationMode: "external-provider" }, { integrationMode: "external-provider" }]);
+  const kept = resolveOwnershipContext({ requestedMode: undefined, supervisor: external, action: "setup-core" });
+  const rechecked = assertOwnershipExpectationCurrent({ supervisor: external, expectation: kept.expectation, action: "setup-core" });
+  assert.equal(rechecked.integrationMode, "external-provider");
+  const fresh = scriptedSupervisor([null, null]);
+  const created = resolveOwnershipContext({ requestedMode: "direct", supervisor: fresh, action: "setup-core" });
+  const recheckedFresh = assertOwnershipExpectationCurrent({ supervisor: fresh, expectation: created.expectation, action: "setup-core" });
+  assert.equal(recheckedFresh.kind, "missing");
 });

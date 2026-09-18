@@ -23,7 +23,7 @@ function isLauncherIntegrationMode(value) {
 // Never coerces; malformed input throws.
 function normalizeRequestedIntegrationMode(value) {
   if (value === undefined) return undefined;
-  if (value === DIRECT || value === EXTERNAL_PROVIDER) return value;
+  if (isLauncherIntegrationMode(value)) return value;
   throw new Error("Integration mode must be direct or external-provider");
 }
 
@@ -54,8 +54,21 @@ function resolveIntegrationModeFromRaw(raw) {
   return DIRECT;
 }
 
-function damagedConfigError(detail) {
-  return new Error("Runtime configuration is damaged and cannot prove routing ownership: " + detail);
+// User-facing damaged-config errors stay bounded: the raw parser/fs detail is
+// kept on error.detail for internal diagnostics only and never shown to the
+// renderer. kind is a safe coarse classification.
+function damagedConfigError(kind, detail) {
+  const error = new Error(
+    "Runtime configuration is damaged and cannot prove routing ownership (" + kind + ")."
+  );
+  error.code = "LAUNCHER_CONFIG_DAMAGED";
+  error.detail = detail;
+  return error;
+}
+
+function classifyReadFailure(message) {
+  if (/json|unexpected token|parse/i.test(String(message))) return "invalid JSON";
+  return "invalid configuration";
 }
 
 // Tri-state canonical read over the lenient setup-config path.
@@ -72,14 +85,20 @@ function readCanonicalIntegrationState(supervisor) {
   try {
     raw = supervisor.readSetupConfig();
   } catch (error) {
-    throw damagedConfigError(error instanceof Error ? error.message : String(error));
+    const detail = error instanceof Error ? error.message : String(error);
+    throw damagedConfigError(classifyReadFailure(detail), detail);
   }
-  if (raw === null || raw === undefined) return { kind: "missing" };
+  // Only an explicit null proves absence. An undefined or otherwise unexpected
+  // reader result fails closed instead of looking like a new installation.
+  if (raw === null) return { kind: "missing" };
+  if (raw === undefined) {
+    throw damagedConfigError("invalid configuration", "Runtime configuration reader returned undefined.");
+  }
   let integrationMode;
   try {
     integrationMode = resolveIntegrationModeFromRaw(raw);
   } catch (error) {
-    throw damagedConfigError(error instanceof Error ? error.message : String(error));
+    throw damagedConfigError("invalid integration mode", error instanceof Error ? error.message : String(error));
   }
   return { kind: "configured", integrationMode: integrationMode, config: raw };
 }
@@ -95,7 +114,10 @@ function resolveLauncherIntegrationMode(options) {
   const canonical = settings.canonical;
   const action = settings.action || "operation";
   const requested = normalizeRequestedIntegrationMode(settings.requestedMode);
-  if (!canonical || canonical.kind === "missing") return requested !== undefined ? requested : DIRECT;
+  if (!canonical || typeof canonical !== "object") {
+    throw new Error("Launcher routing ownership state is invalid");
+  }
+  if (canonical.kind === "missing") return requested !== undefined ? requested : DIRECT;
   if (canonical.kind !== "configured") {
     throw new Error("Launcher routing ownership state is invalid");
   }
@@ -120,7 +142,62 @@ function resolveOwnershipContext(options) {
     integrationMode: integrationMode,
     newInstallation: canonical.kind === "missing",
     canonical: canonical,
+    expectation: createOwnershipExpectation(canonical, integrationMode),
   };
+}
+
+// Trusted ownership provenance (G1 blocker fix). The expectation records what
+// the first trusted canonical read observed. It is created only by this
+// module, branded with a module-private symbol, and frozen. Renderer input,
+// preload payloads and plain hand-built objects can never satisfy
+// assertTrustedExpectation, so installation provenance cannot be invented or
+// downgraded across the pre-browser and runtime validation boundaries.
+const OWNERSHIP_PROVENANCE = Symbol("launcherOwnershipProvenance");
+
+function createOwnershipExpectation(canonical, integrationMode) {
+  return Object.freeze({
+    expectedKind: canonical.kind,
+    integrationMode: integrationMode,
+    [OWNERSHIP_PROVENANCE]: true,
+  });
+}
+
+function assertTrustedExpectation(expectation) {
+  if (!expectation || typeof expectation !== "object" ||
+      (expectation.expectedKind !== "missing" && expectation.expectedKind !== "configured") ||
+      !isLauncherIntegrationMode(expectation.integrationMode) ||
+      expectation[OWNERSHIP_PROVENANCE] !== true) {
+    throw new Error("Launcher ownership expectation is invalid; retry the operation.");
+  }
+  return expectation;
+}
+
+function installationChangedError(action) {
+  return new Error(
+    "Runtime installation state changed while preparing " + action + "; retry the operation."
+  );
+}
+
+// Revalidate a trusted expectation against a fresh canonical read. Configured
+// expects configured with the same mode; missing expects missing. Every other
+// transition, including configured-to-missing, missing-to-configured, mode
+// flips and damaged reads, fails closed so an installation can never silently
+// become new (or change mode) mid-transaction.
+function assertOwnershipExpectationCurrent(options) {
+  const settings = options || {};
+  const action = settings.action || "operation";
+  const expectation = assertTrustedExpectation(settings.expectation);
+  const actual = readCanonicalIntegrationState(settings.supervisor);
+  if (expectation.expectedKind === "configured") {
+    if (actual.kind !== "configured" || actual.integrationMode !== expectation.integrationMode) {
+      throw installationChangedError(action);
+    }
+    return { kind: "configured", integrationMode: actual.integrationMode, config: actual.config };
+  }
+  if (actual.kind !== "missing") {
+    throw installationChangedError(action);
+  }
+  return { kind: "missing", integrationMode: expectation.integrationMode };
 }
 
 // Pull integrationMode out of flexible IPC payloads. Only undefined counts as
@@ -138,6 +215,7 @@ function extractRequestedIntegrationMode(input) {
 module.exports = {
   DIRECT: DIRECT,
   EXTERNAL_PROVIDER: EXTERNAL_PROVIDER,
+  assertOwnershipExpectationCurrent: assertOwnershipExpectationCurrent,
   damagedConfigError: damagedConfigError,
   extractRequestedIntegrationMode: extractRequestedIntegrationMode,
   isLauncherIntegrationMode: isLauncherIntegrationMode,

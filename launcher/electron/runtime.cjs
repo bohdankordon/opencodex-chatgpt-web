@@ -15,7 +15,10 @@ const {
 } = require("./connector-identity.cjs");
 const { embeddedRuntimeInvocation, runtimeInvocation } = require("./runtime-command.cjs");
 const {
+  DIRECT,
+  assertOwnershipExpectationCurrent,
   extractRequestedIntegrationMode,
+  normalizeRequestedIntegrationMode,
   resolveOwnershipContext,
 } = require("./integration-mode.cjs");
 const { redactText } = require("./logging.cjs");
@@ -446,16 +449,57 @@ class RuntimeHost {
     };
   }
 
-  // G1 (PR #2): validate routing ownership for a setup-changing action.
-  // Reads canonical config (never renderer or launcher-state authority) and
-  // throws on mismatch or damaged config BEFORE the caller mutates anything.
-  // G2 consumes the threaded mode parameter for command and checkpoint policy.
-  resolveSetupOwnership(requestedMode, action) {
-    return resolveOwnershipContext({
-      requestedMode: requestedMode,
+  // Ownership provenance gate (G1 blocker fix). Every setup-changing method
+  // validates through here BEFORE mutating anything. Direct callers omit the
+  // trusted expectation and get provenance established from the current
+  // canonical read; main IPC passes the SAME expectation it validated before
+  // browser work, which is revalidated here. G2 consumes the threaded mode
+  // for command and checkpoint policy.
+  validateSetupOwnership(requestedMode, expectation, action) {
+    if (expectation === undefined) {
+      const context = resolveOwnershipContext({
+        requestedMode: requestedMode,
+        supervisor: this.supervisor,
+        action: action,
+      });
+      this.enforceProfileOwnership(context.integrationMode);
+      return context;
+    }
+    const current = assertOwnershipExpectationCurrent({
       supervisor: this.supervisor,
+      expectation: expectation,
       action: action,
     });
+    const requested = normalizeRequestedIntegrationMode(requestedMode);
+    if (requested !== undefined && requested !== current.integrationMode) {
+      throw new Error("Integration ownership mismatch: installation is " + current.integrationMode + " but " + requested + " was requested; ownership migration is CLI-only (action: " + action + ").");
+    }
+    this.enforceProfileOwnership(current.integrationMode);
+    return {
+      integrationMode: current.integrationMode,
+      newInstallation: current.kind === "missing",
+      canonical: current,
+      expectation: expectation,
+    };
+  }
+
+  // Read-only revalidation for main-process pre-browser guards. Shares the
+  // same trusted-expectation check as the mutating path.
+  assertOwnershipExpectationCurrent(expectation, action) {
+    return assertOwnershipExpectationCurrent({
+      supervisor: this.supervisor,
+      expectation: expectation,
+      action: action,
+    });
+  }
+
+  // DEV profile is Direct-only. Central enforcement so every production and
+  // DEV setup path, including direct RuntimeHost callers, fails closed on
+  // external-provider instead of silently continuing as Direct.
+  enforceProfileOwnership(integrationMode) {
+    if (this.launcherProfile === "development" && integrationMode !== DIRECT) {
+      throw new Error("External provider routing is unavailable in the isolated DEV launcher profile");
+    }
   }
 
   mcpCredentialsConfigured(requestedMode) {
@@ -1004,9 +1048,9 @@ class RuntimeHost {
     }
   }
 
-  async setupCore(input) {
-    // G1 validates ownership; the threaded mode parameter is consumed by G2.
-    this.resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-core");
+  async setupCore(input, expectation) {
+    // G1 validates ownership provenance; the threaded mode is consumed by G2.
+    this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-core");
     this.assertProductionProfile("Codex integration setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
@@ -1038,7 +1082,10 @@ class RuntimeHost {
     return { ...result, mode };
   }
 
-  async setupDevCore() {
+  async setupDevCore(input, expectation) {
+    // DEV is Direct-only: canonical or requested external-provider rejects here
+    // even for direct RuntimeHost callers that bypass main IPC.
+    this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-dev-core");
     if (this.launcherProfile !== "development") {
       throw new Error("DEV profile setup requires the isolated DEV launcher");
     }
@@ -1068,9 +1115,9 @@ class RuntimeHost {
     return { ...result, mode };
   }
 
-  async setBiggerContext(enabled, options) {
-    // G1 validates ownership; the threaded mode parameter is consumed by G2.
-    this.resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
+  async setBiggerContext(enabled, options, expectation) {
+    // G1 validates ownership provenance; the threaded mode is consumed by G2.
+    this.validateSetupOwnership(extractRequestedIntegrationMode(options), expectation, "bigger-context");
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Initialize the runtime before changing Bigger Context");
@@ -1116,9 +1163,9 @@ class RuntimeHost {
     return { ...result, mode, enabled: enabled === true };
   }
 
-  async setSkillAttachments(enabled, ownershipInput) {
-    // G1 validates ownership; the threaded mode parameter is consumed by G2.
-    this.resolveSetupOwnership(extractRequestedIntegrationMode(ownershipInput), "skill-attachments");
+  async setSkillAttachments(enabled, ownershipInput, expectation) {
+    // G1 validates ownership provenance; the threaded mode is consumed by G2.
+    this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "skill-attachments");
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) throw new Error("Initialize the runtime before changing Skills as files");
     if (current.config?.browserInteractionMode === "manual") {
@@ -1146,9 +1193,9 @@ class RuntimeHost {
     return { ...result, enabled: enabled === true };
   }
 
-  async setZeroRiskPro(enabled, ownershipInput) {
-    // G1 validates ownership; the threaded mode parameter is consumed by G2.
-    this.resolveSetupOwnership(extractRequestedIntegrationMode(ownershipInput), "zero-risk-pro");
+  async setZeroRiskPro(enabled, ownershipInput, expectation) {
+    // G1 validates ownership provenance; the threaded mode is consumed by G2.
+    this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "zero-risk-pro");
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Install the Codex integration before changing Zero Risk model profiles");
@@ -1243,9 +1290,9 @@ class RuntimeHost {
     };
   }
 
-  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, integrationMode: requestedIntegrationMode } = {}, afterRuntimeReady) {
-    // G1 validates ownership; the threaded mode parameter is consumed by G2.
-    this.resolveSetupOwnership(requestedIntegrationMode, "setup-mcp");
+  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, integrationMode: requestedIntegrationMode } = {}, afterRuntimeReady, expectation) {
+    // G1 validates ownership provenance; the threaded mode is consumed by G2.
+    this.validateSetupOwnership(requestedIntegrationMode, expectation, "setup-mcp");
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const targetMode = interactionMode ?? this.browserInteractionMode();
@@ -1294,7 +1341,10 @@ class RuntimeHost {
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
-  setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, integrationMode: requestedIntegrationMode } = {}, afterRuntimeReady, expectation) {
+    // DEV is Direct-only: canonical or requested external-provider rejects here
+    // even for direct RuntimeHost callers that bypass main IPC.
+    this.validateSetupOwnership(requestedIntegrationMode, expectation, "setup-dev-mcp");
     if (this.launcherProfile !== "development") {
       throw new Error("DEV MCP setup requires the isolated DEV launcher");
     }
@@ -1338,9 +1388,9 @@ class RuntimeHost {
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
-  async setBrowserInteractionMode(mode, afterRuntimeReady, ownershipInput) {
-    // G1 validates ownership; the threaded mode parameter is consumed by G2.
-    this.resolveSetupOwnership(extractRequestedIntegrationMode(ownershipInput), "browser-interaction-mode");
+  async setBrowserInteractionMode(mode, afterRuntimeReady, ownershipInput, expectation) {
+    // G1 validates ownership provenance; the threaded mode is consumed by G2.
+    this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "browser-interaction-mode");
     if (mode !== "automatic" && mode !== "manual") {
       throw new Error("Browser interaction mode must be automatic or manual");
     }

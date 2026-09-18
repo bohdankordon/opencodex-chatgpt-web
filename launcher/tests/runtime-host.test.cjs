@@ -1384,3 +1384,142 @@ test("G1.13 damaged runtime config fails closed instead of looking like a new in
   await assert.rejects(malformed.host.setupCore(), /damaged/);
   assert.equal(malformed.invocation(), undefined);
 });
+
+// G1 blocker-fix regression tests: provenance revalidation, pre-mutation
+// ordering with spies, and DEV Direct-only enforcement at runtime level.
+
+function provenanceHost(reads, options) {
+  const settings = options || {};
+  const launcherProfile = settings.launcherProfile || "production";
+  let readCalls = 0;
+  let stops = 0;
+  const host = new RuntimeHost({
+    app: {
+      getPath: () => path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
+      getVersion: () => "1.1.3",
+    },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: "/source",
+    browserDescriptorPath: "/runtime/launcher-browser.json",
+    ...(launcherProfile === "development"
+      ? { coreHome: "/dev-test", launcherProfile: "development" }
+      : {}),
+    supervisor: {
+      readConfig: () => (typeof reads[0] === "object" && reads[0] !== null && !(reads[0] instanceof Error) ? reads[0] : null),
+      readSetupConfig: () => {
+        const next = reads[Math.min(readCalls, reads.length - 1)];
+        readCalls += 1;
+        if (next instanceof Error) throw next;
+        return next;
+      },
+      stopForSetup: async () => {
+        stops += 1;
+        return { status: "stopped" };
+      },
+      startIfConfigured: async () => ({ status: "ready" }),
+    },
+    getBrowserInteractionMode: () => settings.interactionMode || "automatic",
+  });
+  let invocation;
+  const record = async (name, args, options) => {
+    invocation = { name, args };
+    await options.afterRuntimeReady?.();
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  host.runSetup = record;
+  host.runDevSetup = record;
+  return {
+    host,
+    invocation: () => invocation,
+    reads: () => readCalls,
+    stops: () => stops,
+  };
+}
+
+test("C10 configured external deleted before runtime mutation rejects without setup", async () => {
+  const external = { mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" };
+  const fixture = provenanceHost([external, null]);
+  const main = fixture.host.validateSetupOwnership(undefined, undefined, "setup-core");
+  assert.equal(main.integrationMode, "external-provider");
+  await assert.rejects(fixture.host.setupCore(undefined, main.expectation), /changed while preparing setup-core/);
+  assert.equal(fixture.invocation(), undefined);
+  assert.equal(fixture.stops(), 0);
+  assert.ok(fixture.reads() >= 2);
+});
+
+test("C11 expected missing with config appearing before runtime mutation rejects", async () => {
+  const direct = { mode: "browser-only", browserHost: "launcher" };
+  const fixture = provenanceHost([null, direct]);
+  const main = fixture.host.validateSetupOwnership(undefined, undefined, "setup-core");
+  assert.equal(main.newInstallation, true);
+  await assert.rejects(fixture.host.setupCore(undefined, main.expectation), /changed while preparing setup-core/);
+  assert.equal(fixture.invocation(), undefined);
+  assert.equal(fixture.stops(), 0);
+});
+
+test("C12 direct RuntimeHost caller with existing external and requested direct rejects", async () => {
+  const fixture = provenanceHost([{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }]);
+  await assert.rejects(fixture.host.setupCore({ integrationMode: "direct" }), /ownership mismatch/);
+  assert.equal(fixture.invocation(), undefined);
+  assert.equal(fixture.stops(), 0);
+});
+
+test("D13 setupDevCore rejects canonical external-provider", async () => {
+  const fixture = provenanceHost(
+    [{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }],
+    { launcherProfile: "development" },
+  );
+  await assert.rejects(fixture.host.setupDevCore(), /unavailable in the isolated DEV/);
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("D13 setupDevCore rejects requested external-provider on a fresh DEV home", async () => {
+  const fixture = provenanceHost([null], { launcherProfile: "development" });
+  await assert.rejects(
+    fixture.host.setupDevCore({ integrationMode: "external-provider" }),
+    /unavailable in the isolated DEV/,
+  );
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("D14 setupDevMcp rejects canonical external-provider", async () => {
+  const fixture = provenanceHost(
+    [{ mode: "full", browserHost: "launcher", integrationMode: "external-provider" }],
+    { launcherProfile: "development" },
+  );
+  await assert.rejects(
+    Promise.resolve().then(() => fixture.host.setupDevMcp({
+      replace: true,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKey: "new-private-runtime-key-0123456789",
+    })),
+    /unavailable in the isolated DEV/,
+  );
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("D15 DEV feature setter rejects canonical external-provider before setup", async () => {
+  const fixture = provenanceHost(
+    [{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }],
+    { launcherProfile: "development" },
+  );
+  await assert.rejects(fixture.host.setBiggerContext(true), /unavailable in the isolated DEV/);
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("D16 DEV missing home remains Direct and reaches setup", async () => {
+  const fixture = provenanceHost([null], { launcherProfile: "development" });
+  const result = await fixture.host.setupDevCore();
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+});
+
+test("D17 DEV configured Direct remains allowed", async () => {
+  const fixture = provenanceHost(
+    [{ mode: "browser-only", browserHost: "launcher" }],
+    { launcherProfile: "development" },
+  );
+  const result = await fixture.host.setupDevCore();
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+});

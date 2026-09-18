@@ -5,7 +5,11 @@ const path = require("node:path");
 
 const launcherRoot = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(launcherRoot, "src", "App.tsx"), "utf8");
-const { extractRequestedIntegrationMode } = require("../electron/integration-mode.cjs");
+const {
+  assertOwnershipExpectationCurrent,
+  extractRequestedIntegrationMode,
+  resolveOwnershipContext,
+} = require("../electron/integration-mode.cjs");
 const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"), "utf8");
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
@@ -100,7 +104,12 @@ test("setup preserves session-check failures and never installs without verified
       handle: (_name, handler) => { setup = handler; }, IS_DEV_PROFILE: dev,
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
-      runtimeHost: { setupCore: runWithOwnership, setupDevCore: runWithOwnership, runtimeConfigSnapshot: () => ({ config: {} }) },
+      runtimeHost: {
+        setupCore: runWithOwnership,
+        setupDevCore: runWithOwnership,
+        runtimeConfigSnapshot: () => ({ config: {} }),
+        assertOwnershipExpectationCurrent: () => ({ kind: "missing" }),
+      },
       resolveSetupOwnership: (requestedMode, action) => {
         ownershipRequests.push({ requestedMode, action });
         return { integrationMode: "direct", newInstallation: true, canonical: { kind: "missing" } };
@@ -131,6 +140,135 @@ test("setup IPC threads an optional routing-ownership mode without trusting the 
   assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "skill-attachments"\)/);
   assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "zero-risk-pro"\)/);
   assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "browser-interaction-mode"\)/);
+});
+
+test("setup-core revalidates ownership before browser-visible work", () => {
+  const setupCoreHandler = electronMain.slice(
+    electronMain.indexOf("handle(\"launcher:setup-core\","),
+    electronMain.indexOf("handle(\"launcher:setup-mcp\","),
+  );
+  const recheck = setupCoreHandler.indexOf("assertOwnershipExpectationCurrent(ownership.expectation,");
+  assert.ok(recheck >= 0 && recheck < setupCoreHandler.indexOf("browserHost.probeAuthentication("));
+});
+
+test("B7 setup-core revalidates ownership before the authentication probe", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:setup-core",'),
+    electronMain.indexOf('handle("launcher:setup-mcp",'),
+  );
+  const reads = [{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }, null];
+  let readCalls = 0;
+  const supervisor = { readSetupConfig: () => reads[Math.min(readCalls++, reads.length - 1)] };
+  let setup;
+  let installs = 0;
+  let probes = 0;
+  const state = { browserInteractionMode: "automatic", coreSetupComplete: true };
+  vm.runInNewContext(source, {
+    handle: (_name, handler) => { setup = handler; },
+    IS_DEV_PROFILE: false,
+    stateStore: { read: () => state, update() {} },
+    browserHost: {
+      probeAuthentication: async () => { probes += 1; return { authenticated: true }; },
+      returnToIdle: async () => {},
+    },
+    runtimeHost: {
+      supervisor,
+      setupCore: async () => { installs += 1; return { mode: "browser-only", stdout: "" }; },
+      setupDevCore: async () => { installs += 1; return { mode: "browser-only", stdout: "" }; },
+      runtimeConfigSnapshot: () => ({ config: {} }),
+      assertOwnershipExpectationCurrent: (expectation, action) => assertOwnershipExpectationCurrent({ supervisor, expectation, action }),
+    },
+    resolveSetupOwnership: (requestedMode, action) => resolveOwnershipContext({ requestedMode, supervisor, action }),
+    extractRequestedIntegrationMode,
+    smokePassedThisSession: false,
+    send() {},
+    startCatalogVerificationMonitor() {},
+    logger: {},
+  });
+  await assert.rejects(setup(undefined), /changed while preparing setup-core/);
+  assert.equal(probes, 0);
+  assert.equal(installs, 0);
+  assert.equal(readCalls, 2);
+});
+
+test("B8 setup-mcp revalidates ownership before browser reveal", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:setup-mcp",'),
+    electronMain.indexOf('handle("launcher:set-mcp-step",'),
+  );
+  const reads = [{ mode: "full", browserHost: "launcher", integrationMode: "external-provider" }, null];
+  let readCalls = 0;
+  const supervisor = { readSetupConfig: () => reads[Math.min(readCalls++, reads.length - 1)] };
+  let setup;
+  let reveals = 0;
+  let installs = 0;
+  const state = { browserInteractionMode: "automatic" };
+  vm.runInNewContext(source, {
+    handle: (_name, handler) => { setup = handler; },
+    IS_DEV_PROFILE: false,
+    stateStore: { read: () => state, update() {} },
+    browserHost: {
+      reveal: async () => { reveals += 1; return {}; },
+      withInteractionModeChange: async () => { throw new Error("must not switch modes"); },
+    },
+    runtimeHost: {
+      supervisor,
+      setupMcp: async () => { installs += 1; return { ok: true, stdout: "" }; },
+      runtimeConfigSnapshot: () => ({ config: {} }),
+      assertOwnershipExpectationCurrent: (expectation, action) => assertOwnershipExpectationCurrent({ supervisor, expectation, action }),
+    },
+    resolveSetupOwnership: (requestedMode, action) => resolveOwnershipContext({ requestedMode, supervisor, action }),
+    extractRequestedIntegrationMode,
+    send() {},
+    startCatalogVerificationMonitor() {},
+    logger: {},
+  });
+  await assert.rejects(setup(undefined), /changed while preparing setup-mcp/);
+  assert.equal(reveals, 0);
+  assert.equal(installs, 0);
+  assert.equal(readCalls, 2);
+});
+
+test("B9 browser interaction change revalidates ownership before mutating the browser", async () => {
+  const vm = require("node:vm");
+  const source = electronMain.slice(
+    electronMain.indexOf('handle("launcher:browser-interaction-mode",'),
+    electronMain.indexOf('handle("launcher:set-preference",'),
+  );
+  const reads = [{ mode: "full", browserHost: "launcher", integrationMode: "external-provider" }, null];
+  let readCalls = 0;
+  const supervisor = { readSetupConfig: () => reads[Math.min(readCalls++, reads.length - 1)] };
+  let setup;
+  let switches = 0;
+  const state = { browserInteractionMode: "automatic" };
+  vm.runInNewContext(source, {
+    handle: (_name, handler) => { setup = handler; },
+    IS_DEV_PROFILE: false,
+    validateBrowserInteractionMode: (mode) => mode,
+    stateStore: { read: () => state, update: () => state },
+    browserHost: {
+      activeTraceId: null,
+      currentOperation: () => null,
+      withInteractionModeChange: async () => { switches += 1; return {}; },
+      snapshot: () => ({}),
+    },
+    runtimeHost: {
+      supervisor,
+      mcpCredentialsConfigured: () => true,
+      setBrowserInteractionMode: async () => ({ configured: true }),
+      assertOwnershipExpectationCurrent: (expectation, action) => assertOwnershipExpectationCurrent({ supervisor, expectation, action }),
+    },
+    resolveSetupOwnership: (requestedMode, action) => resolveOwnershipContext({ requestedMode, supervisor, action }),
+    extractRequestedIntegrationMode,
+    send() {},
+    startCatalogVerificationMonitor() {},
+    logger: {},
+  });
+  await assert.rejects(setup({}, "manual"), /changed while preparing browser-interaction-mode/);
+  assert.equal(switches, 0);
+  assert.equal(readCalls, 2);
 });
 
 test("startup failure stays visible on another launch and Retry exits the failed instance", async () => {
