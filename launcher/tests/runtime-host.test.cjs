@@ -5,6 +5,14 @@ const os = require("node:os");
 const path = require("node:path");
 const { CURRENT_CONNECTOR_NAME, DEV_CONNECTOR_NAME } = require("../electron/connector-identity.cjs");
 const { RuntimeHost } = require("../electron/runtime.cjs");
+const { buildSetupOwnershipPolicy } = require("../electron/setup-policy.cjs");
+
+// Direct-integration transaction policy for tests that drive runSetup
+// directly. Production callers build this from their validated ownership
+// context; these fixtures pin the pre-G2 Direct scenarios explicitly.
+function directTransactionPolicy(operation, profile) {
+  return buildSetupOwnershipPolicy({ integrationMode: "direct", operation, profile: profile || "production" });
+}
 
 function hostFor(existingConfig, interactionMode = "automatic") {
   const host = new RuntimeHost({
@@ -71,6 +79,8 @@ test("core setup preserves an existing full-harness installation", async () => {
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
+    "--integration-mode",
+    "direct",
     "--replace-codex-route",
     "--acknowledge-unofficial",
     "--restart-service",
@@ -184,6 +194,8 @@ test("Bigger Context uses the setup transaction and refreshes the production Cod
       "--browser-host-descriptor",
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
+      "--integration-mode",
+      "direct",
       "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
@@ -233,6 +245,8 @@ test("Zero Risk Pro transaction installs or removes only its explicit model prof
       "--acknowledge-unofficial",
       "--standard-context",
       "--zero-risk-pro",
+      "--integration-mode",
+      "direct",
       "--replace-codex-route",
       "--restart-service",
     ],
@@ -268,7 +282,9 @@ test("DEV setup child environment removes launcher-rebound production aliases", 
     return { code: 0, stdout: "", stderr: "" };
   };
 
-  await RuntimeHost.prototype.runDevSetup.call(fixture.host, "dev-environment-test", [], {});
+  await RuntimeHost.prototype.runDevSetup.call(fixture.host, "dev-environment-test", [], {
+    ownershipPolicy: directTransactionPolicy("setup-core", "development"),
+  });
   assert.equal(runOptions.embedded, true);
   assert.deepEqual(runOptions.environment, { ISOLATED_DEV_ENV: "yes" });
 });
@@ -383,6 +399,8 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
+    "--integration-mode",
+    "direct",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -414,6 +432,8 @@ test("launcher migrates the legacy connector identity even when the release vers
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
+    "--integration-mode",
+    "direct",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -491,6 +511,8 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
       "--browser-host-descriptor",
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
+      "--integration-mode",
+      "direct",
       "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
@@ -825,7 +847,7 @@ test("failed first-time setup removes its route before restoring the unconfigure
   };
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--browser-only"], {}),
+      host.runSetup("core-setup", ["setup", "--browser-only"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
       /synthetic setup failure; incomplete first-time setup was rolled back/,
     );
     assert.deepEqual(calls.map((args) => args.join(" ")), [
@@ -871,7 +893,7 @@ test("a failed setup preflight leaves the previous runtime running and untouched
   };
   try {
     await assert.rejects(
-      host.runSetup("runtime-upgrade", ["setup", "--browser-only"], {}),
+      host.runSetup("runtime-upgrade", ["setup", "--browser-only"], { ownershipPolicy: directTransactionPolicy("runtime-upgrade") }),
       /multi_agent_v2 in Codex \[features\] is unsupported$/,
     );
     assert.equal(stops, 0);
@@ -917,6 +939,7 @@ test("a browser-mode commit failure restores the previous runtime inside setup",
   await assert.rejects(
     host.runSetup("browser-interaction-mode", ["setup", "--full"], {
       afterRuntimeReady: async () => { throw new Error("surface ownership failed"); },
+      ownershipPolicy: directTransactionPolicy("browser-interaction-mode"),
     }),
     /surface ownership failed/,
   );
@@ -958,7 +981,7 @@ test("launcher delegates an existing terminal-managed installation to the migrat
     return { code: 0, stdout: "", stderr: "" };
   };
 
-  await host.runSetup("core-setup", ["setup", "--full"], {});
+  await host.runSetup("core-setup", ["setup", "--full"], { ownershipPolicy: directTransactionPolicy("setup-core") });
   assert.equal(prepared, 1);
   assert.equal(launcherStops, 0);
 });
@@ -990,7 +1013,7 @@ test("failed terminal migration verifies the unchanged previous runtime instead 
   };
 
   await assert.rejects(
-    host.runSetup("core-setup", ["setup", "--browser-only"], {}),
+    host.runSetup("core-setup", ["setup", "--browser-only"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
     /synthetic migration failure$/,
   );
   assert.deepEqual(calls, [
@@ -1079,7 +1102,7 @@ test("failed launcher update restores every mutable setup file before restarting
 
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--full"], {}),
+      host.runSetup("core-setup", ["setup", "--full"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
       /synthetic updated runtime startup failure$/,
     );
     assert.equal(startAttempts, 2);
@@ -1161,7 +1184,7 @@ test("failed terminal migration restores removed launchd ownership before verify
 
   try {
     await assert.rejects(
-      host.runSetup("core-setup", ["setup", "--full"], {}),
+      host.runSetup("core-setup", ["setup", "--full"], { ownershipPolicy: directTransactionPolicy("setup-core") }),
       /synthetic launcher startup failure$/,
     );
     assert.equal(startAttempts, 1);
@@ -1383,6 +1406,430 @@ test("G1.13 damaged runtime config fails closed instead of looking like a new in
   const malformed = hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "opencodex" });
   await assert.rejects(malformed.host.setupCore(), /damaged/);
   assert.equal(malformed.invocation(), undefined);
+});
+
+// G2 command policy matrix: explicit integration-mode emission per operation
+// with Direct replace-route preserved and External replace-route forbidden.
+// Numbers map to the G2 test plan (section 22).
+
+function ownershipArgPair(args) {
+  const at = args.indexOf("--integration-mode");
+  return at < 0 ? null : args.slice(at, at + 2);
+}
+
+function externalHostFor(config, interactionMode) {
+  return hostFor({ browserHost: "launcher", ...config, integrationMode: "external-provider" }, interactionMode);
+}
+
+test("G2.2 setupCore External emits explicit mode without replace-route", async () => {
+  for (const mode of ["browser-only", "full"]) {
+    const fixture = externalHostFor({ mode });
+    const result = await fixture.host.setupCore({ integrationMode: "external-provider" });
+    assert.equal(result.mode, mode);
+    assert.deepEqual(ownershipArgPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
+    assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+  }
+});
+
+test("G2.4 setupMcp External emits explicit mode without replace-route", async () => {
+  const fixture = externalHostFor({ mode: "full" });
+  await fixture.host.setupMcp({
+    replace: true,
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    runtimeKey: "new-private-runtime-key-0123456789",
+    integrationMode: "external-provider",
+  });
+  assert.deepEqual(ownershipArgPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G2.6 Bigger Context External emits explicit mode without replace-route", async () => {
+  const fixture = externalHostFor({ mode: "browser-only" });
+  await fixture.host.setBiggerContext(true, { integrationMode: "external-provider" });
+  assert.deepEqual(ownershipArgPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G2.7-8 Skill Attachments Direct keeps replace while External omits it", async () => {
+  const direct = hostFor({ mode: "browser-only", browserHost: "launcher" });
+  await direct.host.setSkillAttachments(true);
+  assert.deepEqual(ownershipArgPair(direct.invocation().args), ["--integration-mode", "direct"]);
+  assert.equal(direct.invocation().args.includes("--replace-codex-route"), true);
+  const external = externalHostFor({ mode: "browser-only" });
+  await external.host.setSkillAttachments(true, { integrationMode: "external-provider" });
+  assert.deepEqual(ownershipArgPair(external.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(external.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G2.10 Zero Risk Pro External emits explicit mode without replace-route", async () => {
+  const fixture = externalHostFor({ mode: "full", browserInteractionMode: "manual" }, "manual");
+  await fixture.host.setZeroRiskPro(true, { integrationMode: "external-provider" });
+  assert.deepEqual(ownershipArgPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G2.11-12 Browser Interaction Direct keeps replace while External omits it", async () => {
+  const direct = hostFor({ mode: "full", browserHost: "launcher", appName: "Codex Native2" });
+  await direct.host.setBrowserInteractionMode("manual");
+  assert.deepEqual(ownershipArgPair(direct.invocation().args), ["--integration-mode", "direct"]);
+  assert.equal(direct.invocation().args.includes("--replace-codex-route"), true);
+  const external = externalHostFor({ mode: "full", appName: "Codex Native2" });
+  await external.host.setBrowserInteractionMode("manual", undefined, { integrationMode: "external-provider" });
+  assert.deepEqual(ownershipArgPair(external.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(external.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G2.14 runtime-upgrade External emits explicit mode without replace-route", async () => {
+  const fixture = externalHostFor({
+    mode: "full",
+    appName: "Codex Native2",
+    releaseVersion: "1.1.1",
+    solAvailable: true,
+    extraHighAvailable: false,
+    proAvailable: false,
+  });
+  fixture.host.bridgeStatus = async () => ({ installed: true, active: true, errors: [] });
+  const result = await fixture.host.upgradeManagedRuntime();
+  assert.equal(result.updated, true);
+  assert.deepEqual(ownershipArgPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G2 runSetup requires a trusted ownership policy before mutation", async () => {
+  const host = new RuntimeHost({
+    app: {
+      getPath: () => path.join(os.tmpdir(), "codex-web-gpt-runtime-host-test"),
+      getVersion: () => "1.1.3",
+    },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: "/source",
+    browserDescriptorPath: "/runtime/launcher-browser.json",
+    supervisor: {},
+  });
+  let spawns = 0;
+  host.run = async () => {
+    spawns += 1;
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  await assert.rejects(
+    host.runSetup("core-setup", ["setup", "--browser-only"], {}),
+    /requires an ownership policy/,
+  );
+  assert.equal(spawns, 0);
+});
+
+test("G2 ownership flags live only in the centralized policy helper", () => {
+  const runtimeSource = fs.readFileSync(path.join(__dirname, "..", "electron", "runtime.cjs"), "utf8");
+  assert.equal(runtimeSource.includes("--replace-codex-route"), false);
+  assert.equal(runtimeSource.includes("--integration-mode"), false);
+  const policySource = fs.readFileSync(path.join(__dirname, "..", "electron", "setup-policy.cjs"), "utf8");
+  assert.ok(policySource.includes("--replace-codex-route"));
+  assert.ok(policySource.includes("--integration-mode"));
+});
+
+// G2 checkpoint/rollback tests: ownership-aware scope with real filesystem
+// fixtures. Route artifacts are bridge-owned in Direct and external/user-owned
+// in External; bridge-owned tunnel state is protected in both.
+
+function transactionHost(initialConfig) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-g2-"));
+  const coreHome = path.join(root, "core");
+  const codexHome = path.join(root, "codex");
+  fs.mkdirSync(path.join(coreHome, "codex"), { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(path.join(coreHome, "secrets"), { recursive: true });
+  fs.mkdirSync(path.join(coreHome, "tunnel", "profiles"), { recursive: true });
+  const configPath = path.join(coreHome, "config.json");
+  if (initialConfig !== null) fs.writeFileSync(configPath, JSON.stringify(initialConfig));
+  let stops = 0;
+  let cleared = 0;
+  const readConfigFile = () => {
+    if (!fs.existsSync(configPath)) return null;
+    return JSON.parse(fs.readFileSync(configPath, "utf8"));
+  };
+  const host = new RuntimeHost({
+    app: {
+      getPath: () => path.join(root, "userdata"),
+      getVersion: () => "1.1.3",
+    },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: "/source",
+    browserDescriptorPath: path.join(coreHome, "launcher-browser.json"),
+    codexHome,
+    launchAgentsDir: path.join(root, "launchagents"),
+    supervisor: {
+      coreHome,
+      configPath,
+      readSetupConfig: readConfigFile,
+      readConfig: readConfigFile,
+      stopForSetup: async () => {
+        stops += 1;
+        return { status: "stopped" };
+      },
+      startIfConfigured: async () => ({ status: "ready" }),
+      clearState: () => {
+        cleared += 1;
+      },
+    },
+  });
+  return {
+    host,
+    root,
+    coreHome,
+    codexHome,
+    configPath,
+    stops: () => stops,
+    cleared: () => cleared,
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+function routeArtifactPaths(fixture) {
+  return {
+    bridgeConfig: fixture.configPath,
+    journal: path.join(fixture.coreHome, "codex", "integration-journal.json"),
+    recovery: path.join(fixture.coreHome, "codex", "integration-journal.recovery.json"),
+    codexConfig: path.join(fixture.codexHome, "config.toml"),
+    modelsCache: path.join(fixture.codexHome, "models_cache.json"),
+    tunnelKey: path.join(fixture.coreHome, "secrets", "tunnel-runtime-automatic.key"),
+  };
+}
+
+function checkpointPaths(checkpoint) {
+  return new Set(checkpoint.map((entry) => entry.path));
+}
+
+test("G2.19-22 Direct checkpoint includes all Codex routing artifacts", () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    const paths = checkpointPaths(
+      fixture.host.captureSetupCheckpoint({ owner: "launcher", config: null }, "direct-integration"),
+    );
+    const artifacts = routeArtifactPaths(fixture);
+    assert.equal(paths.has(artifacts.bridgeConfig), true);
+    assert.equal(paths.has(artifacts.journal), true);
+    assert.equal(paths.has(artifacts.recovery), true);
+    assert.equal(paths.has(artifacts.codexConfig), true);
+    assert.equal(paths.has(artifacts.modelsCache), true);
+    assert.equal(paths.has(artifacts.tunnelKey), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.23-28 External checkpoint excludes routing artifacts but keeps bridge state", () => {
+  const fixture = transactionHost({ mode: "full", browserHost: "launcher", integrationMode: "external-provider" });
+  try {
+    const paths = checkpointPaths(
+      fixture.host.captureSetupCheckpoint({ owner: "launcher", config: null }, "bridge-only"),
+    );
+    const artifacts = routeArtifactPaths(fixture);
+    assert.equal(paths.has(artifacts.bridgeConfig), true);
+    assert.equal(paths.has(artifacts.tunnelKey), true);
+    assert.equal(paths.has(artifacts.journal), false);
+    assert.equal(paths.has(artifacts.recovery), false);
+    assert.equal(paths.has(artifacts.codexConfig), false);
+    assert.equal(paths.has(artifacts.modelsCache), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2 checkpoint scope follows routing mode, not process ownership", () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    const artifacts = routeArtifactPaths(fixture);
+    const externalOwnerDirectScope = checkpointPaths(
+      fixture.host.captureSetupCheckpoint({ owner: "external", config: null }, "direct-integration"),
+    );
+    assert.equal(externalOwnerDirectScope.has(artifacts.codexConfig), true);
+    const launcherOwnerBridgeScope = checkpointPaths(
+      fixture.host.captureSetupCheckpoint({ owner: "launcher", config: null }, "bridge-only"),
+    );
+    assert.equal(launcherOwnerBridgeScope.has(artifacts.codexConfig), false);
+    assert.equal(launcherOwnerBridgeScope.has(artifacts.bridgeConfig), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.28 External Full checkpoint keeps referenced bridge-owned tunnel files", () => {
+  const fixture = transactionHost({ mode: "full", browserHost: "launcher", integrationMode: "external-provider" });
+  try {
+    const customKey = path.join(fixture.coreHome, "custom-runtime.key");
+    const customProfile = path.join(fixture.coreHome, "tunnel", "profiles", "custom-external.yaml");
+    fs.writeFileSync(customKey, "key");
+    fs.writeFileSync(customProfile, "profile");
+    const snapshot = {
+      owner: "launcher",
+      config: {
+        automaticTunnel: {
+          tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+          runtimeKeyFile: customKey,
+          profileDir: path.join(fixture.coreHome, "tunnel", "profiles"),
+          profileName: "custom-external",
+        },
+      },
+    };
+    const paths = checkpointPaths(fixture.host.captureSetupCheckpoint(snapshot, "bridge-only"));
+    assert.equal(paths.has(customKey), true);
+    assert.equal(paths.has(customProfile), true);
+    assert.equal(paths.has(path.join(fixture.codexHome, "config.toml")), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.32 setupCheckpointChanged respects the selected scope", () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  try {
+    const artifacts = routeArtifactPaths(fixture);
+    fs.writeFileSync(artifacts.bridgeConfig, JSON.stringify({ mode: "browser-only", browserHost: "launcher" }));
+    fs.writeFileSync(artifacts.codexConfig, "route");
+    const direct = fixture.host.captureSetupCheckpoint({ owner: "launcher", config: null }, "direct-integration");
+    const bridgeOnly = fixture.host.captureSetupCheckpoint({ owner: "launcher", config: null }, "bridge-only");
+    assert.equal(fixture.host.setupCheckpointChanged(direct), false);
+    assert.equal(fixture.host.setupCheckpointChanged(bridgeOnly), false);
+    fs.writeFileSync(artifacts.codexConfig, "route changed concurrently");
+    assert.equal(fixture.host.setupCheckpointChanged(direct), true);
+    assert.equal(fixture.host.setupCheckpointChanged(bridgeOnly), false);
+    fs.writeFileSync(artifacts.bridgeConfig, JSON.stringify({ mode: "full", browserHost: "launcher" }));
+    assert.equal(fixture.host.setupCheckpointChanged(bridgeOnly), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.16 preflight and real setup use identical ownership args", async () => {
+  for (const integrationMode of ["direct", "external-provider"]) {
+    const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode });
+    const invocations = [];
+    fixture.host.run = async (name, args) => {
+      invocations.push({ name, args: [...args] });
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    try {
+      await fixture.host.setupCore(integrationMode === "direct" ? undefined : { integrationMode });
+      assert.equal(invocations.length, 2);
+      const [preflight, real] = invocations;
+      assert.deepEqual(preflight.args.slice(0, -1), real.args);
+      assert.equal(preflight.args[preflight.args.length - 1], "--preflight-only");
+      const at = real.args.indexOf("--integration-mode");
+      assert.deepEqual(real.args.slice(at, at + 2), ["--integration-mode", integrationMode]);
+      assert.equal(real.args.includes("--replace-codex-route"), integrationMode === "direct");
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test("G2.29 failed Direct transaction restores Direct-owned files exactly", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
+  const artifacts = routeArtifactPaths(fixture);
+  const before = {
+    bridge: JSON.stringify({ mode: "browser-only", browserHost: "launcher" }),
+    journal: "old journal\n",
+    recovery: "old recovery\n",
+    codex: "original codex config\n",
+    cache: "original models cache\n",
+  };
+  fs.writeFileSync(artifacts.journal, before.journal);
+  fs.writeFileSync(artifacts.recovery, before.recovery);
+  fs.writeFileSync(artifacts.codexConfig, before.codex);
+  fs.writeFileSync(artifacts.modelsCache, before.cache);
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(fixture.configPath, JSON.stringify({ mode: "full", browserHost: "launcher" }));
+    fs.writeFileSync(artifacts.journal, "mutated\n");
+    fs.writeFileSync(artifacts.recovery, "mutated\n");
+    fs.writeFileSync(artifacts.codexConfig, "mutated\n");
+    fs.writeFileSync(artifacts.modelsCache, "mutated\n");
+    throw new Error("synthetic Direct setup failure");
+  };
+  try {
+    await assert.rejects(fixture.host.setupCore(), /synthetic Direct setup failure/);
+    assert.equal(fs.readFileSync(fixture.configPath, "utf8"), before.bridge);
+    assert.equal(fs.readFileSync(artifacts.journal, "utf8"), before.journal);
+    assert.equal(fs.readFileSync(artifacts.recovery, "utf8"), before.recovery);
+    assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), before.codex);
+    assert.equal(fs.readFileSync(artifacts.modelsCache, "utf8"), before.cache);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.30 failed External transaction leaves concurrently changed Codex files alone", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  const artifacts = routeArtifactPaths(fixture);
+  const bridgeBefore = JSON.stringify({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  fs.writeFileSync(artifacts.codexConfig, "router-owned route\n");
+  fs.writeFileSync(artifacts.journal, "router-owned journal\n");
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(fixture.configPath, JSON.stringify({ mode: "full", browserHost: "launcher" }));
+    fs.writeFileSync(artifacts.codexConfig, "router changed route concurrently\n");
+    fs.writeFileSync(artifacts.journal, "router changed journal concurrently\n");
+    fs.writeFileSync(artifacts.modelsCache, "router cache\n");
+    throw new Error("synthetic External setup failure");
+  };
+  try {
+    await assert.rejects(
+      fixture.host.setupCore({ integrationMode: "external-provider" }),
+      /synthetic External setup failure/,
+    );
+    assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
+    assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), "router changed route concurrently\n");
+    assert.equal(fs.readFileSync(artifacts.journal, "utf8"), "router changed journal concurrently\n");
+    assert.equal(fs.readFileSync(artifacts.modelsCache, "utf8"), "router cache\n");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.31 failed External transaction neither recreates nor deletes the external journal", async () => {
+  const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  const artifacts = routeArtifactPaths(fixture);
+  assert.equal(fs.existsSync(artifacts.journal), false);
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(artifacts.journal, "external router journal\n");
+    throw new Error("synthetic External journal failure");
+  };
+  try {
+    await assert.rejects(
+      fixture.host.setupCore({ integrationMode: "external-provider" }),
+      /synthetic External journal failure/,
+    );
+    assert.equal(fs.readFileSync(artifacts.journal, "utf8"), "external router journal\n");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("G2.33 first-time External rollback stays bridge-only", async () => {
+  const fixture = transactionHost(null);
+  const artifacts = routeArtifactPaths(fixture);
+  fs.writeFileSync(artifacts.codexConfig, "pre-existing router route\n");
+  let cleared = 0;
+  fixture.host.supervisor.clearState = () => {
+    cleared += 1;
+  };
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(fixture.configPath, JSON.stringify({ mode: "browser-only", browserHost: "launcher" }));
+    throw new Error("synthetic first-time External failure");
+  };
+  try {
+    await assert.rejects(
+      fixture.host.setupCore({ integrationMode: "external-provider" }),
+      /synthetic first-time External failure/,
+    );
+    assert.equal(fs.existsSync(fixture.configPath), false);
+    assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), "pre-existing router route\n");
+    assert.equal(cleared, 1);
+  } finally {
+    fixture.cleanup();
+  }
 });
 
 // G1 blocker-fix regression tests: provenance revalidation, pre-mutation

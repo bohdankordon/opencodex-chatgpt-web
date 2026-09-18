@@ -21,6 +21,13 @@ const {
   normalizeRequestedIntegrationMode,
   resolveOwnershipContext,
 } = require("./integration-mode.cjs");
+const {
+  BRIDGE_ONLY_SCOPE,
+  DIRECT_INTEGRATION_SCOPE,
+  assertSetupOwnershipPolicy,
+  buildSetupOwnershipPolicy,
+  ownershipArgs,
+} = require("./setup-policy.cjs");
 const { redactText } = require("./logging.cjs");
 const { DETACH_OWNED_CHILD, terminateOwnedProcessTree } = require("./process-tree.cjs");
 
@@ -524,26 +531,37 @@ class RuntimeHost {
     );
   }
 
-  captureSetupCheckpoint(snapshot) {
+  // checkpointScope is "direct-integration" (full Direct rollback, as before)
+  // or "bridge-only" (external-provider: Codex routing files are
+  // external/user-owned and must never be restored by Launcher rollback,
+  // even if they exist or changed concurrently). The scope comes from the
+  // trusted transaction policy, never from process ownership or renderer input.
+  captureSetupCheckpoint(snapshot, checkpointScope) {
+    if (checkpointScope !== DIRECT_INTEGRATION_SCOPE && checkpointScope !== BRIDGE_ONLY_SCOPE) {
+      throw new Error("Setup checkpoint scope must be direct-integration or bridge-only");
+    }
     if (typeof this.supervisor.configPath !== "string" || !path.isAbsolute(this.supervisor.configPath)) {
       throw new Error("Launcher runtime supervisor has no absolute configuration path for setup rollback");
     }
     const coreHome = this.supervisor.coreHome
       || path.dirname(this.supervisor.configPath);
-    const paths = new Set([
-      this.supervisor.configPath,
-      path.join(coreHome, "codex", "integration-journal.json"),
-      path.join(coreHome, "codex", "integration-journal.recovery.json"),
-      path.join(this.codexHome, "config.toml"),
-      path.join(this.codexHome, "models_cache.json"),
-      path.join(coreHome, "secrets", "tunnel-runtime.key"),
-      path.join(coreHome, "secrets", "tunnel-runtime-automatic.key"),
-      path.join(coreHome, "secrets", "tunnel-runtime-zero-risk.key"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web.yaml"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-zero-risk.yaml"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-dev.yaml"),
-      path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-dev-zero-risk.yaml"),
-    ]);
+    const paths = new Set([this.supervisor.configPath]);
+    if (checkpointScope === DIRECT_INTEGRATION_SCOPE) {
+      paths.add(path.join(coreHome, "codex", "integration-journal.json"));
+      paths.add(path.join(coreHome, "codex", "integration-journal.recovery.json"));
+      paths.add(path.join(this.codexHome, "config.toml"));
+      paths.add(path.join(this.codexHome, "models_cache.json"));
+    }
+    // Bridge-owned Full-harness state stays protected in both scopes: tunnel
+    // keys and profiles belong to the Launcher transaction regardless of
+    // routing ownership.
+    paths.add(path.join(coreHome, "secrets", "tunnel-runtime.key"));
+    paths.add(path.join(coreHome, "secrets", "tunnel-runtime-automatic.key"));
+    paths.add(path.join(coreHome, "secrets", "tunnel-runtime-zero-risk.key"));
+    paths.add(path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web.yaml"));
+    paths.add(path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-zero-risk.yaml"));
+    paths.add(path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-dev.yaml"));
+    paths.add(path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web-dev-zero-risk.yaml"));
     if (snapshot.owner === "external" && this.platform === "darwin") {
       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.daemon.plist"));
       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.tunnel.plist"));
@@ -1050,7 +1068,12 @@ class RuntimeHost {
 
   async setupCore(input, expectation) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
-    this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-core");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-core");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "setup-core",
+      profile: this.launcherProfile,
+    });
     this.assertProductionProfile("Codex integration setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
@@ -1070,7 +1093,7 @@ class RuntimeHost {
         mode: interactionMode,
         refreshCapabilities: interactionMode === "automatic",
       }),
-      "--replace-codex-route",
+      ...ownershipArgs(policy),
       "--acknowledge-unofficial",
       "--restart-service",
     ];
@@ -1078,6 +1101,7 @@ class RuntimeHost {
       message: "Installing ChatGPT Web models into Codex",
       successMessage: "Codex integration installed",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
     });
     return { ...result, mode };
   }
@@ -1085,7 +1109,12 @@ class RuntimeHost {
   async setupDevCore(input, expectation) {
     // DEV is Direct-only: canonical or requested external-provider rejects here
     // even for direct RuntimeHost callers that bypass main IPC.
-    this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-dev-core");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-dev-core");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "setup-core",
+      profile: this.launcherProfile,
+    });
     if (this.launcherProfile !== "development") {
       throw new Error("DEV profile setup requires the isolated DEV launcher");
     }
@@ -1111,13 +1140,19 @@ class RuntimeHost {
       message: "Configuring the isolated DEV harness",
       successMessage: "Isolated DEV harness configured",
       timeoutMs: mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
     });
     return { ...result, mode };
   }
 
   async setBiggerContext(enabled, options, expectation) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
-    this.validateSetupOwnership(extractRequestedIntegrationMode(options), expectation, "bigger-context");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(options), expectation, "bigger-context");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "bigger-context",
+      profile: this.launcherProfile,
+    });
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Initialize the runtime before changing Bigger Context");
@@ -1140,6 +1175,7 @@ class RuntimeHost {
         message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
         successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
         timeoutMs: CORE_SETUP_TIMEOUT_MS,
+        ownershipPolicy: policy,
       });
       return { ...result, mode, enabled: enabled === true };
     }
@@ -1149,7 +1185,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs(),
-      "--replace-codex-route",
+      ...ownershipArgs(policy),
       "--acknowledge-unofficial",
       "--restart-service",
       contextFlag,
@@ -1159,13 +1195,19 @@ class RuntimeHost {
       message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
       successMessage: enabled ? "Bigger Context enabled; restart Codex" : "Standard context restored; restart Codex",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
     });
     return { ...result, mode, enabled: enabled === true };
   }
 
   async setSkillAttachments(enabled, ownershipInput, expectation) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
-    this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "skill-attachments");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "skill-attachments");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "skill-attachments",
+      profile: this.launcherProfile,
+    });
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) throw new Error("Initialize the runtime before changing Skills as files");
     if (current.config?.browserInteractionMode === "manual") {
@@ -1178,7 +1220,8 @@ class RuntimeHost {
       "--browser-host-descriptor", this.browserDescriptorPath,
       ...this.browserInteractionArgs(),
       "--acknowledge-unofficial",
-      ...(development ? [] : ["--replace-codex-route", "--restart-service"]),
+      ...ownershipArgs(policy),
+      ...(development ? [] : ["--restart-service"]),
       enabled === true ? "--skill-attachments" : "--inline-skills",
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
@@ -1186,6 +1229,7 @@ class RuntimeHost {
       message: enabled ? "Enabling Skills as files" : "Disabling Skills as files",
       successMessage: enabled ? "Skills as files enabled" : "Inline skills restored",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
     };
     const result = development
       ? await this.runDevSetup("skill-attachments", args, options)
@@ -1195,7 +1239,12 @@ class RuntimeHost {
 
   async setZeroRiskPro(enabled, ownershipInput, expectation) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
-    this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "zero-risk-pro");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "zero-risk-pro");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "zero-risk-pro",
+      profile: this.launcherProfile,
+    });
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Install the Codex integration before changing Zero Risk model profiles");
@@ -1213,7 +1262,8 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--standard-context",
       profileFlag,
-      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
+      ...ownershipArgs(policy),
+      ...(this.launcherProfile === "production" ? ["--restart-service"] : []),
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
     const options = {
@@ -1222,6 +1272,7 @@ class RuntimeHost {
         ? `Zero Risk Pro installed${this.launcherProfile === "production" ? "; restart Codex" : ""}`
         : `Default Zero Risk model restored${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
     };
     const result = this.launcherProfile === "development"
       ? await this.runDevSetup("zero-risk-pro", args, options)
@@ -1231,6 +1282,14 @@ class RuntimeHost {
 
   async upgradeManagedRuntime() {
     this.assertProductionProfile("Managed Codex runtime upgrade");
+    // G2 command/checkpoint policy only: explicit integration mode with the
+    // preserved replace-route omission. No startup/restart semantics change.
+    const ownership = this.validateSetupOwnership(undefined, undefined, "runtime-upgrade");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "runtime-upgrade",
+      profile: this.launcherProfile,
+    });
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
     const currentVersion = this.app.getVersion();
@@ -1268,6 +1327,7 @@ class RuntimeHost {
       // A release may repair capability detection. Reusing the previous result can
       // keep eligible models disabled even after the corrected probe is installed.
       ...this.browserInteractionArgs({ mode: interactionMode, refreshCapabilities: true }),
+      ...ownershipArgs(policy),
       "--acknowledge-unofficial",
       "--restart-service",
     ];
@@ -1279,6 +1339,7 @@ class RuntimeHost {
         ? `${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP profile migrated`
         : `Launcher runtime upgraded to ${currentVersion}`,
       timeoutMs: existing.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
     });
     return {
       updated: true,
@@ -1292,7 +1353,12 @@ class RuntimeHost {
 
   setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, integrationMode: requestedIntegrationMode } = {}, afterRuntimeReady, expectation) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
-    this.validateSetupOwnership(requestedIntegrationMode, expectation, "setup-mcp");
+    const ownership = this.validateSetupOwnership(requestedIntegrationMode, expectation, "setup-mcp");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "setup-mcp",
+      profile: this.launcherProfile,
+    });
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const targetMode = interactionMode ?? this.browserInteractionMode();
@@ -1309,7 +1375,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: targetMode }),
-      "--replace-codex-route",
+      ...ownershipArgs(policy),
     ];
     if (reuseSavedCredentials) {
       args.push("--acknowledge-unofficial", "--restart-service");
@@ -1318,6 +1384,7 @@ class RuntimeHost {
         successMessage: "Local MCP tools are ready",
         timeoutMs: MCP_SETUP_TIMEOUT_MS,
         afterRuntimeReady,
+        ownershipPolicy: policy,
       });
     }
     const secretsDir = path.join(this.app.getPath("userData"), "secrets");
@@ -1338,13 +1405,19 @@ class RuntimeHost {
       successMessage: "Local MCP tools are ready",
       timeoutMs: MCP_SETUP_TIMEOUT_MS,
       afterRuntimeReady,
+      ownershipPolicy: policy,
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
   setupDevMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, integrationMode: requestedIntegrationMode } = {}, afterRuntimeReady, expectation) {
     // DEV is Direct-only: canonical or requested external-provider rejects here
     // even for direct RuntimeHost callers that bypass main IPC.
-    this.validateSetupOwnership(requestedIntegrationMode, expectation, "setup-dev-mcp");
+    const ownership = this.validateSetupOwnership(requestedIntegrationMode, expectation, "setup-dev-mcp");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "setup-mcp",
+      profile: this.launcherProfile,
+    });
     if (this.launcherProfile !== "development") {
       throw new Error("DEV MCP setup requires the isolated DEV launcher");
     }
@@ -1372,6 +1445,7 @@ class RuntimeHost {
         successMessage: "DEV Full harness is configured",
         timeoutMs: MCP_SETUP_TIMEOUT_MS,
         afterRuntimeReady,
+        ownershipPolicy: policy,
       });
     }
     const secretsDir = path.join(this.app.getPath("userData"), "secrets");
@@ -1385,12 +1459,18 @@ class RuntimeHost {
       successMessage: "DEV Full harness is configured",
       timeoutMs: MCP_SETUP_TIMEOUT_MS,
       afterRuntimeReady,
+      ownershipPolicy: policy,
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
   async setBrowserInteractionMode(mode, afterRuntimeReady, ownershipInput, expectation) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
-    this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "browser-interaction-mode");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "browser-interaction-mode");
+    const policy = buildSetupOwnershipPolicy({
+      integrationMode: ownership.integrationMode,
+      operation: "browser-interaction-mode",
+      profile: this.launcherProfile,
+    });
     if (mode !== "automatic" && mode !== "manual") {
       throw new Error("Browser interaction mode must be automatic or manual");
     }
@@ -1408,7 +1488,8 @@ class RuntimeHost {
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode, refreshCapabilities: true }),
       "--acknowledge-unofficial",
-      ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
+      ...ownershipArgs(policy),
+      ...(this.launcherProfile === "production" ? ["--restart-service"] : []),
       mode === "automatic" && current.config?.experimentalBiggerContext === true
         ? "--bigger-context"
         : "--standard-context",
@@ -1423,6 +1504,7 @@ class RuntimeHost {
         : `Automatic browser interaction enabled${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
       timeoutMs: current.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
       afterRuntimeReady,
+      ownershipPolicy: policy,
     };
     const result = this.launcherProfile === "development"
       ? await this.runDevSetup("browser-interaction-mode", args, options)
@@ -1443,8 +1525,12 @@ class RuntimeHost {
 
   async runSetup(name, args, options) {
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    // The transaction policy is fixed here, before mutation, from the trusted
+    // ownership context each setup path validated. Rollback below restores
+    // exactly this captured scope even if config changes mid-transaction.
+    const ownershipPolicy = assertSetupOwnershipPolicy(options ? options.ownershipPolicy : undefined);
     const previousRuntime = this.runtimeConfigSnapshot();
-    const checkpoint = this.captureSetupCheckpoint(previousRuntime);
+    const checkpoint = this.captureSetupCheckpoint(previousRuntime, ownershipPolicy.checkpointScope);
     this.lifecycleOperation = name;
     let setupCommandStarted = false;
     let runtimeTransitionStarted = false;
