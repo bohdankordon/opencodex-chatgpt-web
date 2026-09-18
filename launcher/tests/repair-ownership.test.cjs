@@ -720,15 +720,96 @@ test("G4.BLOCKER transaction commit point: success keeps mutation, hook failure 
   } finally { failFixture.cleanup(); }
 });
 
-function composeHelper() {
-  const sliceStart = electronMain.indexOf("function composeAfterRuntimeReady(");
-  const sliceEnd = electronMain.indexOf("\n}\n", sliceStart) + 3;
-  const source = electronMain.slice(sliceStart, sliceEnd);
+function extractComposeSource(mainSource) {
+  const startMarker = "function composeAfterRuntimeReady(";
+  const sliceStart = mainSource.indexOf(startMarker);
+  assert.notEqual(sliceStart, -1, "main.cjs is missing function composeAfterRuntimeReady(");
+  const openBrace = mainSource.indexOf("{", sliceStart);
+  assert.notEqual(openBrace, -1, "main.cjs composeAfterRuntimeReady has no opening brace");
+  let depth = 0;
+  let inString = null;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let escaped = false;
+  let sliceEnd = -1;
+  for (let i = openBrace; i < mainSource.length; i += 1) {
+    const ch = mainSource[i];
+    const next = mainSource[i + 1];
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (inString !== null) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      inString = ch;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        sliceEnd = i + 1;
+        break;
+      }
+    }
+  }
+  assert.notEqual(sliceEnd, -1, "main.cjs composeAfterRuntimeReady boundary not found");
+  return mainSource.slice(sliceStart, sliceEnd);
+}
+
+function composeHelper(mainSource) {
+  const source = extractComposeSource(mainSource === undefined ? electronMain : mainSource);
   const context = {};
   vm.createContext(context);
   vm.runInContext(source + "\nthis.__compose = { composeAfterRuntimeReady };", context);
+  assert.equal(
+    typeof context.__compose.composeAfterRuntimeReady,
+    "function",
+    "composeAfterRuntimeReady was not extracted from main.cjs",
+  );
   return context.__compose;
 }
+
+test("composeHelper extracts the shipped function from LF and CRLF source", () => {
+  const lfSource = electronMain.split("\r\n").join("\n");
+  const crlfSource = lfSource.split("\n").join("\r\n");
+  assert.ok(crlfSource.includes("\r\n"), "CRLF fixture must contain carriage returns");
+  for (const variant of [
+    { label: "LF", text: lfSource },
+    { label: "CRLF", text: crlfSource },
+  ]) {
+    const extracted = composeHelper(variant.text);
+    assert.equal(typeof extracted.composeAfterRuntimeReady, "function", `extraction failed for ${variant.label} source`);
+    const sentinel = async () => {};
+    assert.equal(
+      extracted.composeAfterRuntimeReady(undefined, sentinel),
+      sentinel,
+      `identity branch failed for ${variant.label} source`,
+    );
+  }
+});
 
 test("G4 hook composition preserves browser behavior exactly once", async () => {
   const { composeAfterRuntimeReady } = composeHelper();
