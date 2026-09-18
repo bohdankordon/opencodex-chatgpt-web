@@ -698,7 +698,7 @@ test("integration removal is accepted only after a new status process observes i
   host.run = async (_name, args) => {
     const action = args.join(" ");
     calls.push(action);
-    if (action === "uninstall --yes --launcher-control") {
+    if (action.startsWith("uninstall --yes --launcher-control")) {
       return { stdout: "uninstalled\n" };
     }
     if (action === "route status") {
@@ -710,7 +710,7 @@ test("integration removal is accepted only after a new status process observes i
   await host.uninstallIntegration();
   assert.deepEqual(calls, [
     "runtime:stop",
-    "uninstall --yes --launcher-control",
+    "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct",
     "route status",
   ]);
 });
@@ -733,7 +733,7 @@ test("integration removal rejects a command that leaves an inactive journal behi
   host.run = async (_name, args) => {
     const action = args.join(" ");
     calls.push(action);
-    if (action === "uninstall --yes --launcher-control") {
+    if (action.startsWith("uninstall --yes --launcher-control")) {
       return { stdout: "uninstalled\n" };
     }
     if (action === "route status") {
@@ -748,7 +748,7 @@ test("integration removal rejects a command that leaves an inactive journal behi
   );
   assert.deepEqual(calls, [
     "runtime:stop",
-    "uninstall --yes --launcher-control",
+    "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct",
     "route status",
     "route status",
   ]);

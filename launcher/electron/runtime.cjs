@@ -502,6 +502,21 @@ class RuntimeHost {
     });
   }
 
+  // Expected-ownership CLI binding for Remove (G5 blocker fix). Derives the
+  // core `--expected-*` flags exclusively from the trusted G1 ownership
+  // context validated at uninstall entry: configured installs carry their
+  // canonical mode, missing installs carry kind-only (never a Direct
+  // default). Renderer strings cannot reach here; callers pass no mode.
+  uninstallExpectedOwnershipArgs(ownership) {
+    if (!ownership || !ownership.canonical || ownership.canonical.kind !== "configured") {
+      return ["--expected-installation-kind", "missing"];
+    }
+    if (ownership.integrationMode !== DIRECT && ownership.integrationMode !== EXTERNAL_PROVIDER) {
+      throw new Error("Launcher routing ownership state is invalid");
+    }
+    return ["--expected-installation-kind", "configured", "--expected-integration-mode", ownership.integrationMode];
+  }
+
   // DEV profile is Direct-only. Central enforcement so every production and
   // DEV setup path, including direct RuntimeHost callers, fails closed on
   // external-provider instead of silently continuing as Direct.
@@ -1109,7 +1124,10 @@ class RuntimeHost {
         this.assertNoStaleDirectJournal(name);
       }
       try {
-        const result = await this.run(name, ["uninstall", "--yes", "--launcher-control"], {
+        // The expected-ownership flags bind this destructive child to the
+        // exact ownership the Launcher proved: core revalidates them under
+        // the shared lifecycle lock before mutating anything.
+        const result = await this.run(name, ["uninstall", "--yes", "--launcher-control", ...this.uninstallExpectedOwnershipArgs(ownership)], {
           embedded: true,
           env: this.launcherControlEnvironment(),
           message: "Restoring the previous Codex route",

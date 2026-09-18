@@ -83,7 +83,11 @@ function removeFixture(options) {
     const action = args.join(" ");
     spawns.push(action);
     events.push(action);
-    if (action === "uninstall --yes --launcher-control") {
+    // The expected-ownership suffix binds the destructive child to the exact
+    // ownership the Launcher proved; match by prefix and assert the suffix
+    // per test below instead of exact-matching the legacy bare command.
+    if (action === "uninstall --yes --launcher-control"
+      || action.startsWith("uninstall --yes --launcher-control ")) {
       if (settings.uninstallFails) throw new Error(settings.uninstallFails);
       if (typeof settings.onUninstall === "function") settings.onUninstall({ configPath, codexHome, coreHome });
       else fs.rmSync(configPath, { force: true });
@@ -115,7 +119,12 @@ test("G5.1 Direct Remove runs core uninstall with route verification", async () 
   const fixture = removeFixture({ config: DIRECT_CONFIG });
   try {
     await fixture.host.uninstallIntegration();
-    assert.deepEqual(fixture.spawns, ["uninstall --yes --launcher-control", "route status"]);
+    // The destructive child carries the Launcher-proved Direct expectation;
+    // core revalidates these flags under the shared lifecycle lock.
+    assert.deepEqual(fixture.spawns, [
+      "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct",
+      "route status",
+    ]);
     assert.equal(fs.existsSync(fixture.configPath), false);
     assert.equal(fs.readFileSync(fixture.sentinel, "utf8"), "signed-in-session");
   } finally { fixture.cleanup(); }
@@ -128,11 +137,54 @@ test("G5.2 External Remove issues zero route commands", async () => {
   fs.writeFileSync(rp.modelsCache, "router cache\n");
   try {
     await fixture.host.uninstallIntegration({ integrationMode: "external-provider" });
-    assert.deepEqual(fixture.spawns, ["uninstall --yes --launcher-control"]);
+    assert.deepEqual(fixture.spawns, [
+      "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode external-provider",
+    ]);
     assert.equal(fixture.routeSpawns().length, 0);
     assert.equal(fs.existsSync(fixture.configPath), false);
     assert.equal(fs.readFileSync(rp.codexConfig, "utf8"), "router-owned route\n");
     assert.equal(fs.readFileSync(rp.modelsCache, "utf8"), "router cache\n");
+  } finally { fixture.cleanup(); }
+});
+
+test("G5 expected-ownership args derive only from trusted Launcher ownership", async () => {
+  const fixture = removeFixture({ config: DIRECT_CONFIG });
+  try {
+    // Configured installs carry their canonical mode; the mode strings are
+    // the Launcher-trusted G1 values, never renderer input.
+    assert.deepEqual(
+      fixture.host.uninstallExpectedOwnershipArgs({ canonical: { kind: "configured" }, integrationMode: "direct" }),
+      ["--expected-installation-kind", "configured", "--expected-integration-mode", "direct"],
+    );
+    assert.deepEqual(
+      fixture.host.uninstallExpectedOwnershipArgs({ canonical: { kind: "configured" }, integrationMode: "external-provider" }),
+      ["--expected-installation-kind", "configured", "--expected-integration-mode", "external-provider"],
+    );
+    // Missing installs carry kind-only: never a fake Direct default, and no
+    // mode flag that core would reject alongside kind=missing.
+    assert.deepEqual(
+      fixture.host.uninstallExpectedOwnershipArgs({ canonical: { kind: "missing" }, integrationMode: undefined }),
+      ["--expected-installation-kind", "missing"],
+    );
+    assert.deepEqual(
+      fixture.host.uninstallExpectedOwnershipArgs(null),
+      ["--expected-installation-kind", "missing"],
+    );
+    // Anything outside the allowlisted modes fails closed before spawn.
+    assert.throws(
+      () => fixture.host.uninstallExpectedOwnershipArgs({ canonical: { kind: "configured" }, integrationMode: "bogus" }),
+      /routing ownership state is invalid/,
+    );
+  } finally { fixture.cleanup(); }
+});
+
+test("G5 missing Remove spawns kind-only expected ownership", async () => {
+  const fixture = removeFixture({ config: null });
+  try {
+    await fixture.host.uninstallIntegration();
+    assert.deepEqual(fixture.spawns, ["uninstall --yes --launcher-control --expected-installation-kind missing"]);
+    assert.equal(fixture.routeSpawns().length, 0);
+    assert.equal(fs.existsSync(fixture.configPath), false);
   } finally { fixture.cleanup(); }
 });
 
@@ -245,7 +297,7 @@ test("G5.16 Direct stop failure keeps bridge, restores route, keeps error", asyn
   let routeActive = true;
   fixture.host.run = async (name, args) => {
     const action = args.join(" ");
-    if (action === "uninstall --yes --launcher-control") uninstallSpawned = true;
+    if (action.startsWith("uninstall --yes --launcher-control")) uninstallSpawned = true;
     fixture.spawns.push(action);
     fixture.events.push(action);
     if (action === "route status") return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
@@ -300,7 +352,7 @@ test("G5.26 Direct-to-External drift aborts before core uninstall", async () => 
   fs.writeFileSync(rp.codexConfig, "bridge-active-route\n");
   try {
     await assert.rejects(fixture.host.uninstallIntegration(), /changed while preparing/);
-    assert.ok(!fixture.spawns.includes("uninstall --yes --launcher-control"));
+    assert.ok(!fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
     assert.equal(fixture.routeSpawns().length, 0);
     assert.equal(fs.readFileSync(rp.codexConfig, "utf8"), "bridge-active-route\n");
   } finally { fixture.cleanup(); }
@@ -310,7 +362,7 @@ test("G5.27 External-to-Direct drift aborts bridge deletion", async () => {
   const fixture = removeFixture({ setupReads: [EXTERNAL_CONFIG, DIRECT_CONFIG], writeConfig: false });
   try {
     await assert.rejects(fixture.host.uninstallIntegration({ integrationMode: "external-provider" }), /changed while preparing|mismatch/);
-    assert.ok(!fixture.spawns.includes("uninstall --yes --launcher-control"));
+    assert.ok(!fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
     assert.equal(fixture.routeSpawns().length, 0);
   } finally { fixture.cleanup(); }
 });
@@ -319,7 +371,7 @@ test("G5.28-29 missing and damaged drift fail closed", async () => {
   const missing = removeFixture({ setupReads: [DIRECT_CONFIG, null], writeConfig: false });
   try {
     await assert.rejects(missing.host.uninstallIntegration(), /changed while preparing/);
-    assert.ok(!missing.spawns.includes("uninstall --yes --launcher-control"));
+    assert.ok(!missing.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
   } finally { missing.cleanup(); }
   const damaged = removeFixture({ setupReads: [new Error("unexpected token in JSON")], writeConfig: false });
   try {
@@ -335,7 +387,7 @@ test("G5.31-32 Direct ordering: route cleanup failure precedes any bridge deleti
     const action = args.join(" ");
     fixture.spawns.push(action);
     fixture.events.push(action);
-    if (action === "uninstall --yes --launcher-control") throw new Error("route cleanup failed");
+    if (action.startsWith("uninstall --yes --launcher-control")) throw new Error("route cleanup failed");
     if (action === "route status") return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
     if (action === "route disconnect") {
       routeActive = false;
@@ -346,7 +398,7 @@ test("G5.31-32 Direct ordering: route cleanup failure precedes any bridge deleti
   try {
     await assert.rejects(fixture.host.uninstallIntegration(), /route cleanup failed/);
     assert.equal(fs.existsSync(fixture.configPath), true);
-    const uninstallIndex = fixture.events.indexOf("uninstall --yes --launcher-control");
+    const uninstallIndex = fixture.events.findIndex((e) => e.startsWith("uninstall --yes --launcher-control"));
     const restoreIndex = fixture.events.indexOf("route disconnect");
     assert.ok(uninstallIndex >= 0 && restoreIndex > uninstallIndex);
   } finally { fixture.cleanup(); }

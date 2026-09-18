@@ -37,6 +37,12 @@ import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus
 import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 import { runDevCommand } from "./dev-chat/cli";
+import {
+  assertLifecycleOwnershipMatch,
+  parseExpectedLifecycleOwnership,
+  readActualLifecycleOwnership,
+  withLifecycleLock,
+} from "./lifecycle-lock";
 
 const HELP = `codex-chatgpt-web ${VERSION}
 
@@ -61,6 +67,8 @@ Usage:
   codex-chatgpt-web tunnel <status|start|restart|stop|key-import>
   codex-chatgpt-web open <tunnels|runtime-keys|connectors>
   codex-chatgpt-web uninstall --yes
+  codex-chatgpt-web uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct
+  codex-chatgpt-web uninstall --yes --launcher-control --expected-installation-kind missing
 
 Setup options:
   --browser-only               Account-eligible Web models, full context/images, no local tools or tunnel
@@ -93,6 +101,10 @@ Setup options:
 
 Global:
   --home PATH                  Override ~/.codex-chatgpt-web
+  --expected-installation-kind KIND
+                               Launcher-controlled uninstall only: configured or missing
+  --expected-integration-mode MODE
+                               Launcher-controlled uninstall only: direct or external-provider
   -h, --help
   -v, --version
 `;
@@ -368,7 +380,10 @@ async function setupCommand(args: string[]): Promise<void> {
     }
   }
 
-  const result = await setup(options);
+  // Mutating setup holds the shared lifecycle lock so a concurrent uninstall
+  // cannot interleave the ownership-changing transaction. Preflight above
+  // stays unlocked (read-only); setup revalidates under its own safeguards.
+  const result = await withLifecycleLock("setup", () => setup(options));
   stdout.write(formatSetupReport(result));
 }
 
@@ -383,29 +398,32 @@ async function doctorCommand(args: string[]): Promise<void> {
 async function routeCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
-  const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
-  if (action !== "status" && config && isExternalProviderMode(config)) {
-    throw new Error("Codex routing is managed by OpenCodex in external-provider mode; route mutations are disabled");
+  if (action === "status") {
+    // Read-only: never serialized.
+    const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
+    const status = inspectCodexIntegration();
+    stdout.write(`${JSON.stringify({
+      integrationMode: config?.integrationMode ?? "direct",
+      routingOwner: config && isExternalProviderMode(config) ? "external-router" : "codex-chatgpt-web",
+      installed: status.installed,
+      active: status.active,
+      ...(status.routeUrl ? { routeUrl: status.routeUrl } : {}),
+      errors: status.errors,
+    }, null, 2)}\n`);
+    return;
   }
-  const result = action === "status"
-    ? (() => {
-        const status = inspectCodexIntegration();
-        return {
-          integrationMode: config?.integrationMode ?? "direct",
-          routingOwner: config && isExternalProviderMode(config) ? "external-router" : "codex-chatgpt-web",
-          installed: status.installed,
-          active: status.active,
-          ...(status.routeUrl ? { routeUrl: status.routeUrl } : {}),
-          errors: status.errors,
-        };
-      })()
-    : action === "connect"
-      ? activateCodexIntegration()
-      : action === "disconnect"
-        ? deactivateCodexIntegration()
-        : undefined;
-  if (!result) throw new Error(`Unknown route action: ${action}`);
-  stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (action !== "connect" && action !== "disconnect") throw new Error(`Unknown route action: ${action}`);
+  // Mutating route commands share the lifecycle lock: they rewrite the same
+  // Direct config.toml / models-cache / journal artifacts uninstall restores.
+  // The External refusal is re-checked under the lock against fresh state.
+  await withLifecycleLock(`route-${action}`, async () => {
+    const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
+    if (config && isExternalProviderMode(config)) {
+      throw new Error("Codex routing is managed by OpenCodex in external-provider mode; route mutations are disabled");
+    }
+    const result = action === "connect" ? activateCodexIntegration() : deactivateCodexIntegration();
+    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  });
 }
 
 async function subagentsCommand(args: string[]): Promise<void> {
@@ -429,10 +447,15 @@ async function subagentsCommand(args: string[]): Promise<void> {
   if (action !== "compatibility-v1" && action !== "native") {
     throw new Error("Subagent protocol must be one of: status, compatibility-v1, native");
   }
-  if (isExternalProviderMode(config)) {
-    throw new Error("Codex feature overrides are owned by OpenCodex in external-provider mode; subagent protocol mutations are disabled");
-  }
-  const journal = setCodexSubagentProtocol(config, action);
+  // The protocol switch rewrites the integration journal: same lock as the
+  // other lifecycle mutators, with the External refusal re-checked inside.
+  const journal = await withLifecycleLock("subagents", async () => {
+    const fresh = loadConfig();
+    if (isExternalProviderMode(fresh)) {
+      throw new Error("Codex feature overrides are owned by OpenCodex in external-provider mode; subagent protocol mutations are disabled");
+    }
+    return setCodexSubagentProtocol(fresh, action);
+  });
   stdout.write(`${JSON.stringify({
     protocol: journal.installed.subagent_protocol,
     codexRestartRequired: true,
@@ -536,29 +559,46 @@ async function uninstallCommand(args: string[]): Promise<void> {
   const yes = takeFlag(args, "--yes");
   const keepData = takeFlag(args, "--keep-data");
   const launcherControl = takeFlag(args, "--launcher-control");
+  const expectedKind = takeOption(args, "--expected-installation-kind");
+  const expectedMode = takeOption(args, "--expected-integration-mode");
   assertNoArgs(args);
   if (launcherControl) authorizeLauncherControl("uninstall");
+  // Expected ownership comes only from the trusted Launcher G1 expectation
+  // (never renderer input); manual CLI omits it and uninstalls the exact
+  // state read under the lock below.
+  const expectedOwnership = parseExpectedLifecycleOwnership({ kind: expectedKind, mode: expectedMode });
+  if (launcherControl && !expectedOwnership) {
+    throw new Error("Launcher-controlled uninstall requires --expected-installation-kind (configured|missing) from the trusted launcher ownership state");
+  }
   if (!yes && !await confirm("Restore Codex config, stop services, and remove this installation?")) {
     throw new Error("Uninstall cancelled");
   }
-  const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
-  if (config?.browserHost === "launcher" && !launcherControl) {
-    throw new Error(
-      "Launcher-owned integration must be removed from Codex Web GPT Settings so the active runtime can be drained safely.",
-    );
-  }
-  if (!config && process.platform === "darwin" && getServiceStatus().installed) {
-    throw new Error("Service exists but configuration is missing; refusing an unverifiable uninstall");
-  }
-  const launcherRuntimeStopped = config?.browserHost === "launcher" && launcherControl;
-  if (config && process.platform === "darwin" && !launcherRuntimeStopped) await assertServiceIdle(config);
-  if (config?.mode === "full" && !launcherRuntimeStopped) {
-    if (process.platform === "darwin") await uninstallTunnelService();
-    stopTunnel(config);
-  }
-  if (config && process.platform === "darwin" && !launcherRuntimeStopped) await uninstallService(config);
-  uninstallCodexIntegration(config);
-  if (!keepData) rmSync(getConfigDir(), { recursive: true, force: true });
+  // The lifecycle lock is held continuously across expected-state validation,
+  // service/tunnel stop, Codex route cleanup, journal mutation and bridge
+  // config deletion, so a concurrent setup migration can neither slip in
+  // before the ownership check nor interleave the destructive work.
+  await withLifecycleLock("uninstall", async () => {
+    const actual = readActualLifecycleOwnership();
+    if (expectedOwnership) assertLifecycleOwnershipMatch(expectedOwnership, actual, "uninstall");
+    const config = actual.kind === "configured" ? actual.config : undefined;
+    if (config?.browserHost === "launcher" && !launcherControl) {
+      throw new Error(
+        "Launcher-owned integration must be removed from Codex Web GPT Settings so the active runtime can be drained safely.",
+      );
+    }
+    if (!config && process.platform === "darwin" && getServiceStatus().installed) {
+      throw new Error("Service exists but configuration is missing; refusing an unverifiable uninstall");
+    }
+    const launcherRuntimeStopped = config?.browserHost === "launcher" && launcherControl;
+    if (config && process.platform === "darwin" && !launcherRuntimeStopped) await assertServiceIdle(config);
+    if (config?.mode === "full" && !launcherRuntimeStopped) {
+      if (process.platform === "darwin") await uninstallTunnelService();
+      stopTunnel(config);
+    }
+    if (config && process.platform === "darwin" && !launcherRuntimeStopped) await uninstallService(config);
+    uninstallCodexIntegration(config);
+    if (!keepData) rmSync(getConfigDir(), { recursive: true, force: true });
+  });
   stdout.write(keepData ? "Uninstalled; private application data was preserved.\n" : "Uninstalled and removed private application data.\n");
 }
 
