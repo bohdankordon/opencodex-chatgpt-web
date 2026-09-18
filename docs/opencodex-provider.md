@@ -12,11 +12,19 @@ The external-provider integration in this release is a **CLI/runtime contract**.
 setup, serve, doctor, route-mutation guards, Responses endpoints, and uninstall behavior from
 silently taking ownership of Codex routing.
 
-The desktop Launcher has not yet been taught to persist or operate external-provider ownership.
-Until that launcher work lands, do not use Launcher Repair, Update, Remove, or other setup-changing
-Launcher actions on an external-provider installation. Start and manage this mode through the CLI
-commands documented below. This avoids the stock Launcher re-running Direct-mode setup against a
-Codex configuration owned by OpenCodex.
+The desktop Launcher supports the external-provider lifecycle in an ownership-aware way. A
+genuinely new Launcher installation can choose Direct (default) or External provider/router on
+the Setup surface; that choice is first-install intent only, and Direct-to-External migration in
+either direction stays CLI-only (there is no Settings routing picker or migration button).
+
+Ownership split: the external router owns Codex routing, while the Launcher owns only the
+ChatGPT Web bridge and browser runtime. Registering the provider with the router (for example
+the `ocx provider add` flow below) remains manual work: the Launcher never installs, registers,
+or configures the external router, and External setup fails unless Codex routing is already
+owned by (released to) that router. Launcher startup, repair, reinstall, and update validate
+bridge ownership-health without taking Direct route ownership, and External Remove leaves
+external router/provider configuration untouched (a Direct Codex route owned by the
+installation is still restored).
 
 ## What this process owns
 

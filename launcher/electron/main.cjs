@@ -356,9 +356,9 @@ async function startConfiguredBridgeRuntime({ startupOwnership, runtimeHost, run
 // Ready-state publishing split for testability (G3). coreSetupComplete marks
 // the Launcher bridge installation ready once its own runtime/health contract
 // is valid; it never claims the external router is configured. For External
-// installs codexCatalogVerified records bridge-side catalog health (which the
-// MCP UI needs) once the monitor observes it, never a claim that Codex
-// fetched the catalog through the router; final copy belongs to a later stage.
+// installs codexCatalogVerified records health-validated bridge readiness
+// (which the MCP UI needs), never a claim that Codex fetched the catalog
+// through the router (FINAL-A).
 function completeStartupReadyState({ stateStore, send, config, bridgeRouteChanged, integrationMode, startMonitor }) {
   const current = stateStore.read();
   const patch = {
@@ -370,6 +370,14 @@ function completeStartupReadyState({ stateStore, send, config, bridgeRouteChange
     ...(bridgeRouteChanged ? {
       codexCatalogVerified: false,
       codexRestartRequired: true,
+    } : {}),
+    // FINAL-A: a health-validated External bridge is Launcher-ready. This
+    // flag means the bridge passed ownership-health validation at startup,
+    // NOT proof that Codex directly fetched the catalog. The Direct catalog
+    // monitor never starts for External (see below).
+    ...(integrationMode === EXTERNAL_INTEGRATION_MODE ? {
+      codexCatalogVerified: true,
+      codexRestartRequired: false,
     } : {}),
     ...(config.mode === "browser-only" ? {
       mcpSetupComplete: false,
@@ -427,8 +435,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "Cancel",
     remove: "Remove",
     removeTitle: "Remove Codex Web GPT",
-    removeMessage: "Remove the ChatGPT Web models from Codex and restore the previous model route?",
-    removeDetail: "The launcher's ChatGPT login profile will be preserved. Codex must be restarted once.",
+    removeMessage: "Remove the local ChatGPT Web bridge and its Codex integration?",
+    removeDetail: "Removes the Launcher-managed bridge runtime. If this installation owns a Direct Codex route, that route is restored; external router or provider configuration is left untouched. Restart Codex only if the Launcher reports it is required.",
     retry: "Retry",
     startupTitle: "Codex Web GPT could not start",
     startupDetail: "Retry starts the launcher again without changing your saved settings or ChatGPT profile.",
@@ -442,8 +450,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "取消",
     remove: "移除",
     removeTitle: "移除 Codex Web GPT",
-    removeMessage: "从 Codex 中移除 ChatGPT Web 模型并恢复此前的模型路由？",
-    removeDetail: "启动器中的 ChatGPT 登录 profile 会保留。Codex 需要重启一次。",
+    removeMessage: "移除本地 ChatGPT Web bridge 及其 Codex 集成？",
+    removeDetail: "移除由启动器管理的 bridge 运行时。如果此安装拥有 Direct Codex 路由，将恢复该路由；外部路由器或 provider 配置保持不变。仅在启动器提示需要时重启 Codex。",
     retry: "重试",
     startupTitle: "Codex Web GPT 无法启动",
     startupDetail: "重试会重新启动应用，不会更改已保存的设置或 ChatGPT 登录配置。",
@@ -457,8 +465,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "取消",
     remove: "移除",
     removeTitle: "移除 Codex Web GPT",
-    removeMessage: "從 Codex 中移除 ChatGPT Web 模型並還原先前的模型路由？",
-    removeDetail: "啟動器中的 ChatGPT 登入設定檔會保留。Codex 需要重新啟動一次。",
+    removeMessage: "移除本機 ChatGPT Web bridge 及其 Codex 整合？",
+    removeDetail: "移除由啟動器管理的 bridge 執行階段。如果此安裝擁有 Direct Codex 路由，將還原該路由；外部路由器或 provider 設定保持不變。僅在啟動器提示需要時重新啟動 Codex。",
     retry: "重試",
     startupTitle: "Codex Web GPT 無法啟動",
     startupDetail: "重試會重新啟動應用程式，不會變更已儲存的設定或 ChatGPT 登入設定檔。",
@@ -472,8 +480,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "キャンセル",
     remove: "削除",
     removeTitle: "Codex Web GPT を削除",
-    removeMessage: "Codex から ChatGPT Web モデルを削除し、以前のモデルルートを復元しますか？",
-    removeDetail: "ランチャーの ChatGPT ログインプロファイルは保持されます。Codex を一度再起動する必要があります。",
+    removeMessage: "ローカルの ChatGPT Web ブリッジと Codex 統合を削除しますか？",
+    removeDetail: "ランチャーが管理するブリッジランタイムを削除します。このインストールが Direct Codex ルートを所有している場合は復元されます。外部ルーターやプロバイダーの設定は変更されません。Codex の再起動は、ランチャーが求めた場合のみ必要です。",
     retry: "再試行",
     startupTitle: "Codex Web GPT を起動できませんでした",
     startupDetail: "保存済みの設定と ChatGPT プロファイルを変更せずに、ランチャーを再起動します。",
@@ -487,8 +495,8 @@ const NATIVE_COPY = Object.freeze({
     cancel: "취소",
     remove: "제거",
     removeTitle: "Codex Web GPT 제거",
-    removeMessage: "Codex에서 ChatGPT Web 모델을 제거하고 이전 모델 경로를 복원할까요?",
-    removeDetail: "런처의 ChatGPT 로그인 프로필은 유지됩니다. Codex를 한 번 다시 시작해야 합니다.",
+    removeMessage: "로컬 ChatGPT Web 브리지와 Codex 통합을 제거할까요?",
+    removeDetail: "런처가 관리하는 브리지 런타임을 제거합니다. 이 설치가 Direct Codex 경로를 소유한 경우 해당 경로가 복원되며, 외부 라우터 또는 공급자 구성은 그대로 유지됩니다. 런처가 요청한 경우에만 Codex를 다시 시작하세요.",
     retry: "다시 시도",
     startupTitle: "Codex Web GPT를 시작할 수 없습니다",
     startupDetail: "저장된 설정이나 ChatGPT 프로필을 변경하지 않고 런처를 다시 시작합니다.",
@@ -996,7 +1004,13 @@ function registerIpc({ logger, stateStore }) {
     const result = IS_DEV_PROFILE
       ? await runtimeHost.setupDevCore(input, ownership.expectation)
       : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
-    stateStore.update(repairCompletionPatch(ownership, {
+    // FINAL-A: successful External first setup / reinstall already passed G4
+    // transactional continuity + bridge ownership-health validation inside
+    // runSetup, so mark truthful External UI-ready here. codexCatalogVerified
+    // means health-validated bridge readiness, NOT Direct catalog proof, and
+    // no Codex restart is required because no Direct route was touched.
+    // Direct keeps existing catalog-monitor semantics.
+    const setupCompletion = repairCompletionPatch(ownership, {
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
       codexRestartRequired: IS_DEV_PROFILE ? false : true,
@@ -1010,13 +1024,22 @@ function registerIpc({ logger, stateStore }) {
         mcpRuntimeInstalled: false,
         mcpGuideStep: 0,
       }),
-    }));
+    });
+    stateStore.update(
+      !IS_DEV_PROFILE && ownership.integrationMode === EXTERNAL_INTEGRATION_MODE
+        ? { ...setupCompletion, codexCatalogVerified: true, codexRestartRequired: false }
+        : setupCompletion,
+    );
     await browserHost.returnToIdle().catch((error) => {
       logger.warn("browser.idle_cleanup_failed", {
         message: error instanceof Error ? error.message : String(error),
       });
     });
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    // FINAL-A: the Direct catalog monitor never starts for External; External
+    // readiness was already proven by transactional ownership-health validation.
+    if (!IS_DEV_PROFILE && ownership.integrationMode !== EXTERNAL_INTEGRATION_MODE) {
+      startCatalogVerificationMonitor({ logger, stateStore });
+    }
     // G4 truthful restart: an External repair touches no Codex route, so it
     // must not claim a restart is required merely because the bridge was
     // repaired. Direct preserves existing guidance.

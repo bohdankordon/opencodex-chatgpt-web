@@ -353,8 +353,12 @@ test("G4.20 External repair with correct health succeeds truthfully", async () =
   assert.equal(out.calls.routes, 0);
   const patch = out.calls.stateUpdates[0];
   assert.equal(patch.coreSetupComplete, true);
-  assert.equal("codexRestartRequired" in patch, false);
-  assert.equal("codexCatalogVerified" in patch, false);
+  // FINAL-A: successful External setup/reinstall already passed G4 transactional
+  // continuity + bridge ownership-health validation inside runSetup, so the bridge
+  // is Launcher-ready. codexCatalogVerified means health-validated bridge
+  // readiness (not Direct catalog proof); no Codex restart is required.
+  assert.equal(patch.codexCatalogVerified, true);
+  assert.equal(patch.codexRestartRequired, false);
   assert.equal("externalRouterHealthy" in patch, false);
 });
 

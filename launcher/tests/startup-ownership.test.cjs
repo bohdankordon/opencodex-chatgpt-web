@@ -175,7 +175,7 @@ function recoverContext(options) {
 }
 
 function readyContext() {
-  const context = { DIRECT_INTEGRATION_MODE };
+  const context = { DIRECT_INTEGRATION_MODE, EXTERNAL_INTEGRATION_MODE };
   vm.createContext(context);
   context.completeStartupReadyState = vm.runInContext(readyStateSource + "\ncompleteStartupReadyState;", context);
   return context;
@@ -602,7 +602,7 @@ test("G3.29 External catalog failure publishes no Direct failure claim", async (
   assert.equal(state.codexRestartRequired, true);
 });
 
-test("G3.30 ready state leaves restart untouched without a route change", () => {
+test("G3.30/FINAL-A external ready state marks a health-validated bridge ready", () => {
   const context = readyContext({ browserOnly: false });
   const updated = [];
   const sent = [];
@@ -617,8 +617,11 @@ test("G3.30 ready state leaves restart untouched without a route change", () => 
   });
   assert.equal(monitored.length, 0);
   assert.equal(updated.length, 1);
-  assert.equal("codexRestartRequired" in updated[0], false);
-  assert.equal("codexCatalogVerified" in updated[0], false);
+  // FINAL-A: healthy External startup already passed ownership-health
+  // validation, so the bridge is Launcher-ready: catalog means bridge
+  // readiness (not Direct Codex proof) and no Codex restart is required.
+  assert.equal(updated[0].codexCatalogVerified, true);
+  assert.equal(updated[0].codexRestartRequired, false);
   assert.equal(updated[0].coreSetupComplete, true);
 });
 

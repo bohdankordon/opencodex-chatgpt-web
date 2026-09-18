@@ -40,6 +40,13 @@ Run this list on a maintained Windows 11 x64 machine with a real ChatGPT account
    that the existing private MCP credentials are reused rather than replaced.
 11. Upgrade from the previous public release and prove that launcher state, browser state, Codex
     settings, and MCP configuration survive the updater transaction.
+12. Prove the ownership-aware Launcher lifecycle: on a clean profile the Setup surface offers
+    Direct (default) versus External provider/router and a new External install reaches ready
+    without a Restart-Codex prompt; restart the launcher on a CLI-created External install and
+    prove Install shows complete with MCP reachable; run External Reinstall, update, and Remove
+    and prove no Direct route mutation occurs and external router configuration is untouched;
+    prove the Direct install/reinstall/remove regression still behaves as before; and prove no
+    Settings routing picker or Direct-to-External GUI migration exists (migration is CLI-only).
 
 Any failed or unexecuted item blocks a stable release. An alpha may ship with a named failed item
 only when the release notes describe the limitation and recovery path explicitly.

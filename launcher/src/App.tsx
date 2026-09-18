@@ -17,6 +17,7 @@ import type {
   BrowserState,
   DoctorReport,
   Language,
+  LauncherIntegrationMode,
   LauncherSnapshot,
   LauncherState,
   LogRecord,
@@ -1098,6 +1099,11 @@ function SetupSurface({
 }) {
   const [localBusy, setLocalBusy] = useState(false);
   const manualInteraction = snapshot.state.browserInteractionMode === "manual";
+  const isNewInstall = snapshot.state.coreSetupComplete !== true;
+  // FINAL-A: first-install ownership intent, Direct by default. Never shown
+  // for configured installs (no GUI migration) or the always-Direct DEV
+  // profile. Canonical G1 config remains authoritative.
+  const [routingChoice, setRoutingChoice] = useState<LauncherIntegrationMode>("direct");
   const busy = localBusy
     || operation?.status === "running"
     || (!manualInteraction && (
@@ -1128,7 +1134,15 @@ function SetupSurface({
     updateState((await api!.snapshot()).state);
   });
   const install = () => run(async () => {
-    await api!.setupCore();
+    // FINAL-A: first-install ownership intent only. A genuinely new
+    // installation (coreSetupComplete !== true) may request Direct (default)
+    // or External; a configured install reinstalls with no requested mode so
+    // the canonical G1 config stays authoritative. No GUI migration.
+    if (!devProfile && isNewInstall) {
+      await api!.setupCore({ integrationMode: routingChoice });
+    } else {
+      await api!.setupCore();
+    }
     updateState((await api!.snapshot()).state);
   });
   const setZeroRiskPro = (enabled: boolean) => run(async () => {
@@ -1167,6 +1181,33 @@ function SetupSurface({
             title={copy.stepSmoke}
           />
         </> : null}
+        {!devProfile && isNewInstall ? (
+          <div className="routing-picker" role="radiogroup" aria-label={copy.routingTitle}>
+            <span className="routing-picker-label">{copy.routingTitle}</span>
+            <button
+              aria-checked={routingChoice === "direct"}
+              className={`routing-option${routingChoice === "direct" ? " is-active" : ""}`}
+              disabled={busy}
+              onClick={() => setRoutingChoice("direct")}
+              role="radio"
+              type="button"
+            >
+              <strong>{copy.routingDirect}</strong>
+              <small>{copy.routingDirectBody}</small>
+            </button>
+            <button
+              aria-checked={routingChoice === "external-provider"}
+              className={`routing-option${routingChoice === "external-provider" ? " is-active" : ""}`}
+              disabled={busy}
+              onClick={() => setRoutingChoice("external-provider")}
+              role="radio"
+              type="button"
+            >
+              <strong>{copy.routingExternal}</strong>
+              <small>{copy.routingExternalBody}</small>
+            </button>
+          </div>
+        ) : null}
         <SetupRow
           action={snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall

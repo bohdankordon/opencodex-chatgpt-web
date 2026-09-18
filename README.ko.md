@@ -28,6 +28,8 @@ Codex의 네이티브 모델 선택기에서 Pro를 포함해 계정에 제공�
 
 Full harness 모드는 MCP를 통해 ChatGPT를 현재 작업의 파일, 터미널, 도구 및 승인 절차에 연결합니다. 대화는 Codex 작업에 계속 연결되어 있으므로 컨텍스트가 늘어나도 작업을 이어갈 수 있습니다.
 
+OpenCodex 같은 외부 라우터를 사용하시나요? [외부 공급자 모드](docs/opencodex-provider.md)를 참조하세요.
+
 <div id="get-started"><a id="quick-start"></a></div>
 
 ## 시작하기
