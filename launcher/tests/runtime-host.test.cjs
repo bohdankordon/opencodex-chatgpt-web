@@ -1268,3 +1268,119 @@ test("skill file experiment uses the setup transaction in production and DEV, an
   await assert.rejects(() => manual.host.setSkillAttachments(true), /Zero Risk/);
   assert.equal(manual.invocation(), undefined);
 });
+
+// G1 (PR #2): routing-ownership validation boundaries. Validation only; CLI
+// semantics are unchanged until G2, so matching or omitted modes must still
+// reach the previous code path while mismatches reject before any mutation.
+
+test("G1.23 setup-core rejects a malformed integrationMode before any mutation", async () => {
+  const fixture = hostFor(null);
+  await assert.rejects(fixture.host.setupCore({ integrationMode: "opencodex" }), /Integration mode must be direct or external-provider/);
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("G1.24 setup-mcp rejects a malformed integrationMode before any mutation", async () => {
+  const fixture = hostFor(null);
+  await assert.rejects(
+    Promise.resolve().then(() => fixture.host.setupMcp({ replace: true, integrationMode: "DIRECT" })),
+    /Integration mode must be direct or external-provider/,
+  );
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("G1.25 existing external install rejects direct setup-core before spawn or stop", async () => {
+  const fixture = hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  let stopped = false;
+  const stop = fixture.host.supervisor.stopForSetup;
+  fixture.host.supervisor.stopForSetup = async () => {
+    stopped = true;
+    return stop();
+  };
+  await assert.rejects(fixture.host.setupCore({ integrationMode: "direct" }), /ownership mismatch/);
+  assert.equal(fixture.invocation(), undefined);
+  assert.equal(stopped, false);
+});
+
+test("G1.26 existing external install rejects direct setup-mcp before any mutation", async () => {
+  const fixture = hostFor({ mode: "full", browserHost: "launcher", integrationMode: "external-provider" });
+  await assert.rejects(
+    Promise.resolve().then(() => fixture.host.setupMcp({
+      replace: true,
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKey: "new-private-runtime-key-0123456789",
+      integrationMode: "direct",
+    })),
+    /ownership mismatch/,
+  );
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("G1.27 existing external install rejects direct feature changes before any mutation", async () => {
+  const external = () => hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  const bigger = external();
+  await assert.rejects(bigger.host.setBiggerContext(true, { integrationMode: "direct" }), /ownership mismatch/);
+  assert.equal(bigger.invocation(), undefined);
+  const skills = external();
+  await assert.rejects(skills.host.setSkillAttachments(true, { integrationMode: "direct" }), /ownership mismatch/);
+  assert.equal(skills.invocation(), undefined);
+  const pro = hostFor({ mode: "full", browserHost: "launcher", browserInteractionMode: "manual", integrationMode: "external-provider" }, "manual");
+  await assert.rejects(pro.host.setZeroRiskPro(true, { integrationMode: "direct" }), /ownership mismatch/);
+  assert.equal(pro.invocation(), undefined);
+  const interaction = external();
+  await assert.rejects(
+    interaction.host.setBrowserInteractionMode("automatic", undefined, { integrationMode: "direct" }),
+    /ownership mismatch/,
+  );
+  assert.equal(interaction.invocation(), undefined);
+});
+
+test("G1.28 canonical external install with omitted renderer mode still reaches setup", async () => {
+  const fixture = hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  const result = await fixture.host.setupCore();
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+});
+
+test("G1.28 existing external install with matching renderer mode still reaches setup", async () => {
+  const fixture = hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
+  const result = await fixture.host.setupCore({ integrationMode: "external-provider" });
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+});
+
+test("existing direct install rejects an external request as CLI-only migration", async () => {
+  const fixture = hostFor({ mode: "browser-only", browserHost: "launcher" });
+  await assert.rejects(fixture.host.setupCore({ integrationMode: "external-provider" }), /CLI-only/);
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("G1.29 launcher-state-like fields cannot override canonical runtime ownership", async () => {
+  const fixture = hostFor({
+    mode: "browser-only",
+    browserHost: "launcher",
+    integrationMode: "external-provider",
+    coreSetupComplete: false,
+    bridgeEnabled: true,
+  });
+  await assert.rejects(fixture.host.setupCore({ integrationMode: "direct" }), /ownership mismatch/);
+  assert.equal(fixture.invocation(), undefined);
+});
+
+test("G1.30-31 legacy install without integrationMode resolves direct and reaches setup", async () => {
+  const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
+  const result = await fixture.host.setupCore();
+  assert.equal(result.mode, "full");
+  assert.notEqual(fixture.invocation(), undefined);
+});
+
+test("G1.13 damaged runtime config fails closed instead of looking like a new install", async () => {
+  const unreadable = hostFor(null);
+  unreadable.host.supervisor.readSetupConfig = () => {
+    throw new Error("Unexpected token in JSON");
+  };
+  await assert.rejects(unreadable.host.setupCore(), /damaged/);
+  assert.equal(unreadable.invocation(), undefined);
+  const malformed = hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "opencodex" });
+  await assert.rejects(malformed.host.setupCore(), /damaged/);
+  assert.equal(malformed.invocation(), undefined);
+});

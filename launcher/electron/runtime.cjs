@@ -14,6 +14,10 @@ const {
   validateConnectorName,
 } = require("./connector-identity.cjs");
 const { embeddedRuntimeInvocation, runtimeInvocation } = require("./runtime-command.cjs");
+const {
+  extractRequestedIntegrationMode,
+  resolveOwnershipContext,
+} = require("./integration-mode.cjs");
 const { redactText } = require("./logging.cjs");
 const { DETACH_OWNED_CHILD, terminateOwnedProcessTree } = require("./process-tree.cjs");
 
@@ -440,6 +444,18 @@ class RuntimeHost {
       serialized: JSON.stringify(config),
       config: structuredClone(config),
     };
+  }
+
+  // G1 (PR #2): validate routing ownership for a setup-changing action.
+  // Reads canonical config (never renderer or launcher-state authority) and
+  // throws on mismatch or damaged config BEFORE the caller mutates anything.
+  // G2 consumes the threaded mode parameter for command and checkpoint policy.
+  resolveSetupOwnership(requestedMode, action) {
+    return resolveOwnershipContext({
+      requestedMode: requestedMode,
+      supervisor: this.supervisor,
+      action: action,
+    });
   }
 
   mcpCredentialsConfigured(requestedMode) {
@@ -988,7 +1004,9 @@ class RuntimeHost {
     }
   }
 
-  async setupCore() {
+  async setupCore(input) {
+    // G1 validates ownership; the threaded mode parameter is consumed by G2.
+    this.resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-core");
     this.assertProductionProfile("Codex integration setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const existing = this.runtimeConfigSnapshot();
@@ -1050,7 +1068,9 @@ class RuntimeHost {
     return { ...result, mode };
   }
 
-  async setBiggerContext(enabled) {
+  async setBiggerContext(enabled, options) {
+    // G1 validates ownership; the threaded mode parameter is consumed by G2.
+    this.resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Initialize the runtime before changing Bigger Context");
@@ -1096,7 +1116,9 @@ class RuntimeHost {
     return { ...result, mode, enabled: enabled === true };
   }
 
-  async setSkillAttachments(enabled) {
+  async setSkillAttachments(enabled, ownershipInput) {
+    // G1 validates ownership; the threaded mode parameter is consumed by G2.
+    this.resolveSetupOwnership(extractRequestedIntegrationMode(ownershipInput), "skill-attachments");
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) throw new Error("Initialize the runtime before changing Skills as files");
     if (current.config?.browserInteractionMode === "manual") {
@@ -1124,7 +1146,9 @@ class RuntimeHost {
     return { ...result, enabled: enabled === true };
   }
 
-  async setZeroRiskPro(enabled) {
+  async setZeroRiskPro(enabled, ownershipInput) {
+    // G1 validates ownership; the threaded mode parameter is consumed by G2.
+    this.resolveSetupOwnership(extractRequestedIntegrationMode(ownershipInput), "zero-risk-pro");
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Install the Codex integration before changing Zero Risk model profiles");
@@ -1219,7 +1243,9 @@ class RuntimeHost {
     };
   }
 
-  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode } = {}, afterRuntimeReady) {
+  setupMcp({ tunnelId = "", runtimeKey = "", replace = false, interactionMode, integrationMode: requestedIntegrationMode } = {}, afterRuntimeReady) {
+    // G1 validates ownership; the threaded mode parameter is consumed by G2.
+    this.resolveSetupOwnership(requestedIntegrationMode, "setup-mcp");
     this.assertProductionProfile("Native Codex MCP setup");
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const targetMode = interactionMode ?? this.browserInteractionMode();
@@ -1312,7 +1338,9 @@ class RuntimeHost {
     }).finally(() => fs.rmSync(keyPath, { force: true }));
   }
 
-  async setBrowserInteractionMode(mode, afterRuntimeReady) {
+  async setBrowserInteractionMode(mode, afterRuntimeReady, ownershipInput) {
+    // G1 validates ownership; the threaded mode parameter is consumed by G2.
+    this.resolveSetupOwnership(extractRequestedIntegrationMode(ownershipInput), "browser-interaction-mode");
     if (mode !== "automatic" && mode !== "manual") {
       throw new Error("Browser interaction mode must be automatic or manual");
     }

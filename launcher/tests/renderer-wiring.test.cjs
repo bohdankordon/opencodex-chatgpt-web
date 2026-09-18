@@ -5,6 +5,7 @@ const path = require("node:path");
 
 const launcherRoot = path.resolve(__dirname, "..");
 const appSource = fs.readFileSync(path.join(launcherRoot, "src", "App.tsx"), "utf8");
+const { extractRequestedIntegrationMode } = require("../electron/integration-mode.cjs");
 const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"), "utf8");
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
@@ -92,23 +93,44 @@ test("setup preserves session-check failures and never installs without verified
     let installs = 0;
     let browser = { authenticated: false, status: "error", message: "ChatGPT session verification failed (HTTP 503)." };
     const state = { browserInteractionMode: "automatic", coreSetupComplete: false };
-    const run = async () => { installs++; return { mode: "browser-only", stdout: "" }; };
+    const ownershipRequests = [];
+    let lastInput;
+    const runWithOwnership = async (input) => { installs++; lastInput = input; return { mode: "browser-only", stdout: "" }; };
     vm.runInNewContext(source, {
       handle: (_name, handler) => { setup = handler; }, IS_DEV_PROFILE: dev,
       stateStore: { read: () => state, update() {} },
       browserHost: { probeAuthentication: async () => browser, returnToIdle: async () => {} },
-      runtimeHost: { setupCore: run, setupDevCore: run, runtimeConfigSnapshot: () => ({ config: {} }) },
+      runtimeHost: { setupCore: runWithOwnership, setupDevCore: runWithOwnership, runtimeConfigSnapshot: () => ({ config: {} }) },
+      resolveSetupOwnership: (requestedMode, action) => {
+        ownershipRequests.push({ requestedMode, action });
+        return { integrationMode: "direct", newInstallation: true, canonical: { kind: "missing" } };
+      },
+      extractRequestedIntegrationMode,
       smokePassedThisSession: true, send() {}, startCatalogVerificationMonitor() {}, logger: {},
     });
     await assert.rejects(setup, error => error.message === browser.message);
     assert.equal(installs, 0);
+    assert.deepEqual(ownershipRequests, [{ requestedMode: undefined, action: "setup-core" }]);
     browser = { authenticated: false, status: "signed-out", message: "Sign in to ChatGPT" };
     await assert.rejects(setup, /Sign in to/);
     assert.equal(installs, 0);
     browser = { authenticated: true, status: "ready", message: "ChatGPT is ready" };
     assert.equal((await setup()).ok, true);
     assert.equal(installs, 1);
+    if (!dev) assert.equal(lastInput.integrationMode, "direct");
   }
+});
+
+test("setup IPC threads an optional routing-ownership mode without trusting the renderer", () => {
+  assert.match(preloadSource, /setupCore: \(input\) => ipcRenderer\.invoke\("launcher:setup-core", input\)/);
+  assert.match(preloadSource, /setBiggerContext: \(enabled, options\) => ipcRenderer\.invoke\("launcher:bigger-context", enabled, options\)/);
+  assert.match(preloadSource, /setBrowserInteractionMode: \(mode, options\) =>/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(input\), "setup-core"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(input\), "setup-mcp"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "bigger-context"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "skill-attachments"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "zero-risk-pro"\)/);
+  assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(options\), "browser-interaction-mode"\)/);
 });
 
 test("startup failure stays visible on another launch and Retry exits the failed instance", async () => {
@@ -197,7 +219,7 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
   assert.match(appSource, /data-profile=\{snapshot\.profile\}/);
   assert.match(appSource, /manualBiggerContextUnavailable[\s\S]*?copy\.biggerContextBody/);
   assert.match(appSource, /api!\.setBiggerContext\(enabled\)/);
-  assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true\)/);
+  assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true,/);
   assert.doesNotMatch(electronMain, /IS_DEV_PROFILE && key === "experimentalBiggerContext"/);
 });
 
@@ -237,8 +259,10 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
     electronMain.indexOf('handle("launcher:set-preference"'),
   );
   const modeTransaction = modeSwitchHandler.indexOf("await browserHost.withInteractionModeChange(");
-  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady)");
+  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady,");
   const stateModeCommit = modeSwitchHandler.indexOf("const state = stateStore.update({");
+  const ownershipResolution = modeSwitchHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(options),");
+  assert.ok(ownershipResolution >= 0 && ownershipResolution < modeTransaction);
   assert.ok(modeTransaction >= 0 && modeTransaction < runtimeModeCommit);
   assert.ok(runtimeModeCommit < stateModeCommit);
 
@@ -249,6 +273,8 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
   const runtimeMcpCommit = mcpSetupHandler.indexOf("const runSetup = afterRuntimeReady => setup({");
   const mcpTransaction = mcpSetupHandler.indexOf("await browserHost.withInteractionModeChange(interactionMode, runSetup)");
   const stateMcpCommit = mcpSetupHandler.indexOf("const state = stateStore.update({");
+  const mcpOwnership = mcpSetupHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(input),");
+  assert.ok(mcpOwnership >= 0 && mcpOwnership < runtimeMcpCommit);
   assert.ok(runtimeMcpCommit >= 0 && runtimeMcpCommit < mcpTransaction);
   assert.ok(mcpTransaction < stateMcpCommit);
   assert.match(browserHostSource, /bindManualTurnContents\(tab\)/);

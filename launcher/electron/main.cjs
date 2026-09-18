@@ -38,6 +38,11 @@ const {
   validateSidebarState,
 } = require("./state.cjs");
 const {
+  DIRECT: DIRECT_INTEGRATION_MODE,
+  extractRequestedIntegrationMode,
+  resolveOwnershipContext,
+} = require("./integration-mode.cjs");
+const {
   MIN_WINDOW_BOUNDS,
   readWindowState,
   trackWindowState,
@@ -480,6 +485,23 @@ function validateBrowserInteractionMode(value) {
   return value;
 }
 
+// G1 (PR #2): resolve routing ownership BEFORE any lifecycle mutation.
+// Renderer input is never authority: the canonical runtime config wins, an
+// omitted mode preserves it, and a mismatch rejects before browser mutation,
+// supervisor stop, checkpoint or CLI spawn. launcher-state.json is never read
+// here. G2 derives command, checkpoint and route policy from this context.
+function resolveSetupOwnership(requestedMode, action) {
+  const context = resolveOwnershipContext({
+    requestedMode: requestedMode,
+    supervisor: runtimeSupervisor || runtimeHost.supervisor,
+    action: action,
+  });
+  if (IS_DEV_PROFILE && context.integrationMode !== DIRECT_INTEGRATION_MODE) {
+    throw new Error("External provider routing is unavailable in the isolated DEV launcher profile");
+  }
+  return context;
+}
+
 function validateBounds(value) {
   if (!value || typeof value !== "object") throw new Error("Browser bounds are required");
   for (const key of ["x", "y", "width", "height"]) {
@@ -734,7 +756,8 @@ function registerIpc({ logger, stateStore }) {
     stopCatalogVerificationMonitor();
     return { cancelled: false, state };
   });
-  handle("launcher:setup-core", async () => {
+  handle("launcher:setup-core", async (_event, input) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-core");
     const setupState = stateStore.read();
     if (setupState.browserInteractionMode === "automatic") {
       const browser = await browserHost.probeAuthentication();
@@ -756,7 +779,10 @@ function registerIpc({ logger, stateStore }) {
           : "Run the browser smoke test before installing the Codex integration",
       );
     }
-    const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
+    // G1 carries resolved ownership into the runtime call; CLI semantics unchanged (G2).
+    const result = IS_DEV_PROFILE
+      ? await runtimeHost.setupDevCore()
+      : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode });
     stateStore.update({
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
@@ -781,6 +807,7 @@ function registerIpc({ logger, stateStore }) {
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
   handle("launcher:setup-mcp", async (_event, input) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(input), "setup-mcp");
     const currentMode = stateStore.read().browserInteractionMode;
     const interactionMode = input?.interactionMode === undefined
       ? currentMode
@@ -794,6 +821,7 @@ function registerIpc({ logger, stateStore }) {
       runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
       replace: input?.replace === true,
       interactionMode,
+      integrationMode: ownership.integrationMode,
     }, afterRuntimeReady);
     if (!interactionModeChange && interactionMode === "automatic") await browserHost.reveal();
     const result = interactionModeChange
@@ -829,8 +857,9 @@ function registerIpc({ logger, stateStore }) {
       ...autostart,
     };
   });
-  handle("launcher:bigger-context", async (_event, enabled) => {
-    const result = await runtimeHost.setBiggerContext(enabled === true);
+  handle("launcher:bigger-context", async (_event, enabled, options) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
+    const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode });
     const state = stateStore.update({
       experimentalBiggerContext: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
@@ -840,16 +869,18 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
-  handle("launcher:skill-attachments", async (_event, enabled) => {
+  handle("launcher:skill-attachments", async (_event, enabled, options) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "skill-attachments");
     if (browserHost.activeTraceId || browserHost.currentOperation()) {
       throw new Error("Finish or cancel active ChatGPT turns before changing Skills as files");
     }
-    const result = await runtimeHost.setSkillAttachments(enabled === true);
+    const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode });
     const state = stateStore.update({ experimentalSkillAttachments: result.enabled });
     send("launcher:state-changed", state);
     return state;
   });
-  handle("launcher:zero-risk-pro", async (_event, enabled) => {
+  handle("launcher:zero-risk-pro", async (_event, enabled, options) => {
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "zero-risk-pro");
     const browserOperation = browserHost.currentOperation();
     if (browserHost.activeTraceId || browserOperation) {
       throw new Error(
@@ -858,7 +889,7 @@ function registerIpc({ logger, stateStore }) {
           : `Finish ${browserOperation} before changing Zero Risk model profiles`,
       );
     }
-    const result = await runtimeHost.setZeroRiskPro(enabled === true);
+    const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode });
     const state = stateStore.update({
       zeroRiskProEnabled: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE,
@@ -868,8 +899,9 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
-  handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
+  handle("launcher:browser-interaction-mode", async (_event, rawMode, options) => {
     const mode = validateBrowserInteractionMode(rawMode);
+    const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "browser-interaction-mode");
     const current = stateStore.read();
     if (current.browserInteractionMode === mode) {
       return { state: current, credentialsRequired: false, targetMode: mode };
@@ -887,7 +919,7 @@ function registerIpc({ logger, stateStore }) {
     }
     const result = await browserHost.withInteractionModeChange(
       mode,
-      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady),
+      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady, { integrationMode: ownership.integrationMode }),
     );
     const state = stateStore.update({
       browserInteractionMode: mode,

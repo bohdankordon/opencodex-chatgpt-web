@@ -3,6 +3,14 @@ import languages from "../electron/languages.json";
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
+export type LauncherIntegrationMode = "direct" | "external-provider";
+
+// G1 (PR #2): renderer protocol typing only. The main process resolves the
+// canonical mode from runtime config; this value is never authority.
+// Omitted during G1 for existing installs so main preserves canonical mode.
+export interface IntegrationModeOption {
+  integrationMode?: LauncherIntegrationMode;
+}
 export type Surface = "browser" | "setup" | "mcp" | "activity" | "settings";
 
 export interface LauncherState {
@@ -148,19 +156,20 @@ export interface LauncherApi {
   doctor(): Promise<DoctorReport>;
   cancelTurns(): Promise<{ stdout: string }>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
-  setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
+  setupCore(input?: IntegrationModeOption): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;
     replace?: boolean;
     interactionMode?: BrowserInteractionMode;
+    integrationMode?: LauncherIntegrationMode;
   }): Promise<{ ok: boolean; stdout: string }>;
   setMcpStep(step: number): Promise<LauncherState>;
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
-  setBiggerContext(enabled: boolean): Promise<LauncherState>;
-  setSkillAttachments(enabled: boolean): Promise<LauncherState>;
-  setZeroRiskPro(enabled: boolean): Promise<LauncherState>;
-  setBrowserInteractionMode(mode: BrowserInteractionMode): Promise<{
+  setBiggerContext(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
+  setSkillAttachments(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
+  setZeroRiskPro(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
+  setBrowserInteractionMode(mode: BrowserInteractionMode, options?: IntegrationModeOption): Promise<{
     state: LauncherState;
     credentialsRequired: boolean;
     targetMode: BrowserInteractionMode;
