@@ -1067,7 +1067,7 @@ class RuntimeHost {
     }
   }
 
-  async setupCore(input, expectation) {
+  async setupCore(input, expectation, afterRuntimeReady) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
     const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, "setup-core");
     const policy = buildSetupOwnershipPolicy({
@@ -1103,6 +1103,11 @@ class RuntimeHost {
       successMessage: "Codex integration installed",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
       ownershipPolicy: policy,
+      // G4 blocker fix: repair continuity + health run inside the transaction
+      // via afterRuntimeReady, while the G2 checkpoint is still live. A hook
+      // failure enters runSetup catch/rollback instead of committing route
+      // mutation and reporting failure afterwards.
+      ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
     });
     return { ...result, mode };
   }
@@ -1146,7 +1151,7 @@ class RuntimeHost {
     return { ...result, mode };
   }
 
-  async setBiggerContext(enabled, options, expectation) {
+  async setBiggerContext(enabled, options, expectation, afterRuntimeReady) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
     const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(options), expectation, "bigger-context");
     const policy = buildSetupOwnershipPolicy({
@@ -1177,6 +1182,7 @@ class RuntimeHost {
         successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
         timeoutMs: CORE_SETUP_TIMEOUT_MS,
         ownershipPolicy: policy,
+        ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
       });
       return { ...result, mode, enabled: enabled === true };
     }
@@ -1197,11 +1203,12 @@ class RuntimeHost {
       successMessage: enabled ? "Bigger Context enabled; restart Codex" : "Standard context restored; restart Codex",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
       ownershipPolicy: policy,
+      ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
     });
     return { ...result, mode, enabled: enabled === true };
   }
 
-  async setSkillAttachments(enabled, ownershipInput, expectation) {
+  async setSkillAttachments(enabled, ownershipInput, expectation, afterRuntimeReady) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
     const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "skill-attachments");
     const policy = buildSetupOwnershipPolicy({
@@ -1231,6 +1238,7 @@ class RuntimeHost {
       successMessage: enabled ? "Skills as files enabled" : "Inline skills restored",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
       ownershipPolicy: policy,
+      ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
     };
     const result = development
       ? await this.runDevSetup("skill-attachments", args, options)
@@ -1238,7 +1246,7 @@ class RuntimeHost {
     return { ...result, enabled: enabled === true };
   }
 
-  async setZeroRiskPro(enabled, ownershipInput, expectation) {
+  async setZeroRiskPro(enabled, ownershipInput, expectation, afterRuntimeReady) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
     const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "zero-risk-pro");
     const policy = buildSetupOwnershipPolicy({
@@ -1274,6 +1282,7 @@ class RuntimeHost {
         : `Default Zero Risk model restored${this.launcherProfile === "production" ? "; restart Codex" : ""}`,
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
       ownershipPolicy: policy,
+      ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
     };
     const result = this.launcherProfile === "development"
       ? await this.runDevSetup("zero-risk-pro", args, options)

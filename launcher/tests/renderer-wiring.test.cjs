@@ -119,6 +119,7 @@ test("setup preserves session-check failures and never installs without verified
       validateRepairBridgeHealth: async () => {},
       repairCompletionPatch: (_ownership, directPatch) => directPatch,
       EXTERNAL_INTEGRATION_MODE: "external-provider",
+      createRepairRuntimeValidation: () => undefined,
     });
     await assert.rejects(setup, error => error.message === browser.message);
     assert.equal(installs, 0);
@@ -227,6 +228,11 @@ test("B8 setup-mcp revalidates ownership before browser reveal", async () => {
     send() {},
     startCatalogVerificationMonitor() {},
     logger: {},
+    createRepairRuntimeValidation: () => undefined,
+    composeAfterRuntimeReady: (existing) => existing,
+    repairCompletionPatch: (_ownership, directPatch) => directPatch,
+    validateRepairBridgeHealth: async () => {},
+    EXTERNAL_INTEGRATION_MODE: "external-provider",
   });
   await assert.rejects(setup(undefined), /changed while preparing setup-mcp/);
   assert.equal(reveals, 0);
@@ -400,7 +406,7 @@ test("Zero Risk setup commits state after the runtime transaction and preserves 
     electronMain.indexOf('handle("launcher:set-preference"'),
   );
   const modeTransaction = modeSwitchHandler.indexOf("await browserHost.withInteractionModeChange(");
-  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady,");
+  const runtimeModeCommit = modeSwitchHandler.indexOf("runtimeHost.setBrowserInteractionMode(mode,");
   const stateModeCommit = modeSwitchHandler.indexOf("stateStore.update(");
   const ownershipResolution = modeSwitchHandler.indexOf("resolveSetupOwnership(extractRequestedIntegrationMode(options),");
   assert.ok(ownershipResolution >= 0 && ownershipResolution < modeTransaction);

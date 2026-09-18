@@ -128,7 +128,10 @@ test("G4.36-40 repairCompletionPatch truthfulness", () => {
   assert.equal("externalRouterHealthy" in extPatch, false);
 });
 
-test("G4.9-10 repair performs zero explicit route calls", async () => {
+// NOTE (§28): spy-only assertions below prove zero EXPLICIT route lifecycle
+// commands (connect/restore/status). Direct subprocess route mutation inside
+// setup is covered separately by the G4.BLOCKER real-file rollback tests.
+test("G4.9-10 repair issues zero explicit route lifecycle commands", async () => {
   for (const mode of ["direct", "external-provider"]) {
     const config = mode === "direct" ? { mode: "browser-only", browserHost: "launcher", integrationMode: "direct" } : { mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" };
     const fixture = simpleHost(config);
@@ -143,7 +146,7 @@ test("G4.9-10 repair performs zero explicit route calls", async () => {
   }
 });
 
-test("G4.11 External repair failure calls zero route restore", async () => {
+test("G4.11 External repair failure issues zero explicit route restore", async () => {
   const existing = { mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" };
   const host = new RuntimeHost({
     app: { getPath: () => os.tmpdir(), getVersion: () => "1.1.3" },
@@ -288,9 +291,14 @@ async function runRepairCore({ preConfig, postConfig, health, mutateDuringSetup 
   };
   const { repairCompletionPatch: realPatch } = mainHelpers();
   const runtimeHost = {
-    setupCore: async () => {
+    setupCore: async (input, expectation, hook) => {
+      // Emulate the real runSetup transaction: the repair validator hook
+      // runs BEFORE commit, while the checkpoint is live. A hook failure
+      // rejects the setup instead of committing then failing afterwards.
+      calls.hookWired = typeof hook === "function";
       if (mutateDuringSetup) mutateDuringSetup({ setConfig: (c) => { current = c; }, setHealth: (h) => { healthPayload = h; } });
       else if (postConfig !== undefined && postConfig !== "__keep") current = postConfig;
+      if (hook) await hook();
       return { mode: "browser-only", stdout: "" };
     },
     setupDevCore: async () => { throw new Error("unexpected DEV"); },
@@ -321,6 +329,12 @@ async function runRepairCore({ preConfig, postConfig, health, mutateDuringSetup 
     },
     repairCompletionPatch: realPatch,
     EXTERNAL_INTEGRATION_MODE: "external-provider",
+    // G4 blocker fix: the handler now creates the validator and passes it
+    // INTO setupCore (transactional), instead of validating after return.
+    createRepairRuntimeValidation: (ownership, action) => async () => {
+      runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, action);
+      await context.validateRepairBridgeHealth(ownership, action);
+    },
   };
   vm.createContext(context);
   vm.runInContext(setupCoreHandlerSource() + "\nthis.__captured = __handler;", context);
@@ -344,14 +358,14 @@ test("G4.20 External repair with correct health succeeds truthfully", async () =
   assert.equal("externalRouterHealthy" in patch, false);
 });
 
-test("G4.21 External repair with Direct health fails with zero route", async () => {
+test("G4.21 External repair with Direct health fails with zero explicit route commands", async () => {
   const out = await runRepairCore({ preConfig: EXTERNAL_CONFIG, health: directHealth() });
   assert.match(String(out.error && out.error.message), /ownership mismatch/i);
   assert.equal(out.calls.routes, 0);
   assert.equal(out.calls.stateUpdates.length, 0);
 });
 
-test("G4.22 Direct repair with External health fails before route", async () => {
+test("G4.22 Direct repair with External health fails with zero explicit route commands", async () => {
   const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: externalHealth() });
   assert.match(String(out.error && out.error.message), /ownership mismatch/i);
   assert.equal(out.calls.routes, 0);
@@ -367,14 +381,14 @@ test("G4.23-24 wrong routing_owner or provider URL fails", async () => {
   assert.equal(badUrl.calls.stateUpdates.length, 0);
 });
 
-test("G4.25 External-to-Direct drift during repair fails with zero route", async () => {
+test("G4.25 External-to-Direct drift during repair fails with zero explicit route commands", async () => {
   const out = await runRepairCore({ preConfig: EXTERNAL_CONFIG, health: externalHealth(), mutateDuringSetup: ({ setConfig }) => setConfig(DIRECT_CONFIG) });
   assert.match(String(out.error && out.error.message), /changed while preparing|mismatch/i);
   assert.equal(out.calls.routes, 0);
   assert.equal(out.calls.stateUpdates.length, 0);
 });
 
-test("G4.26 Direct-to-External drift during repair fails with zero route", async () => {
+test("G4.26 Direct-to-External drift during repair fails with zero explicit route commands", async () => {
   const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: directHealth(), mutateDuringSetup: ({ setConfig }) => setConfig(EXTERNAL_CONFIG) });
   assert.match(String(out.error && out.error.message), /changed while preparing|mismatch/i);
   assert.equal(out.calls.routes, 0);
@@ -533,5 +547,207 @@ test("G4 absent journal stays absent through External repair rollback", async ()
     assert.equal(fs.existsSync(journal), false);
     assert.equal(fs.existsSync(recovery), false);
   } finally { fixture.cleanup(); }
+});
+
+// G4 blocker-fix regressions: validation INSIDE runSetup via afterRuntimeReady.
+// Each test mutates real temporary route artifacts during the mocked setup
+// subprocess, then fails the transactional hook. The G2 checkpoint must still
+// be live, so runSetup catch/rollback restores files. Spy-only route counts
+// are insufficient because Direct route mutation happens inside setup.
+
+function directRouteFiles(fixture) {
+  return {
+    codexConfig: path.join(fixture.codexHome, "config.toml"),
+    modelsCache: path.join(fixture.codexHome, "models_cache.json"),
+    journal: path.join(fixture.coreHome, "codex", "integration-journal.json"),
+    recovery: path.join(fixture.coreHome, "codex", "integration-journal.recovery.json"),
+  };
+}
+
+test("G4.BLOCKER Direct health failure inside transaction restores route files", async () => {
+  const initial = { mode: "browser-only", browserHost: "launcher", host: "127.0.0.1", port: 17841, integrationMode: "direct" };
+  const fixture = realHost(initial);
+  const files = directRouteFiles(fixture);
+  const original = { codexConfig: "ORIGINAL-direct-route\n", modelsCache: "ORIGINAL-cache\n", journal: "ORIGINAL-journal\n", recovery: "ORIGINAL-recovery\n" };
+  fs.writeFileSync(files.codexConfig, original.codexConfig);
+  fs.writeFileSync(files.modelsCache, original.modelsCache);
+  fs.writeFileSync(files.journal, original.journal);
+  fs.writeFileSync(files.recovery, original.recovery);
+  const bridgeBefore = fs.readFileSync(fixture.configPath, "utf8");
+  let scope;
+  const origCapture = fixture.host.captureSetupCheckpoint.bind(fixture.host);
+  fixture.host.captureSetupCheckpoint = (s, sc) => { scope = sc; return origCapture(s, sc); };
+  let routes = 0;
+  fixture.host.connectBridgeRoute = async () => { routes += 1; return {}; };
+  fixture.host.restoreBridgeRoute = async () => { routes += 1; return {}; };
+  fixture.host.restoreBridgeRouteWithinOperation = async () => { routes += 1; return {}; };
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(files.codexConfig, "MUTATED-direct-route\n");
+    fs.writeFileSync(files.modelsCache, "MUTATED-cache\n");
+    fs.writeFileSync(files.journal, "MUTATED-journal\n");
+    fs.writeFileSync(files.recovery, "MUTATED-recovery\n");
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const { validateRuntimeOwnershipHealth: realHealth } = require("../electron/runtime-health.cjs");
+  const badHealth = { status: "ok", service: "codex-chatgpt-web", mode: "browser-only", version: "9.9.9", integration_mode: "external-provider", routing_owner: "external-router", provider_base_url: "http://127.0.0.1:17841/v1", pid: 7, port: 17841, accepting_turns: true };
+  const hook = async () => {
+    const config = fixture.host.supervisor.readConfig();
+    realHealth({ config, integrationMode: "direct", health: badHealth });
+  };
+  try {
+    await assert.rejects(fixture.host.setupCore({}, undefined, hook), /ownership mismatch/i);
+    assert.equal(scope, "direct-integration");
+    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), original.codexConfig);
+    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), original.modelsCache);
+    assert.equal(fs.readFileSync(files.journal, "utf8"), original.journal);
+    assert.equal(fs.readFileSync(files.recovery, "utf8"), original.recovery);
+    assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
+    assert.equal(routes, 0);
+  } finally { fixture.cleanup(); }
+});
+
+test("G4.BLOCKER Direct ownership drift inside transaction restores route files", async () => {
+  const initial = { mode: "browser-only", browserHost: "launcher", integrationMode: "direct" };
+  const fixture = realHost(initial);
+  const files = directRouteFiles(fixture);
+  const original = { codexConfig: "ORIGINAL-direct-route\n", modelsCache: "ORIGINAL-cache\n", journal: "ORIGINAL-journal\n" };
+  fs.writeFileSync(files.codexConfig, original.codexConfig);
+  fs.writeFileSync(files.modelsCache, original.modelsCache);
+  fs.writeFileSync(files.journal, original.journal);
+  const bridgeBefore = fs.readFileSync(fixture.configPath, "utf8");
+  const pre = fixture.host.validateSetupOwnership(undefined, undefined, "setup-core");
+  let scope;
+  const origCapture = fixture.host.captureSetupCheckpoint.bind(fixture.host);
+  fixture.host.captureSetupCheckpoint = (s, sc) => { scope = sc; return origCapture(s, sc); };
+  let routes = 0;
+  fixture.host.connectBridgeRoute = async () => { routes += 1; return {}; };
+  fixture.host.restoreBridgeRoute = async () => { routes += 1; return {}; };
+  fixture.host.restoreBridgeRouteWithinOperation = async () => { routes += 1; return {}; };
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(files.codexConfig, "MUTATED-direct-route\n");
+    fs.writeFileSync(files.modelsCache, "MUTATED-cache\n");
+    fs.writeFileSync(files.journal, "MUTATED-journal\n");
+    fs.writeFileSync(fixture.configPath, JSON.stringify({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }));
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const hook = async () => { fixture.host.assertOwnershipExpectationCurrent(pre.expectation, "setup-core"); };
+  try {
+    await assert.rejects(fixture.host.setupCore({}, undefined, hook), /changed while preparing/i);
+    assert.equal(scope, "direct-integration");
+    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), original.codexConfig);
+    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), original.modelsCache);
+    assert.equal(fs.readFileSync(files.journal, "utf8"), original.journal);
+    assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
+    assert.equal(routes, 0);
+  } finally { fixture.cleanup(); }
+});
+
+test("G4.BLOCKER External hook failure stays bridge-only", async () => {
+  const initial = { mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" };
+  const fixture = realHost(initial);
+  const files = directRouteFiles(fixture);
+  const tunnelKey = path.join(fixture.coreHome, "secrets", "tunnel-runtime-automatic.key");
+  fs.writeFileSync(files.codexConfig, "router-owned route\n");
+  fs.writeFileSync(files.modelsCache, "router cache\n");
+  fs.writeFileSync(files.journal, "router journal\n");
+  fs.writeFileSync(tunnelKey, "bridge-key-before\n");
+  const bridgeBefore = fs.readFileSync(fixture.configPath, "utf8");
+  let scope;
+  const origCapture = fixture.host.captureSetupCheckpoint.bind(fixture.host);
+  fixture.host.captureSetupCheckpoint = (s, sc) => { scope = sc; return origCapture(s, sc); };
+  let routes = 0;
+  fixture.host.connectBridgeRoute = async () => { routes += 1; return {}; };
+  fixture.host.restoreBridgeRoute = async () => { routes += 1; return {}; };
+  fixture.host.restoreBridgeRouteWithinOperation = async () => { routes += 1; return {}; };
+  fixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(tunnelKey, "mutated-bridge-key\n");
+    fs.writeFileSync(files.codexConfig, "concurrent router change\n");
+    fs.writeFileSync(files.modelsCache, "concurrent router cache\n");
+    fs.writeFileSync(files.journal, "concurrent router journal\n");
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const hook = async () => { throw new Error("Bridge ownership mismatch: synthetic External validation failure"); };
+  try {
+    await assert.rejects(fixture.host.setupCore({ integrationMode: "external-provider" }, undefined, hook), /synthetic External validation failure/);
+    assert.equal(scope, "bridge-only");
+    assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
+    assert.equal(fs.readFileSync(tunnelKey, "utf8"), "bridge-key-before\n");
+    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), "concurrent router change\n");
+    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), "concurrent router cache\n");
+    assert.equal(fs.readFileSync(files.journal, "utf8"), "concurrent router journal\n");
+    assert.equal(routes, 0);
+  } finally { fixture.cleanup(); }
+});
+
+test("G4.BLOCKER transaction commit point: success keeps mutation, hook failure rolls back", async () => {
+  const initial = { mode: "browser-only", browserHost: "launcher", integrationMode: "direct" };
+  const successFixture = realHost(initial);
+  const successFiles = directRouteFiles(successFixture);
+  fs.writeFileSync(successFiles.codexConfig, "ORIGINAL\n");
+  fs.writeFileSync(successFiles.journal, "ORIGINAL-journal\n");
+  successFixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(successFiles.codexConfig, "COMMITTED\n");
+    fs.writeFileSync(successFiles.journal, "COMMITTED-journal\n");
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  try {
+    await successFixture.host.setupCore({}, undefined, async () => {});
+    assert.equal(fs.readFileSync(successFiles.codexConfig, "utf8"), "COMMITTED\n");
+    assert.equal(fs.readFileSync(successFiles.journal, "utf8"), "COMMITTED-journal\n");
+  } finally { successFixture.cleanup(); }
+  const failFixture = realHost(initial);
+  const failFiles = directRouteFiles(failFixture);
+  fs.writeFileSync(failFiles.codexConfig, "ORIGINAL\n");
+  fs.writeFileSync(failFiles.journal, "ORIGINAL-journal\n");
+  failFixture.host.run = async (name, args) => {
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(failFiles.codexConfig, "MUTATED\n");
+    fs.writeFileSync(failFiles.journal, "MUTATED-journal\n");
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  try {
+    await assert.rejects(failFixture.host.setupCore({}, undefined, async () => { throw new Error("synthetic hook failure"); }), /synthetic hook failure/);
+    assert.equal(fs.readFileSync(failFiles.codexConfig, "utf8"), "ORIGINAL\n");
+    assert.equal(fs.readFileSync(failFiles.journal, "utf8"), "ORIGINAL-journal\n");
+  } finally { failFixture.cleanup(); }
+});
+
+function composeHelper() {
+  const sliceStart = electronMain.indexOf("function composeAfterRuntimeReady(");
+  const sliceEnd = electronMain.indexOf("\n}\n", sliceStart) + 3;
+  const source = electronMain.slice(sliceStart, sliceEnd);
+  const context = {};
+  vm.createContext(context);
+  vm.runInContext(source + "\nthis.__compose = { composeAfterRuntimeReady };", context);
+  return context.__compose;
+}
+
+test("G4 hook composition preserves browser behavior exactly once", async () => {
+  const { composeAfterRuntimeReady } = composeHelper();
+  const order = [];
+  const browserHook = async () => { order.push("browser"); };
+  const validator = async () => { order.push("validator"); };
+  assert.equal(typeof composeAfterRuntimeReady(undefined, validator), "function");
+  await composeAfterRuntimeReady(undefined, validator)();
+  assert.deepEqual(order, ["validator"]);
+  order.length = 0;
+  const composed = composeAfterRuntimeReady(browserHook, validator);
+  await composed();
+  assert.deepEqual(order, ["browser", "validator"]);
+  await assert.rejects(composed(), /more than once/);
+  assert.equal(composeAfterRuntimeReady(browserHook, undefined), browserHook);
+});
+
+test("G4 setupCore receives the transactional validator hook", async () => {
+  const fixture = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "direct" });
+  await fixture.host.setupCore({}, undefined, async () => {});
+  assert.equal(typeof fixture.invocation().policy, "object");
+  const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: directHealth() });
+  assert.equal(out.error, undefined);
+  assert.equal(out.calls.hookWired, true);
 });
 

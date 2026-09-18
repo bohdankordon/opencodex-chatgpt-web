@@ -284,6 +284,37 @@ async function validateRepairBridgeHealth(ownership, action) {
   });
 }
 
+// Repair transaction validator (G4 blocker fix). Runs INSIDE RuntimeHost
+// runSetup via afterRuntimeReady, while the G2 checkpoint is still live:
+// capture checkpoint -> preflight -> setup subprocess (may mutate Direct
+// route) -> runtime start -> continuity + health -> commit/return. A hook
+// failure enters the existing runSetup catch/rollback, so Direct route
+// artifacts are restored and External stays bridge-only. Successful return
+// from runSetup is the commit point; main must not add a second mandatory
+// post-return check that could invalidate the repair without compensation.
+function createRepairRuntimeValidation(ownership, action) {
+  return async () => {
+    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, action);
+    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, action);
+  };
+}
+
+// Compose an existing runtime-ready callback (e.g. the browser interaction
+// commit passed through withInteractionModeChange) with the repair
+// validator. Existing browser behavior runs first, then repair validation,
+// both inside the same runSetup transaction. Each runs at most once.
+function composeAfterRuntimeReady(existing, validator) {
+  if (!existing) return validator;
+  if (!validator) return existing;
+  let called = false;
+  return async () => {
+    if (called) throw new Error("Runtime ready callback was executed more than once");
+    called = true;
+    await existing();
+    await validator();
+  };
+}
+
 // Ownership-aware bridge startup reconciliation (G3). Takes an already
 // established trusted startup ownership context plus explicit collaborators,
 // so the sequence is unit-testable without Electron. Direct startups keep
@@ -949,16 +980,13 @@ function registerIpc({ logger, stateStore }) {
       );
     }
     // G1 carries resolved ownership into the runtime call; CLI semantics unchanged (G2).
+    // G4 transaction: continuity + health run INSIDE runSetup via
+    // afterRuntimeReady, before the commit point, so a Direct route mutation
+    // is rolled back on validation failure. No post-return mandatory check.
+    const repairValidation = createRepairRuntimeValidation(ownership, "setup-core");
     const result = IS_DEV_PROFILE
       ? await runtimeHost.setupDevCore(input, ownership.expectation)
-      : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode }, ownership.expectation);
-    // G4 repair continuity + health: the setup subprocess may have rewritten
-    // config, so revalidate the SAME trusted expectation before marking
-    // repair complete. Drift (mode flip, missing, damaged) fails closed with
-    // zero route mutation and truthful failure state. Health proves the live
-    // bridge reports the repaired ownership; wrong-owner bridges fail here.
-    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-core");
-    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "setup-core");
+      : await runtimeHost.setupCore({ integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
     stateStore.update(repairCompletionPatch(ownership, {
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
@@ -998,13 +1026,17 @@ function registerIpc({ logger, stateStore }) {
     const setup = IS_DEV_PROFILE
       ? runtimeHost.setupDevMcp.bind(runtimeHost)
       : runtimeHost.setupMcp.bind(runtimeHost);
+    // G4 transaction: repair validator composes with the browser commit hook
+    // inside runSetup, before the commit point. Existing browser behavior
+    // runs first, then continuity + health; any failure rolls back.
+    const repairValidation = IS_DEV_PROFILE ? undefined : createRepairRuntimeValidation(ownership, "setup-mcp");
     const runSetup = afterRuntimeReady => setup({
       tunnelId: typeof input?.tunnelId === "string" ? input.tunnelId.trim() : "",
       runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
       replace: input?.replace === true,
       interactionMode,
       integrationMode: ownership.integrationMode,
-    }, afterRuntimeReady, ownership.expectation);
+    }, composeAfterRuntimeReady(afterRuntimeReady, repairValidation), ownership.expectation);
     // withInteractionModeChange writes override/descriptor state before the
     // runtime action runs, and reveal() shows browser UI: revalidate trusted
     // provenance BEFORE either browser-visible mutation.
@@ -1018,11 +1050,6 @@ function registerIpc({ logger, stateStore }) {
     const result = interactionModeChange
       ? await browserHost.withInteractionModeChange(interactionMode, runSetup)
       : await runSetup();
-    // G4 repair continuity + health: revalidate SAME expectation after the
-    // setup subprocess rewrote config; drift fails closed with zero route
-    // mutation. Health proves the repaired bridge reports repaired ownership.
-    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "setup-mcp");
-    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "setup-mcp");
     const state = stateStore.update(repairCompletionPatch(ownership, {
       browserInteractionMode: interactionMode,
       ...(interactionMode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
@@ -1055,12 +1082,9 @@ function registerIpc({ logger, stateStore }) {
   });
   handle("launcher:bigger-context", async (_event, enabled, options) => {
     const ownership = resolveSetupOwnership(extractRequestedIntegrationMode(options), "bigger-context");
-    const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
-    // G4 repair continuity + health: revalidate SAME expectation after setup
-    // mutation; drift fails closed. Health proves the live bridge still
-    // reports the trusted ownership.
-    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "bigger-context");
-    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "bigger-context");
+    // G4 transaction: validator runs inside runSetup before commit.
+    const repairValidation = createRepairRuntimeValidation(ownership, "bigger-context");
+    const result = await runtimeHost.setBiggerContext(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
     const state = stateStore.update(repairCompletionPatch(ownership, {
       experimentalBiggerContext: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE ? true : false,
@@ -1075,12 +1099,10 @@ function registerIpc({ logger, stateStore }) {
     if (browserHost.activeTraceId || browserHost.currentOperation()) {
       throw new Error("Finish or cancel active ChatGPT turns before changing Skills as files");
     }
-    const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
-    // G4 repair continuity + health: revalidate SAME expectation after setup
-    // mutation; drift fails closed. Skill state itself is bridge-owned and
-    // already truthful, so no restart/catalog patch to strip.
-    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "skill-attachments");
-    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "skill-attachments");
+    // G4 transaction: validator runs inside runSetup before commit. Skill
+    // state itself is bridge-owned and already truthful.
+    const repairValidation = createRepairRuntimeValidation(ownership, "skill-attachments");
+    const result = await runtimeHost.setSkillAttachments(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
     const state = stateStore.update({ experimentalSkillAttachments: result.enabled });
     send("launcher:state-changed", state);
     return state;
@@ -1095,11 +1117,10 @@ function registerIpc({ logger, stateStore }) {
           : `Finish ${browserOperation} before changing Zero Risk model profiles`,
       );
     }
-    const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation);
-    // G4 repair continuity + health: revalidate SAME expectation after setup
-    // mutation; drift fails closed. External preserves restart/catalog flags.
-    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "zero-risk-pro");
-    if (!IS_DEV_PROFILE) await validateRepairBridgeHealth(ownership, "zero-risk-pro");
+    // G4 transaction: validator runs inside runSetup before commit. External
+    // preserves restart/catalog flags via repairCompletionPatch below.
+    const repairValidation = createRepairRuntimeValidation(ownership, "zero-risk-pro");
+    const result = await runtimeHost.setZeroRiskPro(enabled === true, { integrationMode: ownership.integrationMode }, ownership.expectation, repairValidation);
     const state = stateStore.update(repairCompletionPatch(ownership, {
       zeroRiskProEnabled: result.enabled,
       codexCatalogVerified: IS_DEV_PROFILE,
@@ -1130,15 +1151,14 @@ function registerIpc({ logger, stateStore }) {
     // withInteractionModeChange mutates override/descriptor state before the
     // runtime action runs: revalidate trusted provenance first.
     runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "browser-interaction-mode");
+    // G4 transaction: repair validator composes with the browser commit hook
+    // inside runSetup, before the commit point. No post-return mandatory
+    // check; success return means continuity + health already passed.
+    const repairValidation = IS_DEV_PROFILE ? undefined : createRepairRuntimeValidation(ownership, "browser-interaction-mode");
     const result = await browserHost.withInteractionModeChange(
       mode,
-      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady, { integrationMode: ownership.integrationMode }, ownership.expectation),
+      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, composeAfterRuntimeReady(afterRuntimeReady, repairValidation), { integrationMode: ownership.integrationMode }, ownership.expectation),
     );
-    // G4 repair continuity + health: revalidate SAME expectation after the
-    // interaction-mode transaction rewrote config; drift fails closed.
-    // External preserves restart/catalog flags (bridge-only change).
-    runtimeHost.assertOwnershipExpectationCurrent(ownership.expectation, "browser-interaction-mode");
-    if (!IS_DEV_PROFILE && result.configured) await validateRepairBridgeHealth(ownership, "browser-interaction-mode");
     const directPatch = {
       browserInteractionMode: mode,
       ...(mode === "manual" ? { experimentalBiggerContext: false, experimentalSkillAttachments: false } : {}),
