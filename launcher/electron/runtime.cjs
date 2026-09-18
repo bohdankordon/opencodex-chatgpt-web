@@ -16,6 +16,7 @@ const {
 const { embeddedRuntimeInvocation, runtimeInvocation } = require("./runtime-command.cjs");
 const {
   DIRECT,
+  EXTERNAL_PROVIDER,
   assertOwnershipExpectationCurrent,
   extractRequestedIntegrationMode,
   normalizeRequestedIntegrationMode,
@@ -1014,29 +1015,98 @@ class RuntimeHost {
     });
   }
 
-  async uninstallIntegration() {
+  // Read-only stale-route guard for External removal (G5 §30). Canonical
+  // External installs never own Codex routing: setup skips Codex integration
+  // and the ownership handoff retires obsolete Direct journals. Any surviving
+  // journal is stale evidence of an unfinished migration, and core uninstall
+  // would restore that stale Direct route before deleting the config dir.
+  // Existence alone fails closed here (CLI-only recovery); content is never
+  // parsed for authority and nothing is mutated by this check.
+  assertNoStaleDirectJournal(action) {
+    const coreHome = this.supervisor?.coreHome
+      || (typeof this.supervisor?.configPath === "string" ? path.dirname(this.supervisor.configPath) : null);
+    if (!coreHome || !path.isAbsolute(coreHome)) {
+      throw new Error("Launcher runtime supervisor has no configuration home for ownership-safe removal");
+    }
+    for (const name of ["integration-journal.json", "integration-journal.recovery.json"]) {
+      const journalPath = path.join(coreHome, "codex", name);
+      let stat = null;
+      try {
+        stat = fs.statSync(journalPath);
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        throw error;
+      }
+      if (stat && stat.isFile()) {
+        throw new Error(
+          `Refusing External removal while a Direct integration journal exists (${name}); ownership migration is CLI-only`,
+        );
+      }
+    }
+  }
+
+  async uninstallIntegration(input, expectation) {
     this.assertProductionProfile("Codex integration removal");
     const name = "uninstall-integration";
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    // G5: canonical routing ownership BEFORE any destructive mutation.
+    // Renderer input can never select or migrate ownership (preload sends no
+    // mode; any requested mode that mismatches canonical rejects here), and
+    // a damaged config fails closed before supervisor stop or CLI spawn.
+    // Missing config resolves through the idempotent path below, never as a
+    // default-Direct destructive policy.
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(input), expectation, name);
+    const isExternalRemove = ownership.integrationMode === EXTERNAL_PROVIDER;
+    const wasConfigured = ownership.canonical.kind === "configured";
     const previousRuntime = this.runtimeConfigSnapshot();
     this.lifecycleOperation = name;
+    // Direct-only route compensation, revalidated: only a proven-current
+    // Direct installation may touch route lifecycle commands. External,
+    // missing or drifted ownership rethrows the original error untouched,
+    // preserving existing Direct messages verbatim for Direct installs.
+    const restoreDirectRouteCompensation = async (error, stopPhase) => {
+      const message = error instanceof Error ? error.message : String(error);
+      let current = null;
+      try {
+        current = this.assertOwnershipExpectationCurrent(ownership.expectation, name);
+      } catch {
+        current = null;
+      }
+      if (!current || current.kind !== "configured" || current.integrationMode !== DIRECT) {
+        throw error;
+      }
+      try {
+        await this.restoreBridgeRouteWithinOperation(name);
+      } catch (routeError) {
+        throw new Error(
+          `${message}; restoring the previous Codex route also failed:`
+          + ` ${routeError instanceof Error ? routeError.message : String(routeError)}`,
+        );
+      }
+      if (stopPhase) {
+        throw new Error(
+          `${message}; the previous Codex route was restored,`
+          + " but launcher runtime cleanup did not complete",
+        );
+      }
+      throw error;
+    };
     try {
       try {
         if (previousRuntime.owner === "external") this.supervisor.prepareExternalMigration();
         else await this.supervisor.stopForSetup();
       } catch (error) {
-        try {
-          await this.restoreBridgeRouteWithinOperation(name);
-        } catch (routeError) {
-          throw new Error(
-            `${error instanceof Error ? error.message : String(error)}; restoring the previous Codex route also failed:`
-            + ` ${routeError instanceof Error ? routeError.message : String(routeError)}`,
-          );
-        }
-        throw new Error(
-          `${error instanceof Error ? error.message : String(error)}; the previous Codex route was restored,`
-          + " but launcher runtime cleanup did not complete",
-        );
+        await restoreDirectRouteCompensation(error, true);
+      }
+      // Revalidate BEFORE route-sensitive core uninstall: drift aborts here,
+      // before any routing mutation, with no compensation owed (nothing
+      // routed has been touched yet in this operation).
+      this.assertOwnershipExpectationCurrent(ownership.expectation, name);
+      if (isExternalRemove) {
+        // Stale Direct evidence under canonical External must not grant
+        // Direct cleanup permission: core uninstall would restore the stale
+        // route before deleting the config dir. Fail closed (CLI-only).
+        this.assertNoStaleDirectJournal(name);
       }
       try {
         const result = await this.run(name, ["uninstall", "--yes", "--launcher-control"], {
@@ -1046,21 +1116,32 @@ class RuntimeHost {
           successMessage: "Codex Web GPT integration removed",
           timeoutMs: UNINSTALL_TIMEOUT_MS,
         });
-        const verified = await this.bridgeStatus(name);
-        if (verified.installed || verified.active) {
-          throw new Error("Codex integration removal did not persist in the active config");
+        // Revalidate before accepting success: a migration during uninstall
+        // Revalidate before accepting success, deletion-aware: core uninstall
+        // legitimately deletes the bridge config dir, so absence afterwards
+        // is the expected success signature, not drift. A surviving config
+        // that mismatches the original expectation is real drift and fails
+        // closed with no post-hoc route command to repair it.
+        try {
+          this.assertOwnershipExpectationCurrent(ownership.expectation, name);
+        } catch (error) {
+          if (this.runtimeConfigSnapshot().configured) throw error;
+        }
+        if (!isExternalRemove && wasConfigured) {
+          const verified = await this.bridgeStatus(name);
+          if (verified.installed || verified.active) {
+            throw new Error("Codex integration removal did not persist in the active config");
+          }
+        } else {
+          // Zero route commands for External/missing: prove bridge absence
+          // without route status.
+          if (this.runtimeConfigSnapshot().configured) {
+            throw new Error("Codex integration removal did not persist in the active config");
+          }
         }
         return result;
       } catch (error) {
-        try {
-          await this.restoreBridgeRouteWithinOperation(name);
-        } catch (routeError) {
-          throw new Error(
-            `${error instanceof Error ? error.message : String(error)}; restoring the previous Codex route also failed:`
-            + ` ${routeError instanceof Error ? routeError.message : String(routeError)}`,
-          );
-        }
-        throw error;
+        await restoreDirectRouteCompensation(error, false);
       }
     } finally {
       this.lifecycleOperation = null;

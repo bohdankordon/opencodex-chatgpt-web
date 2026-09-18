@@ -932,18 +932,27 @@ function registerIpc({ logger, stateStore }) {
       noLink: true,
     });
     if (confirmation.response !== 1) return { cancelled: true };
+    // G5: canonical routing ownership AFTER the confirmation dialog
+    // (think-time drift) and BEFORE any destructive mutation. Renderer sends
+    // no mode; damaged config fails closed here with zero mutation.
+    const ownership = resolveSetupOwnership(undefined, "uninstall-integration");
     try {
-      await runtimeHost.uninstallIntegration();
+      await runtimeHost.uninstallIntegration(undefined, ownership.expectation);
     } finally {
       browserHost.writeDescriptor();
     }
+    // G5 truthful state: only a proven configured-Direct removal restores
+    // Codex routing and may ask for a Codex restart. External/missing removal
+    // touches no route, so it must not invent Direct restart guidance.
+    // browserInteractionMode reset is Launcher-owned UI state (existing
+    // semantics, no routing effect) and is preserved for all modes.
     const state = stateStore.update({
       coreSetupComplete: false,
       codexCatalogVerified: false,
       mcpSetupComplete: false,
       mcpRuntimeInstalled: false,
       mcpGuideStep: 0,
-      codexRestartRequired: true,
+      codexRestartRequired: ownership.integrationMode === DIRECT_INTEGRATION_MODE && !ownership.newInstallation,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
       experimentalSkillAttachments: false,
