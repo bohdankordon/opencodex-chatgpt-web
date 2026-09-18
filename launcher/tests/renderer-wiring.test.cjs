@@ -493,12 +493,19 @@ test("saved ChatGPT authentication is refreshed before setup is presented", () =
   const productionStartup = electronMain.indexOf("} else void (async () => {");
   const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
   const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
-  const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
-  const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart);
+  const runtimeStart = electronMain.indexOf("startConfiguredBridgeRuntime({", upgrade);
   assert.ok(refreshBarrier > productionStartup, "production startup must wait for saved-session refresh");
   assert.ok(upgrade > refreshBarrier, "runtime upgrade must not inspect the browser before refresh settles");
-  assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
-  assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
+  assert.ok(runtimeStart > upgrade, "configured runtime must reconcile after any upgrade");
+  const reconciler = electronMain.indexOf("async function startConfiguredBridgeRuntime({");
+  const reconcilerStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", reconciler);
+  const reconcilerHealth = electronMain.indexOf("validateRuntimeOwnershipHealth({", reconciler);
+  const reconcilerConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", reconciler);
+  const reconcilerGate = electronMain.indexOf("if (!policy.connectDirectRoute)", reconciler);
+  assert.ok(reconcilerStart > reconciler, "reconciler must start the runtime first");
+  assert.ok(reconcilerHealth > reconcilerStart, "bridge ownership health must validate before any route action");
+  assert.ok(reconcilerGate > reconcilerHealth, "route connect must sit behind the ownership policy gate");
+  assert.ok(reconcilerConnect > reconcilerGate, "Codex route must connect only after ownership validation");
   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);
 });
 

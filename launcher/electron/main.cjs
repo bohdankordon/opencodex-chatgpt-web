@@ -39,9 +39,12 @@ const {
 } = require("./state.cjs");
 const {
   DIRECT: DIRECT_INTEGRATION_MODE,
+  assertOwnershipExpectationCurrent,
   extractRequestedIntegrationMode,
   resolveOwnershipContext,
 } = require("./integration-mode.cjs");
+const { validateRuntimeOwnershipHealth } = require("./runtime-health.cjs");
+const { buildStartupRoutePolicy } = require("./startup-route-policy.cjs");
 const {
   MIN_WINDOW_BOUNDS,
   readWindowState,
@@ -158,6 +161,16 @@ function startCatalogVerificationMonitor({ logger, stateStore }) {
         const reason = typeof result.failure?.code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(result.failure.code)
           ? result.failure.code
           : ["config", "request", "transport", "upstream", "catalog"].includes(result.failure?.stage) ? result.failure.stage : "catalog";
+        // External bridges serve their catalog to the router, not directly to
+        // Codex: a Direct-worded catalog failure must not mark an External
+        // install broken. Keep observing quietly; readiness was proven by
+        // ownership-health validation at startup.
+        if (config.integrationMode === "external-provider") {
+          logger.debug("codex.model_catalog_verification_pending", {
+            status: result.status, reason, request: result.request,
+          });
+          return;
+        }
         const state = stateStore.update({ codexRestartRequired: false });
         send("launcher:state-changed", state);
         logger.warn("codex.model_catalog_failed", { status: result.status, reason, request: result.request });
@@ -210,6 +223,100 @@ async function restoreCodexRouteAfterRuntimeFailure({ logger, stateStore }) {
     logger.error("bridge.route_restore_after_runtime_failure_failed", { message });
     return { restored: false, error: message };
   }
+}
+
+// Ownership-aware bridge startup reconciliation (G3). Takes an already
+// established trusted startup ownership context plus explicit collaborators
+// so the sequence is unit-testable without Electron. Direct startups keep
+// existing semantics (health validation, then route connect); external
+// startups validate the same bridge health contract but never touch route
+// commands, never demand a direct Codex route, and never probe the external
+// router (router health stays unknown by design).
+async function startConfiguredBridgeRuntime({ startupOwnership, runtimeHost, runtimeSupervisor }) {
+  if (!startupOwnership || !startupOwnership.expectation) {
+    throw new Error("Bridge startup requires a trusted ownership context");
+  }
+  const runtime = await runtimeSupervisor.startIfConfigured();
+  if (runtime.status !== "ready") return { runtime, startupOwnership };
+  assertOwnershipExpectationCurrent({
+    supervisor: runtimeSupervisor,
+    expectation: startupOwnership.expectation,
+    action: "runtime-startup-health",
+  });
+  const config = runtimeSupervisor.readConfig();
+  const health = await runtimeSupervisor.proxyHealthPayload(config);
+  validateRuntimeOwnershipHealth({
+    config,
+    integrationMode: startupOwnership.integrationMode,
+    health,
+  });
+  const policy = buildStartupRoutePolicy(startupOwnership.integrationMode);
+  if (!policy.connectDirectRoute) {
+    return { runtime: { ...runtime, bridgeRouteChanged: false }, startupOwnership };
+  }
+  assertOwnershipExpectationCurrent({
+    supervisor: runtimeSupervisor,
+    expectation: startupOwnership.expectation,
+    action: "runtime-startup-connect",
+  });
+  const route = await runtimeHost.connectBridgeRoute();
+  return { runtime: { ...runtime, bridgeRouteChanged: route.changed === true }, startupOwnership };
+}
+
+// Ready-state publishing split for testability (G3). coreSetupComplete marks
+// the Launcher bridge installation ready once its own runtime/health contract
+// is valid; it never claims the external router is configured. For External
+// installs codexCatalogVerified records bridge-side catalog health (which the
+// MCP UI needs) once the monitor observes it, never a claim that Codex
+// fetched the catalog through the router; final copy belongs to a later stage.
+function completeStartupReadyState({ stateStore, send, config, bridgeRouteChanged, integrationMode, startMonitor }) {
+  const current = stateStore.read();
+  const patch = {
+    coreSetupComplete: true,
+    mcpRuntimeInstalled: config.mode === "full",
+    experimentalBiggerContext: config.experimentalBiggerContext === true,
+    experimentalSkillAttachments: config.experimentalSkillAttachments === true,
+    zeroRiskProEnabled: config.zeroRiskProEnabled === true,
+    ...(bridgeRouteChanged ? {
+      codexCatalogVerified: false,
+      codexRestartRequired: true,
+    } : {}),
+    ...(config.mode === "browser-only" ? {
+      mcpSetupComplete: false,
+      mcpGuideStep: 0,
+    } : {}),
+  };
+  if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
+    const state = stateStore.update(patch);
+    send("launcher:state-changed", state);
+  }
+  // External bridges must not be gated by Direct Codex-catalog assumptions;
+  // readiness was already proven by ownership-health validation.
+  if (integrationMode === DIRECT_INTEGRATION_MODE) startMonitor();
+}
+
+// Startup failure route compensation (G3). Decided from the pre-upgrade
+// ownership capture: an External or unknown startup NEVER reaches Direct
+// route restoration, even if config disappeared or changed mid-startup.
+// Proven-Direct startups revalidate provenance before touching the route.
+// Never throws: resolves to the same shape as the restore helper.
+async function recoverStartupRoute({ startupOwnership, logger, stateStore }) {
+  if (!startupOwnership || startupOwnership.integrationMode !== DIRECT_INTEGRATION_MODE) {
+    return { restored: false, skipped: true };
+  }
+  try {
+    assertOwnershipExpectationCurrent({
+      supervisor: runtimeSupervisor,
+      expectation: startupOwnership.expectation,
+      action: "runtime-startup-recovery",
+    });
+  } catch (error) {
+    logger.warn("runtime.startup_recovery_ownership_changed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { restored: false, skipped: true, ownershipChanged: true };
+  }
+  return restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
 }
 
 function trayImage() {
@@ -1218,6 +1325,10 @@ async function start() {
     app.quit();
     return;
   }
+  // Pre-upgrade ownership capture for failure compensation only. A startup
+  // that began as External (or unreadable) must never enter Direct route
+  // restoration even if config disappears mid-startup.
+  let recoveryOwnership = null;
   if (IS_DEV_PROFILE) {
     let config = null;
     try {
@@ -1254,6 +1365,21 @@ async function start() {
       });
     }
   } else void (async () => {
+    // Trusted startup ownership for route compensation, captured before
+    // upgrade/setup work can change or remove the config. A startup that
+    // began as External (or unreadable) must never enter Direct route
+    // restoration, even if an upgrade failure leaves config damaged.
+    try {
+      recoveryOwnership = resolveOwnershipContext({
+        requestedMode: undefined,
+        supervisor: runtimeSupervisor,
+        action: "runtime-startup",
+      });
+    } catch (error) {
+      logger.warn("runtime.startup_ownership_unreadable", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     await startupAuthenticationRefresh;
     const upgrade = await runtimeHost.upgradeManagedRuntime();
     if (upgrade.updated) {
@@ -1295,38 +1421,35 @@ async function start() {
         send("launcher:state-changed", state);
       }
     }
-    const runtime = await runtimeSupervisor.startIfConfigured();
-    if (runtime.status !== "ready") return runtime;
-    const route = await runtimeHost.connectBridgeRoute();
-    return { ...runtime, bridgeRouteChanged: route.changed === true };
-  })().then(async (runtime) => {
+    // Fresh trusted ownership for route/health decisions: the upgrade above
+    // may have rewritten the config, so the pre-upgrade capture is used only
+    // for failure compensation, never for connect/health authority.
+    const startupOwnership = resolveOwnershipContext({
+      requestedMode: undefined,
+      supervisor: runtimeSupervisor,
+      action: "runtime-startup",
+    });
+    const started = await startConfiguredBridgeRuntime({
+      startupOwnership,
+      runtimeHost,
+      runtimeSupervisor,
+    });
+    return { runtime: started.runtime, startupOwnership, recoveryOwnership };
+  })().then(async ({ runtime, startupOwnership, recoveryOwnership }) => {
     if (runtime.status === "ready") {
       const config = runtimeSupervisor.readConfig();
-      const current = stateStore.read();
-      const patch = {
-        coreSetupComplete: true,
-        mcpRuntimeInstalled: config.mode === "full",
-        experimentalBiggerContext: config.experimentalBiggerContext === true,
-        experimentalSkillAttachments: config.experimentalSkillAttachments === true,
-        zeroRiskProEnabled: config.zeroRiskProEnabled === true,
-        ...(runtime.bridgeRouteChanged ? {
-          codexCatalogVerified: false,
-          codexRestartRequired: true,
-        } : {}),
-        ...(config.mode === "browser-only" ? {
-          mcpSetupComplete: false,
-          mcpGuideStep: 0,
-        } : {}),
-      };
-      if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
-        const state = stateStore.update(patch);
-        send("launcher:state-changed", state);
-      }
-      startCatalogVerificationMonitor({ logger, stateStore });
+      completeStartupReadyState({
+        stateStore,
+        send,
+        config,
+        bridgeRouteChanged: runtime.bridgeRouteChanged === true,
+        integrationMode: startupOwnership.integrationMode,
+        startMonitor: () => startCatalogVerificationMonitor({ logger, stateStore }),
+      });
       return;
     }
     if (runtime.status === "not-configured") {
-      const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+      const routeRecovery = await recoverStartupRoute({ startupOwnership: recoveryOwnership, logger, stateStore });
       const current = stateStore.read();
       if (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete) {
         const state = stateStore.update({
@@ -1347,7 +1470,7 @@ async function start() {
       }
       return;
     }
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const routeRecovery = await recoverStartupRoute({ startupOwnership: recoveryOwnership, logger, stateStore });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     if (runtime.status === "external" || runtime.status === "needs-setup") {
@@ -1363,17 +1486,21 @@ async function start() {
           ? `${detail}; restoring the previous Codex route also failed: ${routeRecovery.error}`
           : routeRecovery.restored
             ? `${detail}; the previous Codex route was restored, restart Codex once`
-            : detail,
+            : routeRecovery.ownershipChanged
+              ? `${detail}; installation ownership changed during startup; retry the operation`
+              : detail,
       });
     }
   }).catch(async (error) => {
     const primary = error instanceof Error ? error.message : String(error);
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const routeRecovery = await recoverStartupRoute({ startupOwnership: recoveryOwnership, logger, stateStore });
     const message = routeRecovery.error
       ? `${primary}; restoring the previous Codex route also failed: ${routeRecovery.error}`
       : routeRecovery.restored
         ? `${primary}; the previous Codex route was restored, restart Codex once`
-        : primary;
+        : routeRecovery.ownershipChanged
+          ? `${primary}; installation ownership changed during startup; retry the operation`
+          : primary;
     logger.error("runtime.startup_failed", { message });
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
