@@ -9,7 +9,9 @@ const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.c
 const {
   DIRECT: DIRECT_INTEGRATION_MODE,
   assertOwnershipExpectationCurrent,
+  assertOwnershipContinuity,
   resolveOwnershipContext,
+  EXTERNAL_PROVIDER: EXTERNAL_INTEGRATION_MODE,
 } = require("../electron/integration-mode.cjs");
 const { buildStartupRoutePolicy } = require("../electron/startup-route-policy.cjs");
 const { validateRuntimeOwnershipHealth } = require("../electron/runtime-health.cjs");
@@ -652,4 +654,198 @@ test("startup flow keeps route calls behind ownership gates", () => {
   const captureAt = electronMain.indexOf("action: \"runtime-startup\"", upgradeAt);
   const reconcileAt = electronMain.indexOf("startConfiguredBridgeRuntime({", captureAt);
   assert.ok(upgradeAt > 0 && captureAt > upgradeAt && reconcileAt > captureAt);
+});
+
+// Two-capture startup window regressions (G3 blocker fix). Each test models
+// FIRST CAPTURE, async/upgrade window with config drift, SECOND CAPTURE,
+// then the continuity gate: the gate, not the later reconcile checks, must
+// reject drift before any route behavior.
+
+function loadUpgradePatch() {
+  const start = electronMain.indexOf("function buildUpgradeCompletionPatch({");
+  const end = electronMain.indexOf("async function startConfiguredBridgeRuntime(", start);
+  if (start < 0 || end < 0) throw new Error("upgrade patch builder slice is missing");
+  const context = { EXTERNAL_INTEGRATION_MODE };
+  vm.createContext(context);
+  context.buildUpgradeCompletionPatch = vm.runInContext(
+    electronMain.slice(start, end) + "\nbuildUpgradeCompletionPatch;",
+    context,
+  );
+  return context;
+}
+
+test("G3.1 pre External to post Direct rejects before start or connect", async () => {
+  const bed = startupSupervisor({ setupReads: [EXTERNAL_CONFIG, DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: directHealth() });
+  const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.equal(pre.integrationMode, "external-provider");
+  const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.equal(post.integrationMode, "direct");
+  assert.throws(
+    () => assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+  let connects = 0;
+  const context = runStartBridge({
+    runtimeHost: {
+      connectBridgeRoute: async () => {
+        connects += 1;
+        return { installed: true, active: true, changed: true };
+      },
+    },
+    runtimeSupervisor: bed.supervisor,
+  });
+  const unguarded = await context.startConfiguredBridgeRuntime({
+    startupOwnership: post,
+    runtimeHost: context.runtimeHost,
+    runtimeSupervisor: context.runtimeSupervisor,
+  });
+  assert.equal(unguarded.runtime.status, "ready");
+  assert.equal(connects, 1);
+  const recovery = recoverContext({ supervisor: bed.supervisor, ownership: pre });
+  const recovered = await recovery.recoverStartupRoute({
+    startupOwnership: pre,
+    logger: recovery.logger,
+    stateStore: {},
+  });
+  assert.equal(recovered.skipped, true);
+  assert.equal(recovery.restores, 0);
+});
+
+test("G3.2 pre Direct to post External rejects with zero route calls", async () => {
+  const bed = startupSupervisor({
+    setupReads: [DIRECT_CONFIG, EXTERNAL_CONFIG],
+    configReads: [EXTERNAL_CONFIG],
+    health: externalHealth(),
+  });
+  const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.equal(pre.integrationMode, "direct");
+  const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.equal(post.integrationMode, "external-provider");
+  assert.throws(
+    () => assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+  const recovery = recoverContext({ supervisor: bed.supervisor, ownership: pre });
+  const recovered = await recovery.recoverStartupRoute({
+    startupOwnership: pre,
+    logger: recovery.logger,
+    stateStore: {},
+  });
+  assert.equal(recovered.skipped, true);
+  assert.equal(recovered.ownershipChanged, true);
+  assert.equal(recovery.restores, 0);
+});
+
+test("G3.3 pre configured to post missing rejects", async () => {
+  const bed = startupSupervisor({ setupReads: [DIRECT_CONFIG, null], configReads: [DIRECT_CONFIG], health: directHealth() });
+  const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.equal(post.canonical.kind, "missing");
+  assert.throws(
+    () => assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+  const recovery = recoverContext({ supervisor: bed.supervisor, ownership: pre });
+  const recovered = await recovery.recoverStartupRoute({
+    startupOwnership: pre,
+    logger: recovery.logger,
+    stateStore: {},
+  });
+  assert.equal(recovered.skipped, true);
+  assert.equal(recovery.restores, 0);
+});
+
+test("G3.4 pre configured to post damaged rejects", async () => {
+  const bed = startupSupervisor({
+    setupReads: [DIRECT_CONFIG, new Error("Unexpected token")],
+    configReads: [DIRECT_CONFIG],
+    health: directHealth(),
+  });
+  const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.throws(
+    () => resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" }),
+    /damaged/,
+  );
+  const recovery = recoverContext({ supervisor: bed.supervisor, ownership: pre });
+  const recovered = await recovery.recoverStartupRoute({
+    startupOwnership: pre,
+    logger: recovery.logger,
+    stateStore: {},
+  });
+  assert.equal(recovered.skipped, true);
+  assert.equal(recovery.restores, 0);
+});
+
+test("G3.5-6 unchanged ownership passes continuity across the window", async () => {
+  for (const config of [DIRECT_CONFIG, EXTERNAL_CONFIG]) {
+    const health = config.integrationMode === "direct" ? directHealth() : externalHealth();
+    const bed = startupSupervisor({ setupReads: [config, { ...config }], configReads: [{ ...config }], health });
+    const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+    const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+    const kept = assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" });
+    assert.equal(kept.integrationMode, config.integrationMode);
+    let connects = 0;
+    const context = runStartBridge({
+      runtimeHost: {
+        connectBridgeRoute: async () => {
+          connects += 1;
+          return { installed: true, active: true, changed: false };
+        },
+      },
+      runtimeSupervisor: bed.supervisor,
+    });
+    const started = await context.startConfiguredBridgeRuntime({
+      startupOwnership: post,
+      runtimeHost: context.runtimeHost,
+      runtimeSupervisor: context.runtimeSupervisor,
+    });
+    assert.equal(started.runtime.status, "ready");
+    assert.equal(connects, config.integrationMode === "direct" ? 1 : 0);
+  }
+});
+
+test("G3.10 external upgrade completion sets no restart requirement", () => {
+  const context = loadUpgradePatch();
+  const patch = context.buildUpgradeCompletionPatch({
+    upgrade: { updated: true, mode: "full", integrationMode: "external-provider" },
+    snapshotConfig: { experimentalBiggerContext: false, experimentalSkillAttachments: false, zeroRiskProEnabled: true },
+  });
+  assert.equal(patch.coreSetupComplete, true);
+  assert.equal("codexRestartRequired" in patch, false);
+  assert.equal("codexCatalogVerified" in patch, false);
+  assert.equal(patch.zeroRiskProEnabled, true);
+  assert.equal(patch.mcpRuntimeInstalled, true);
+  assert.equal(patch.mcpSetupComplete, false);
+});
+
+test("G3.11 direct upgrade completion preserves restart behavior", () => {
+  const context = loadUpgradePatch();
+  const full = context.buildUpgradeCompletionPatch({
+    upgrade: { updated: true, mode: "full", integrationMode: "direct" },
+    snapshotConfig: { experimentalBiggerContext: true },
+  });
+  assert.equal(full.codexRestartRequired, true);
+  assert.equal(full.codexCatalogVerified, false);
+  assert.equal(full.experimentalBiggerContext, true);
+  assert.equal(full.mcpRuntimeInstalled, true);
+  const browserOnly = context.buildUpgradeCompletionPatch({
+    upgrade: { updated: true, mode: "browser-only", integrationMode: "direct" },
+    snapshotConfig: {},
+  });
+  assert.equal(browserOnly.codexRestartRequired, true);
+  assert.equal(browserOnly.mcpGuideStep, 0);
+});
+
+test("startup captures continuity across the upgrade window in order", () => {
+  const preCapture = electronMain.indexOf("recoveryOwnership = resolveOwnershipContext({");
+  const upgradeAt = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", preCapture);
+  const postCapture = electronMain.indexOf("const startupOwnership = resolveOwnershipContext({", upgradeAt);
+  const continuityAt = electronMain.indexOf("assertOwnershipContinuity({", postCapture);
+  const reconcileAt = electronMain.indexOf("startConfiguredBridgeRuntime({", continuityAt);
+  for (const entry of [preCapture, upgradeAt, postCapture, continuityAt, reconcileAt]) {
+    assert.ok(entry > 0);
+  }
+  assert.ok(preCapture < upgradeAt && upgradeAt < postCapture && postCapture < continuityAt && continuityAt < reconcileAt);
+  const continuityBlock = electronMain.slice(postCapture, reconcileAt);
+  assert.ok(!continuityBlock.includes("upgrade.updated"));
 });

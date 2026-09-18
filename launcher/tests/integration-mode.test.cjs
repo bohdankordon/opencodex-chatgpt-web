@@ -4,6 +4,7 @@ const {
   DIRECT,
   EXTERNAL_PROVIDER,
   assertOwnershipExpectationCurrent,
+  assertOwnershipContinuity,
   extractRequestedIntegrationMode,
   isLauncherIntegrationMode,
   normalizeRequestedIntegrationMode,
@@ -369,4 +370,96 @@ test("stable expectation revalidates cleanly in both kinds", () => {
   const created = resolveOwnershipContext({ requestedMode: "direct", supervisor: fresh, action: "setup-core" });
   const recheckedFresh = assertOwnershipExpectationCurrent({ supervisor: fresh, expectation: created.expectation, action: "setup-core" });
   assert.equal(recheckedFresh.kind, "missing");
+});
+
+// Startup ownership continuity (G3 fix): same branded expectations as G1,
+// compared across the pre/post upgrade captures. Only kind + mode are
+// compared; releaseVersion/ports/metadata may legitimately change.
+
+function continuityContext(supervisor) {
+  return resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "runtime-startup" });
+}
+
+test("continuity passes for unchanged Direct ownership", () => {
+  const supervisor = { readSetupConfig: () => ({ mode: "browser-only" }) };
+  const before = continuityContext(supervisor);
+  const after = continuityContext(supervisor);
+  const kept = assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "direct");
+});
+
+test("continuity passes for unchanged External ownership", () => {
+  const supervisor = { readSetupConfig: () => ({ mode: "browser-only", integrationMode: "external-provider" }) };
+  const before = continuityContext(supervisor);
+  const after = continuityContext(supervisor);
+  const kept = assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "external-provider");
+});
+
+test("continuity passes when only bridge metadata changes", () => {
+  let config = { mode: "browser-only", integrationMode: "external-provider", releaseVersion: "0.0.1", port: 17841 };
+  const supervisor = { readSetupConfig: () => ({ ...config }) };
+  const before = continuityContext(supervisor);
+  config = { mode: "full", integrationMode: "external-provider", releaseVersion: "0.0.2", port: 19841 };
+  const after = continuityContext(supervisor);
+  const kept = assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "external-provider");
+});
+
+test("continuity rejects Direct to External drift", () => {
+  let config = { mode: "browser-only" };
+  const supervisor = { readSetupConfig: () => ({ ...config }) };
+  const before = continuityContext(supervisor);
+  config = { mode: "browser-only", integrationMode: "external-provider" };
+  const after = continuityContext(supervisor);
+  assert.throws(
+    () => assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+});
+
+test("continuity rejects External to Direct drift", () => {
+  let config = { mode: "browser-only", integrationMode: "external-provider" };
+  const supervisor = { readSetupConfig: () => ({ ...config }) };
+  const before = continuityContext(supervisor);
+  config = { mode: "browser-only" };
+  const after = continuityContext(supervisor);
+  assert.throws(
+    () => assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+});
+
+test("continuity rejects missing and configured transitions", () => {
+  const present = { readSetupConfig: () => ({ mode: "browser-only" }) };
+  const absent = { readSetupConfig: () => null };
+  const before = continuityContext(present);
+  const afterMissing = continuityContext(absent);
+  assert.throws(
+    () => assertOwnershipContinuity({ before: before.expectation, after: afterMissing.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+  const beforeMissing = continuityContext(absent);
+  const afterPresent = continuityContext(present);
+  assert.throws(
+    () => assertOwnershipContinuity({ before: beforeMissing.expectation, after: afterPresent.expectation, action: "runtime-startup" }),
+    /changed while preparing runtime-startup/,
+  );
+});
+
+test("continuity rejects forged expectations", () => {
+  const supervisor = { readSetupConfig: () => ({ mode: "browser-only" }) };
+  const trusted = continuityContext(supervisor);
+  assert.throws(
+    () => assertOwnershipContinuity({
+      before: { expectedKind: "configured", integrationMode: "direct" },
+      after: trusted.expectation,
+      action: "runtime-startup",
+    }),
+    /expectation is invalid/,
+  );
+  assert.throws(
+    () => assertOwnershipContinuity({ before: trusted.expectation, after: undefined, action: "runtime-startup" }),
+    /expectation is invalid/,
+  );
 });

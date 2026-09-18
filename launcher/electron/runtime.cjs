@@ -1349,6 +1349,10 @@ class RuntimeHost {
       toVersion: currentVersion,
       connectorMigrated: connectorMigrationRequired,
       stdout: result.stdout,
+      // Trusted canonical routing mode that governed this upgrade. Core
+      // computes codexRestartRequired from the same mode; startup state
+      // follows it instead of assuming Direct.
+      integrationMode: ownership.integrationMode,
     };
   }
 

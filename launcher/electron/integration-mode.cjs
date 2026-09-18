@@ -178,6 +178,25 @@ function installationChangedError(action) {
   );
 }
 
+// Startup ownership continuity (G3 fix). Compares two trusted branded
+// expectations, typically the pre-upgrade capture and the post-upgrade
+// capture, and requires the same installation ownership identity: same
+// canonical kind and same integration mode. Full config is deliberately NOT
+// compared: managed setup may legitimately rewrite releaseVersion, ports,
+// bundle references and other bridge-owned metadata. Any ownership drift
+// (including configured-to-missing and missing-to-configured) fails closed
+// with the established state-drift error; drift is never migration.
+function assertOwnershipContinuity(options) {
+  const settings = options || {};
+  const action = settings.action || "operation";
+  const before = assertTrustedExpectation(settings.before);
+  const after = assertTrustedExpectation(settings.after);
+  if (before.expectedKind !== after.expectedKind || before.integrationMode !== after.integrationMode) {
+    throw installationChangedError(action);
+  }
+  return after;
+}
+
 // Revalidate a trusted expectation against a fresh canonical read. Configured
 // expects configured with the same mode; missing expects missing. Every other
 // transition, including configured-to-missing, missing-to-configured, mode
@@ -216,6 +235,7 @@ module.exports = {
   DIRECT: DIRECT,
   EXTERNAL_PROVIDER: EXTERNAL_PROVIDER,
   assertOwnershipExpectationCurrent: assertOwnershipExpectationCurrent,
+  assertOwnershipContinuity: assertOwnershipContinuity,
   damagedConfigError: damagedConfigError,
   extractRequestedIntegrationMode: extractRequestedIntegrationMode,
   isLauncherIntegrationMode: isLauncherIntegrationMode,

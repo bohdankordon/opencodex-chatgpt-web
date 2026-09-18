@@ -40,6 +40,8 @@ const {
 const {
   DIRECT: DIRECT_INTEGRATION_MODE,
   assertOwnershipExpectationCurrent,
+  assertOwnershipContinuity,
+  EXTERNAL_PROVIDER: EXTERNAL_INTEGRATION_MODE,
   extractRequestedIntegrationMode,
   resolveOwnershipContext,
 } = require("./integration-mode.cjs");
@@ -225,8 +227,34 @@ async function restoreCodexRouteAfterRuntimeFailure({ logger, stateStore }) {
   }
 }
 
+// Upgrade completion state (G3 fix). Restart/catalog reset follows the
+// trusted upgrade ownership instead of assuming Direct: core computes
+// codexRestartRequired from integration mode, and an External upgrade
+// touches no Codex route. Pre-existing flags are preserved, never invented,
+// for External; later lifecycle stages own their cleanup.
+function buildUpgradeCompletionPatch({ upgrade, snapshotConfig }) {
+  return {
+    coreSetupComplete: true,
+    ...(upgrade.integrationMode === EXTERNAL_INTEGRATION_MODE
+      ? {}
+      : { codexCatalogVerified: false, codexRestartRequired: true }),
+    experimentalBiggerContext: snapshotConfig?.experimentalBiggerContext === true,
+    experimentalSkillAttachments: snapshotConfig?.experimentalSkillAttachments === true,
+    zeroRiskProEnabled: snapshotConfig?.zeroRiskProEnabled === true,
+    ...(upgrade.mode === "full" ? {
+      mcpRuntimeInstalled: true,
+      mcpSetupComplete: false,
+      mcpGuideStep: 2,
+    } : {
+      mcpRuntimeInstalled: false,
+      mcpSetupComplete: false,
+      mcpGuideStep: 0,
+    }),
+  };
+}
+
 // Ownership-aware bridge startup reconciliation (G3). Takes an already
-// established trusted startup ownership context plus explicit collaborators
+// established trusted startup ownership context plus explicit collaborators,
 // so the sequence is unit-testable without Electron. Direct startups keep
 // existing semantics (health validation, then route connect); external
 // startups validate the same bridge health contract but never touch route
@@ -1383,23 +1411,10 @@ async function start() {
     await startupAuthenticationRefresh;
     const upgrade = await runtimeHost.upgradeManagedRuntime();
     if (upgrade.updated) {
-      const state = stateStore.update({
-        coreSetupComplete: true,
-        codexCatalogVerified: false,
-        codexRestartRequired: true,
-        experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
-        experimentalSkillAttachments: runtimeHost.runtimeConfigSnapshot().config?.experimentalSkillAttachments === true,
-        zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
-        ...(upgrade.mode === "full" ? {
-          mcpRuntimeInstalled: true,
-          mcpSetupComplete: false,
-          mcpGuideStep: 2,
-        } : {
-          mcpRuntimeInstalled: false,
-          mcpSetupComplete: false,
-          mcpGuideStep: 0,
-        }),
-      });
+      const state = stateStore.update(buildUpgradeCompletionPatch({
+        upgrade,
+        snapshotConfig: runtimeHost.runtimeConfigSnapshot().config,
+      }));
       send("launcher:state-changed", state);
       logger.info("runtime.release_upgraded", {
         fromVersion: upgrade.fromVersion,
@@ -1429,6 +1444,17 @@ async function start() {
       supervisor: runtimeSupervisor,
       action: "runtime-startup",
     });
+    // Ownership continuity across the async upgrade window: a managed upgrade
+    // must preserve routing ownership, so any drift between the pre-upgrade
+    // capture and this fresh capture fails closed here, before runtime start
+    // or route decisions. Drift is never an implicit migration (CLI-only).
+    if (recoveryOwnership) {
+      assertOwnershipContinuity({
+        before: recoveryOwnership.expectation,
+        after: startupOwnership.expectation,
+        action: "runtime-startup",
+      });
+    }
     const started = await startConfiguredBridgeRuntime({
       startupOwnership,
       runtimeHost,

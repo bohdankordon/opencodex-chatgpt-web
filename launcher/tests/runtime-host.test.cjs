@@ -411,6 +411,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     toVersion: "1.1.3",
     connectorMigrated: false,
     stdout: "",
+    integrationMode: "direct",
   });
 });
 
@@ -1521,6 +1522,28 @@ test("G2.14 runtime-upgrade External emits explicit mode without replace-route",
   assert.equal(result.updated, true);
   assert.deepEqual(ownershipArgPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
   assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("upgrade result propagates the trusted integration mode", async () => {
+  const direct = hostFor({
+    mode: "full",
+    browserHost: "launcher",
+    appName: "Codex Native2",
+    releaseVersion: "1.1.1",
+    solAvailable: true,
+    extraHighAvailable: false,
+    proAvailable: false,
+  });
+  assert.equal((await direct.host.upgradeManagedRuntime()).integrationMode, "direct");
+  const external = externalHostFor({
+    mode: "full",
+    appName: "Codex Native2",
+    releaseVersion: "1.1.1",
+    solAvailable: true,
+    extraHighAvailable: false,
+    proAvailable: false,
+  });
+  assert.equal((await external.host.upgradeManagedRuntime()).integrationMode, "external-provider");
 });
 
 test("G2 runSetup requires a trusted ownership policy before mutation", async () => {
