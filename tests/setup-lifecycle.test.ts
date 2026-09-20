@@ -118,7 +118,11 @@ test.skipIf(process.platform !== "darwin")("external service setup retains valid
     acknowledgedUnofficialAt: new Date().toISOString(),
   };
   const proxy = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json({
-    service: "codex-chatgpt-web", status: "ok", mode: "full", version: existing.releaseVersion, accepting_turns: true,
+    service: "codex-chatgpt-web", status: "ok", mode: "full", version: existing.releaseVersion,
+    // Production /healthz reports the canonical integration mode (see server.ts); the
+    // fixture must too, or setupProxyIsReady() never accepts it and waitForProxy()
+    // outlives Bun default test timeout.
+    integration_mode: existing.integrationMode, accepting_turns: true,
   }) });
   existing.port = proxy.port!;
   const calls: string[] = [];
