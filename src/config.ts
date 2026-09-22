@@ -7,6 +7,7 @@ import {
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
 } from "./chatgpt-web-models";
+import { validateExternalClients, type ExternalClientRecord } from "./external-client";
 import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
 
@@ -97,6 +98,11 @@ export interface AppConfig {
   autoApproveToolCalls: boolean;
   controlToken: string;
   runtimeCommand: string[];
+  /**
+   * Credentials admitted through the authenticated-external boundary. Stored configuration may
+   * omit the field entirely; the in-memory shape is always the validated list.
+   */
+  externalClients: ExternalClientRecord[];
   acknowledgedUnofficialAt?: string;
   tunnel?: TunnelConfig;
   automaticTunnel?: TunnelConfig;
@@ -225,6 +231,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
+    externalClients: [],
   };
 }
 
@@ -558,6 +565,16 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (proAvailable && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Pro requires Sol`);
   }
+  // externalClients is additive: configuration written before it existed has no such field and
+  // stays valid, meaning "no external clients". Validation is pure — loading never rewrites the
+  // file, so no migration write happens here or anywhere else during config load.
+  let externalClients: ExternalClientRecord[];
+  try {
+    externalClients = validateExternalClients((value as Record<string, unknown>).externalClients);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${detail} in ${path}`);
+  }
   const normalized = { ...parsed } as Record<string, unknown>;
   // Do not perpetuate the compatibility alias once the config has been parsed. The canonical
   // field is integrationMode; accepting the alias is only a migration aid for old launcher state.
@@ -575,6 +592,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     experimentalSkillAttachments,
     zeroRiskProEnabled,
     integrationMode: resolvedIntegrationMode,
+    externalClients,
   } as AppConfig;
 }
 

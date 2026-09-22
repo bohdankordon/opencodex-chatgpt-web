@@ -311,3 +311,46 @@ export interface CodexProviderConfig {
     experimentalSkillAttachments?: boolean;
   };
 }
+
+/**
+ * PR #4 request authority.
+ *
+ * Admission class and native authority are orthogonal: a legacy request may or may not carry
+ * native Codex turn metadata, while an authenticated external client never carries any. The
+ * union keeps that separation structural instead of optional, so reaching a native turn handle
+ * from an external request needs an explicit, visible cast rather than a plain field read.
+ */
+export type AdmissionClass =
+  | "legacy"
+  | "authenticated-external";
+
+/** Native Codex turn authority, validated from the native turn-metadata envelope. */
+export interface NativeCodexAuthority {
+  readonly kind: "native-codex";
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly parentThreadId?: string;
+  readonly agentName?: string;
+  readonly subagentKind?: string;
+  readonly promptCacheKey?: string;
+}
+
+/** Identity of a caller that authenticated through an external client credential. */
+export interface AuthenticatedExternalClientIdentity {
+  readonly kind: "external-client";
+  readonly clientId: string;
+}
+
+/**
+ * The authority a request is admitted under. The external variant intentionally has no native
+ * turn handles: authenticated-external admission can never carry native Codex authority.
+ */
+export type RequestAuthority =
+  | {
+      readonly admissionClass: "legacy";
+      readonly native?: NativeCodexAuthority;
+    }
+  | {
+      readonly admissionClass: "authenticated-external";
+      readonly client: AuthenticatedExternalClientIdentity;
+    };
