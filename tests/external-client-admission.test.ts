@@ -453,15 +453,23 @@ test("an external credential grants no native endpoint authority", async () => {
   const token = generateExternalClientToken();
   const config = withExternalClient(externalProviderConfig(), token);
   await withServer(config, async ({ port, upstream, adapterStarts }) => {
-    // Compaction keeps its native-metadata contract: the external credential does not replace it.
+    // Compaction is unsupported for an authenticated external client: one deterministic answer,
+    // whatever the request contains. This supersedes the Phase D expectation that compact kept
+    // its native-metadata contract for external traffic, which leaked a pre-auth oracle.
     const compact = await post(
       port,
       "/v1/responses/compact",
       { model: "chatgpt-web/light", input: USER_INPUT },
       clientHeaders(token),
     );
-    expect([compact.status, JSON.parse(await compact.text()).error.message])
-      .toEqual([400, METADATA_ERROR_MESSAGE]);
+    expect([compact.status, JSON.parse(await compact.text()).error]).toEqual([
+      501,
+      {
+        message: "Authenticated external-client compaction is not supported",
+        type: "unsupported_operation",
+        code: "unsupported_operation",
+      },
+    ]);
 
     for (const path of ["/v1/alpha/search", "/v1/images/generations", "/v1/images/edits"]) {
       const response = await post(port, path, { model: "gpt-5.6-sol", prompt: "x" }, clientHeaders(token));

@@ -423,6 +423,11 @@ export async function modelsRequest(
       },
     });
   }
+  // Direct mode has no external-client lifecycle. Any dedicated header fails closed here, before
+  // the native models request, so neither the client id nor an external token can be forwarded
+  // into the native Codex trust domain. No credential is validated and no client id is inspected,
+  // so this cannot become a credential oracle.
+  if (readExternalClientHeader(req.headers).present) return externalClientAuthFailure();
   let upstream: Response;
   let sent = false;
   try {
@@ -540,10 +545,27 @@ function externalProviderTurnMetadataError(
 const EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE = "External client authentication failed";
 /** Temporary Phase D gate message; execution arrives with the external request identity work. */
 const EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE = "Authenticated external-client execution is not enabled yet";
+const EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE = "Authenticated external-client compaction is not supported";
+const EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE = "Authenticated external-client native search is not supported";
+const EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE = "Authenticated external-client native image requests are not supported";
 
 /** The single response construction path shared by every external authentication failure. */
 function externalClientAuthFailure(): Response {
   return formatErrorResponse(401, "authentication_error", EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE);
+}
+
+/**
+ * Deterministic "this build does not support the operation for an authenticated external client"
+ * answer, used by every native-capable endpoint. Built directly rather than through
+ * formatErrorResponse because the shared classifier maps every 5xx onto
+ * server_error/upstream_server_error, which would advertise a failed upstream instead of an
+ * operation this build does not support yet.
+ */
+function externalClientUnsupportedResponse(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: { message, type: "unsupported_operation", code: "unsupported_operation" } }),
+    { status: 501, headers: { "Content-Type": "application/json" } },
+  );
 }
 
 function externalClientRouteRejection(model: string): Response {
@@ -554,31 +576,76 @@ function externalClientRouteRejection(model: string): Response {
   );
 }
 
+/** The authority an authenticated external client request carries; never contains the secret. */
+type AuthenticatedExternalClientAuthority = Extract<
+  RequestAuthority,
+  { admissionClass: "authenticated-external" }
+>;
+
+/**
+ * Result of classifying one request against the dedicated external-client header.
+ *
+ * "absent" means the request is a legacy request and the caller continues its existing path;
+ * "rejected" carries the one shared flat 401 every external authentication failure uses; and
+ * "authenticated" carries external authority for the endpoint to answer with.
+ */
+type ExternalClientAuthentication =
+  | { readonly kind: "absent" }
+  | { readonly kind: "rejected"; readonly response: Response }
+  | { readonly kind: "authenticated"; readonly authority: AuthenticatedExternalClientAuthority };
+
+/**
+ * The single external-client authentication primitive.
+ *
+ * Every endpoint that can reach a native Codex boundary calls this before doing native work, so the
+ * dedicated header can never leak into a native passthrough path. Direct mode fails closed before
+ * any credential work, and every credential shape answers with the same flat 401, so the response
+ * reveals nothing about client existence, token shape, route availability, or integration mode.
+ */
+function authenticateExternalClientRequest(
+  req: Request,
+  config: AppConfig,
+  headerState?: ExternalClientHeaderState,
+): ExternalClientAuthentication {
+  const header = headerState ?? readExternalClientHeader(req.headers);
+  if (!header.present) return { kind: "absent" };
+  if (!isExternalProviderMode(config)) return { kind: "rejected", response: externalClientAuthFailure() };
+  const presented = parseBearerToken(req.headers.get("authorization"));
+  if (!header.valid) {
+    dummyTimingSafeCompare(presented ?? "");
+    return { kind: "rejected", response: externalClientAuthFailure() };
+  }
+  if (presented === undefined) return { kind: "rejected", response: externalClientAuthFailure() };
+  const record = findExternalClient(config.externalClients, header.clientId);
+  if (!record) {
+    dummyTimingSafeCompare(presented);
+    return { kind: "rejected", response: externalClientAuthFailure() };
+  }
+  if (!verifyExternalClientToken(record, presented)) {
+    return { kind: "rejected", response: externalClientAuthFailure() };
+  }
+  return {
+    kind: "authenticated",
+    authority: {
+      admissionClass: "authenticated-external",
+      client: { kind: "external-client", clientId: record.id },
+    },
+  };
+}
+
 /**
  * Temporary Phase D execution gate.
  *
  * Authenticated external admission succeeds here, but execution stays deferred: the ChatGPT Web
  * adapter is still native-identity-based, so an external request must not fabricate thread or turn
- * handles merely to enter it. The response is built directly rather than through
- * formatErrorResponse because the shared classifier maps every 5xx onto
- * server_error/upstream_server_error, which would advertise a failed upstream instead of an
- * operation this build does not support yet. A later stage replaces this gate with the external
- * execution runtime and consumes the authority passed here.
+ * handles merely to enter it. A later stage replaces this gate with the external execution runtime
+ * and consumes the authority passed here.
  */
-function externalClientExecutionGate(authority: RequestAuthority): Response {
+function externalClientExecutionGate(authority: AuthenticatedExternalClientAuthority): Response {
   if (authority.admissionClass !== "authenticated-external") {
     throw new Error("The external execution gate requires authenticated external authority");
   }
-  return new Response(
-    JSON.stringify({
-      error: {
-        message: EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE,
-        type: "unsupported_operation",
-        code: "unsupported_operation",
-      },
-    }),
-    { status: 501, headers: { "Content-Type": "application/json" } },
-  );
+  return externalClientUnsupportedResponse(EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE);
 }
 
 /**
@@ -590,7 +657,7 @@ function externalClientExecutionGate(authority: RequestAuthority): Response {
  */
 function externalClientRouteAdmission(
   config: AppConfig,
-  authority: RequestAuthority,
+  authority: AuthenticatedExternalClientAuthority,
   requestedModel: unknown,
 ): Response {
   if (typeof requestedModel !== "string" || !isChatGptWebModelSlug(requestedModel)) {
@@ -612,40 +679,6 @@ function externalClientRouteAdmission(
     return externalClientRouteRejection(requestedModel);
   }
   return externalClientExecutionGate(authority);
-}
-
-/**
- * Authenticate one request that carried the dedicated external-client header.
- *
- * A dedicated header means the request has entered the external-client admission surface, so it
- * can never be answered as a legacy request. Direct mode fails closed before any credential work,
- * and every credential or route shape below answers with the same flat 401, so the response
- * reveals nothing about client existence, token shape, route availability, or integration mode.
- */
-function externalClientAdmission(
-  config: AppConfig,
-  header: ExternalClientHeaderState,
-  requestedModel: unknown,
-  req: Request,
-): Response {
-  if (!isExternalProviderMode(config)) return externalClientAuthFailure();
-  const presented = parseBearerToken(req.headers.get("authorization"));
-  if (!header.present || !header.valid) {
-    dummyTimingSafeCompare(presented ?? "");
-    return externalClientAuthFailure();
-  }
-  if (presented === undefined) return externalClientAuthFailure();
-  const record = findExternalClient(config.externalClients, header.clientId);
-  if (!record) {
-    dummyTimingSafeCompare(presented);
-    return externalClientAuthFailure();
-  }
-  if (!verifyExternalClientToken(record, presented)) return externalClientAuthFailure();
-  const authority: RequestAuthority = {
-    admissionClass: "authenticated-external",
-    client: { kind: "external-client", clientId: record.id },
-  };
-  return externalClientRouteAdmission(config, authority, requestedModel);
 }
 
 export async function responseRequest(
@@ -675,8 +708,10 @@ export async function responseRequest(
   // present-invalid header must never fall through to the legacy path, and only the legacy branch
   // below may extract native Codex identity from the body.
   const externalClientHeader = readExternalClientHeader(req.headers);
-  if (externalClientHeader.present) {
-    return externalClientAdmission(config, externalClientHeader, requestedModel, req);
+  const externalAuthentication = authenticateExternalClientRequest(req, config, externalClientHeader);
+  if (externalAuthentication.kind === "rejected") return externalAuthentication.response;
+  if (externalAuthentication.kind === "authenticated") {
+    return externalClientRouteAdmission(config, externalAuthentication.authority, requestedModel);
   }
   let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
   try {
@@ -897,6 +932,16 @@ export async function compactRequest(
       "invalid_request_error",
       error instanceof Error ? error.message : "Compaction request body must be a JSON object",
     );
+  }
+  // External clients never reach the legacy compact implementation: classification happens before
+  // metadata promotion, native identity extraction, model validation, route resolution, and any
+  // continuation state, so spoofed native metadata cannot bind native authority and no pre-auth
+  // model or metadata oracle exists. Every authenticated external compact request gets the same
+  // unsupported answer whatever it asked for.
+  const externalCompact = authenticateExternalClientRequest(req, config);
+  if (externalCompact.kind === "rejected") return externalCompact.response;
+  if (externalCompact.kind === "authenticated") {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE);
   }
   raw = applyCodexTurnMetadataHeader(raw, req, { headerWins: true });
   let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
@@ -1276,6 +1321,13 @@ export function startServer(
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        // Dedicated external-client traffic never enters a native passthrough boundary: Direct mode
+        // fails closed, and external-provider authenticates before the unsupported answer.
+        const externalSearch = authenticateExternalClientRequest(req, config);
+        if (externalSearch.kind === "rejected") return externalSearch.response;
+        if (externalSearch.kind === "authenticated") {
+          return externalClientUnsupportedResponse(EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE);
+        }
         if (isExternalProviderMode(config)) {
           return formatErrorResponse(501, "unsupported_operation", "Native search is not provided by codex-chatgpt-web in external-provider mode");
         }
@@ -1289,6 +1341,13 @@ export function startServer(
       if (req.method === "POST"
         && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits")) {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        // Same trust-domain gate as search: no image request may carry an external credential or
+        // the dedicated client header into the native Codex boundary.
+        const externalImages = authenticateExternalClientRequest(req, config);
+        if (externalImages.kind === "rejected") return externalImages.response;
+        if (externalImages.kind === "authenticated") {
+          return externalClientUnsupportedResponse(EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE);
+        }
         if (isExternalProviderMode(config)) {
           return formatErrorResponse(501, "unsupported_operation", "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode");
         }
