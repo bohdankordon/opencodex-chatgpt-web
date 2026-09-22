@@ -20,7 +20,14 @@ import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./
 import type { AppConfig } from "./config";
 import { isExternalProviderMode, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
-import { readExternalClientHeader } from "./external-client";
+import {
+  dummyTimingSafeCompare,
+  findExternalClient,
+  parseBearerToken,
+  readExternalClientHeader,
+  verifyExternalClientToken,
+  type ExternalClientHeaderState,
+} from "./external-client";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
@@ -33,6 +40,7 @@ import {
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   isChatGptWebModelSlug,
+  isChatGptWebRouteAvailableToExternalClient,
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
@@ -46,7 +54,12 @@ import {
 } from "./responses/compaction";
 import { parseRequest } from "./responses/parser";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
-import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
+import {
+  namespacedToolName,
+  type AdapterEvent,
+  type CodexParsedRequest,
+  type RequestAuthority,
+} from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
@@ -523,6 +536,118 @@ function externalProviderTurnMetadataError(
   );
 }
 
+/** One generic message for every external-client authentication failure, whatever its cause. */
+const EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE = "External client authentication failed";
+/** Temporary Phase D gate message; execution arrives with the external request identity work. */
+const EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE = "Authenticated external-client execution is not enabled yet";
+
+/** The single response construction path shared by every external authentication failure. */
+function externalClientAuthFailure(): Response {
+  return formatErrorResponse(401, "authentication_error", EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE);
+}
+
+function externalClientRouteRejection(model: string): Response {
+  return formatErrorResponse(
+    400,
+    "model_not_found",
+    `Model ${model} is not available to an authenticated external client`,
+  );
+}
+
+/**
+ * Temporary Phase D execution gate.
+ *
+ * Authenticated external admission succeeds here, but execution stays deferred: the ChatGPT Web
+ * adapter is still native-identity-based, so an external request must not fabricate thread or turn
+ * handles merely to enter it. The response is built directly rather than through
+ * formatErrorResponse because the shared classifier maps every 5xx onto
+ * server_error/upstream_server_error, which would advertise a failed upstream instead of an
+ * operation this build does not support yet. A later stage replaces this gate with the external
+ * execution runtime and consumes the authority passed here.
+ */
+function externalClientExecutionGate(authority: RequestAuthority): Response {
+  if (authority.admissionClass !== "authenticated-external") {
+    throw new Error("The external execution gate requires authenticated external authority");
+  }
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE,
+        type: "unsupported_operation",
+        code: "unsupported_operation",
+      },
+    }),
+    { status: 501, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+/**
+ * Route admission for an authenticated external client, then the temporary execution gate.
+ *
+ * Only route information may influence the result at this point, and compatibility is decided by
+ * the reviewed shared predicate rather than by a second allowlist. Nothing here expands
+ * continuation state, parses the Responses semantic body, or touches the turn-session registry.
+ */
+function externalClientRouteAdmission(
+  config: AppConfig,
+  authority: RequestAuthority,
+  requestedModel: unknown,
+): Response {
+  if (typeof requestedModel !== "string" || !isChatGptWebModelSlug(requestedModel)) {
+    return formatErrorResponse(
+      400,
+      "model_not_found",
+      typeof requestedModel === "string"
+        ? `Model ${requestedModel} is not provided by codex-chatgpt-web`
+        : "A model is required for an authenticated external client",
+    );
+  }
+  let route: ChatGptWebModelRoute;
+  try {
+    route = requireChatGptWebModelRoute(requestedModel, config);
+  } catch {
+    return externalClientRouteRejection(requestedModel);
+  }
+  if (!isChatGptWebRouteAvailableToExternalClient(route, config)) {
+    return externalClientRouteRejection(requestedModel);
+  }
+  return externalClientExecutionGate(authority);
+}
+
+/**
+ * Authenticate one request that carried the dedicated external-client header.
+ *
+ * A dedicated header means the request has entered the external-client admission surface, so it
+ * can never be answered as a legacy request. Direct mode fails closed before any credential work,
+ * and every credential or route shape below answers with the same flat 401, so the response
+ * reveals nothing about client existence, token shape, route availability, or integration mode.
+ */
+function externalClientAdmission(
+  config: AppConfig,
+  header: ExternalClientHeaderState,
+  requestedModel: unknown,
+  req: Request,
+): Response {
+  if (!isExternalProviderMode(config)) return externalClientAuthFailure();
+  const presented = parseBearerToken(req.headers.get("authorization"));
+  if (!header.present || !header.valid) {
+    dummyTimingSafeCompare(presented ?? "");
+    return externalClientAuthFailure();
+  }
+  if (presented === undefined) return externalClientAuthFailure();
+  const record = findExternalClient(config.externalClients, header.clientId);
+  if (!record) {
+    dummyTimingSafeCompare(presented);
+    return externalClientAuthFailure();
+  }
+  if (!verifyExternalClientToken(record, presented)) return externalClientAuthFailure();
+  const authority: RequestAuthority = {
+    admissionClass: "authenticated-external",
+    client: { kind: "external-client", clientId: record.id },
+  };
+  return externalClientRouteAdmission(config, authority, requestedModel);
+}
+
 export async function responseRequest(
   req: Request,
   config: AppConfig,
@@ -546,6 +671,13 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
+  // The dedicated header classifies admission before any native authority is read: a
+  // present-invalid header must never fall through to the legacy path, and only the legacy branch
+  // below may extract native Codex identity from the body.
+  const externalClientHeader = readExternalClientHeader(req.headers);
+  if (externalClientHeader.present) {
+    return externalClientAdmission(config, externalClientHeader, requestedModel, req);
+  }
   let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
   try {
     nativeIdentity = extractCodexTurnIdentityFromBody(raw);

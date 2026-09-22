@@ -449,7 +449,7 @@ test("the external-client profile is never applied to Direct mode", async () => 
   });
 });
 
-test("the dedicated header does not admit a request on POST /v1/responses", async () => {
+test("the dedicated header enters external admission instead of reaching the native path", async () => {
   isolatedEnvironment();
   const config = externalProviderConfig();
   const server = startServer(config, {
@@ -469,10 +469,15 @@ test("the dedicated header does not admit a request on POST /v1/responses", asyn
       },
       body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
     });
-    // Request admission belongs to Phase D: a native model stays rejected exactly as before.
-    expect(response.status).toBe(400);
-    const body = await response.json() as { error: { message: string } };
-    expect(body.error.message).toContain("not provided by codex-chatgpt-web");
+    // Phase D: the dedicated header enters the external-client admission surface, so an
+    // unconfigured credential is rejected flatly instead of reaching the native path.
+    expect(response.status).toBe(401);
+    const body = await response.json() as { error: { message: string; type: string; code: string } };
+    expect(body.error).toEqual({
+      message: "External client authentication failed",
+      type: "authentication_error",
+      code: "invalid_api_key",
+    });
   } finally {
     await server.stop(true);
   }

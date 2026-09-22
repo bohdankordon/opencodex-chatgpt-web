@@ -114,3 +114,27 @@ test.skipIf(process.platform === "win32")("the credential store stays owner-only
   expect(statSync(root).mode & 0o777).toBe(0o700);
   expect(statSync(configPath(root)).mode & 0o777).toBe(0o600);
 });
+
+test("an external client token may not collide with the control token", () => {
+  const root = isolatedHome();
+  const shared = generateExternalClientToken();
+  writeFileSync(configPath(root), JSON.stringify({
+    ...defaultConfig("browser-only"),
+    controlToken: shared,
+    externalClients: [{ id: "hermes-local", token: shared }],
+  }, null, 2) + "\n");
+  const message = loadFailure();
+  expect(message).toContain("external client token must differ from control token");
+  expect(message).not.toContain(shared);
+
+  // A distinct external token still loads, and the control credential keeps its own value.
+  const distinct = generateExternalClientToken();
+  writeFileSync(configPath(root), JSON.stringify({
+    ...defaultConfig("browser-only"),
+    controlToken: shared,
+    externalClients: [{ id: "hermes-local", token: distinct }],
+  }, null, 2) + "\n");
+  const loaded = loadConfig();
+  expect(loaded.controlToken).toBe(shared);
+  expect(loaded.externalClients).toEqual([{ id: "hermes-local", token: distinct }]);
+});

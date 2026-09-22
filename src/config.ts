@@ -575,6 +575,13 @@ function parseConfig(value: unknown, path: string): AppConfig {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`${detail} in ${path}`);
   }
+  // External-client credentials and the Launcher/admin control credential are different trust
+  // domains. /admin/* authorizes by Bearer value, so an external token configured equal to
+  // controlToken would physically satisfy admin authorization; fail closed on that collision
+  // without echoing either secret.
+  if (externalClients.some(client => client.token === parsed.controlToken)) {
+    throw new Error(`external client token must differ from control token in ${path}`);
+  }
   const normalized = { ...parsed } as Record<string, unknown>;
   // Do not perpetuate the compatibility alias once the config has been parsed. The canonical
   // field is integrationMode; accepting the alias is only a migration aid for old launcher state.
