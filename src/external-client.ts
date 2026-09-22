@@ -58,16 +58,65 @@ export function generateExternalClientToken(): string {
 }
 
 /**
- * Reads the caller-asserted external client id.
+ * Presence-preserving classification of the dedicated external client header.
  *
- * Only an already-canonical value is returned, so a missing, malformed, or repeated header is
- * indistinguishable from an absent one and can never select a client on its own. A header that
- * arrived as several joined values fails the canonical check as well.
+ * A caller that sends the dedicated header has explicitly entered the external-client admission
+ * surface, so an unusable value must stay distinguishable from no header at all. The intended
+ * admission shape - implemented in a later stage, never here - is:
+ *
+ *   const external = readExternalClientHeader(request.headers);
+ *   if (!external.present) {
+ *     // legacy path
+ *   } else {
+ *     if (!external.valid) {
+ *       // flat rejection
+ *     }
+ *     // only then credential lookup and token verification
+ *   }
+ *
+ * A present-invalid header must never fall through to legacy. If an invalid id collapsed into
+ * the absent state, a request that named an unknown or malformed client could be admitted as a
+ * legacy request instead of being rejected. Only the HTTP contract's null result means "no
+ * header".
  */
-export function readExternalClientId(headers: Headers): string | undefined {
-  const raw = headers.get(EXTERNAL_CLIENT_ID_HEADER);
-  if (typeof raw !== "string") return undefined;
-  return validateExternalClientId(raw.trim());
+export type ExternalClientHeaderState =
+  | {
+      readonly present: false;
+    }
+  | {
+      readonly present: true;
+      readonly valid: false;
+    }
+  | {
+      readonly present: true;
+      readonly valid: true;
+      readonly clientId: string;
+    };
+
+/**
+ * Classifies a raw dedicated-header value without repairing it.
+ *
+ * A null lookup result is the only absent state. Every other value - empty, whitespace-padded,
+ * uppercased, repeated or comma-joined, or otherwise malformed - is present-invalid, and the id
+ * is returned verbatim only when it is already canonical.
+ */
+export function classifyExternalClientHeaderValue(raw: string | null): ExternalClientHeaderState {
+  if (raw === null) return { present: false };
+  const clientId = validateExternalClientId(raw);
+  return clientId === undefined
+    ? { present: true, valid: false }
+    : { present: true, valid: true, clientId };
+}
+
+/**
+ * Reads the dedicated external client header while preserving its presence.
+ *
+ * Optional whitespace around a field value is resolved by the HTTP layer before this module sees
+ * it. Nothing here trims, lowercases, or otherwise repairs a value into validity, and a header
+ * that arrived as several joined values is rejected instead of selecting one of them.
+ */
+export function readExternalClientHeader(headers: Headers): ExternalClientHeaderState {
+  return classifyExternalClientHeaderValue(headers.get(EXTERNAL_CLIENT_ID_HEADER));
 }
 
 /**

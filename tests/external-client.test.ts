@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
 import {
   EXTERNAL_CLIENT_ID_HEADER,
+  classifyExternalClientHeaderValue,
   dummyTimingSafeCompare,
   findExternalClient,
   generateExternalClientToken,
   parseBearerToken,
-  readExternalClientId,
+  readExternalClientHeader,
   validateExternalClientId,
   validateExternalClientToken,
   validateExternalClients,
@@ -84,15 +85,104 @@ test("token validation enforces the accepted secret shape", () => {
   }
 });
 
-test("the client id header is read without normalizing or guessing", () => {
-  expect(readExternalClientId(new Headers([[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]))).toBe("hermes-local");
-  expect(readExternalClientId(new Headers())).toBeUndefined();
-  expect(readExternalClientId(new Headers([[EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]))).toBeUndefined();
-  expect(readExternalClientId(new Headers([[EXTERNAL_CLIENT_ID_HEADER, ""]]))).toBeUndefined();
-  expect(readExternalClientId(new Headers([
+test("an absent header is the only state that reports absence", () => {
+  expect(readExternalClientHeader(new Headers())).toEqual({ present: false });
+  expect(readExternalClientHeader(new Headers([["X-Other-Client", "hermes-local"]]))).toEqual({ present: false });
+  expect(classifyExternalClientHeaderValue(null)).toEqual({ present: false });
+});
+
+test("a canonical header value keeps its exact id", () => {
+  const headers = new Headers([[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]);
+  expect(readExternalClientHeader(headers)).toEqual({ present: true, valid: true, clientId: "hermes-local" });
+});
+
+test("unusable header values are present-invalid instead of absent", () => {
+  const unusable = [
+    "",
+    "Hermes-Local",
+    " hermes-local ",
+    " hermes-local",
+    "hermes-local ",
+    "hermes-local, hermes-2",
+    "hermes-local,hermes-2",
+    "hermes.local",
+    "hermes-local!",
+    "-hermes-local",
+    "ab",
+    "a".repeat(65),
+    "hermes local",
+  ];
+  for (const raw of unusable) {
+    expect(classifyExternalClientHeaderValue(raw)).toEqual({ present: true, valid: false });
+  }
+});
+
+test("a repeated or joined dedicated header is never repaired into one id", () => {
+  const combined = new Headers([
     [EXTERNAL_CLIENT_ID_HEADER, "hermes-local"],
-    [EXTERNAL_CLIENT_ID_HEADER, "client-123"],
-  ]))).toBeUndefined();
+    [EXTERNAL_CLIENT_ID_HEADER, "hermes-2"],
+  ]);
+  const appended = new Headers();
+  appended.append(EXTERNAL_CLIENT_ID_HEADER, "hermes-local");
+  appended.append(EXTERNAL_CLIENT_ID_HEADER, "hermes-2");
+  const fixtures = [
+    combined,
+    appended,
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, ""]]),
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]),
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, "hermes-local!"]]),
+  ];
+  for (const headers of fixtures) {
+    expect(readExternalClientHeader(headers)).toEqual({ present: true, valid: false });
+  }
+});
+
+test("the HTTP layer resolves optional whitespace without this module repairing values", () => {
+  // Field-value whitespace belongs to HTTP parsing: a padded wire value arrives here already
+  // stripped, so the no-trim rule is asserted where the raw value is still observable.
+  const padded = new Headers([[EXTERNAL_CLIENT_ID_HEADER, "  hermes-local  "]]);
+  expect(padded.get(EXTERNAL_CLIENT_ID_HEADER)).toBe("hermes-local");
+  expect(readExternalClientHeader(padded)).toEqual({ present: true, valid: true, clientId: "hermes-local" });
+});
+
+test("no header that carries a value is ever classified as absent", () => {
+  const fixtures = [
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, ""]]),
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]),
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, "hermes-local!"]]),
+    new Headers([[EXTERNAL_CLIENT_ID_HEADER, "ab"]]),
+    new Headers([
+      [EXTERNAL_CLIENT_ID_HEADER, "hermes-local"],
+      [EXTERNAL_CLIENT_ID_HEADER, "hermes-2"],
+    ]),
+  ];
+  for (const headers of fixtures) {
+    const state = readExternalClientHeader(headers);
+    // The invariant is the point: a value-carrying header is never reported as absent.
+    expect(state.present).toBe(true);
+    expect(state).toEqual({ present: true, valid: false });
+  }
+  for (const raw of ["", "Hermes-Local", " hermes-local ", "hermes-local, hermes-2", "ab"]) {
+    expect(classifyExternalClientHeaderValue(raw).present).toBe(true);
+  }
+  expect(classifyExternalClientHeaderValue(null).present).toBe(false);
+});
+
+test("the documented admission shape separates legacy from an external-client attempt", () => {
+  const route = (headers: Headers): string => {
+    const external = readExternalClientHeader(headers);
+    if (!external.present) return "legacy";
+    if (!external.valid) return "reject";
+    return "external:" + external.clientId;
+  };
+  expect(route(new Headers())).toBe("legacy");
+  expect(route(new Headers([[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]))).toBe("external:hermes-local");
+  expect(route(new Headers([[EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]))).toBe("reject");
+  expect(route(new Headers([[EXTERNAL_CLIENT_ID_HEADER, ""]]))).toBe("reject");
+  expect(route(new Headers([
+    [EXTERNAL_CLIENT_ID_HEADER, "hermes-local"],
+    [EXTERNAL_CLIENT_ID_HEADER, "hermes-2"],
+  ]))).toBe("reject");
 });
 
 test("bearer parsing extracts the presented secret verbatim", () => {
