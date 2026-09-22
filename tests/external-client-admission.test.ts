@@ -11,13 +11,9 @@ import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 
 const HEADER = EXTERNAL_CLIENT_ID_HEADER;
 const AUTH_FAILURE_MESSAGE = "External client authentication failed";
-const EXECUTION_GATE_MESSAGE = "Authenticated external-client execution is not enabled yet";
 const METADATA_ERROR_MESSAGE = "External-provider ChatGPT Web requests require native Codex turn metadata in client_metadata";
 const AUTH_FAILURE_BODY = JSON.stringify({
   error: { message: AUTH_FAILURE_MESSAGE, type: "authentication_error", code: "invalid_api_key" },
-});
-const EXECUTION_GATE_BODY = JSON.stringify({
-  error: { message: EXECUTION_GATE_MESSAGE, type: "unsupported_operation", code: "unsupported_operation" },
 });
 
 const roots: string[] = [];
@@ -226,85 +222,112 @@ test("authentication precedes every route decision", async () => {
   });
 });
 
-test("the shared predicate admits only compatible routes and stops at the temporary gate", async () => {
+test("the shared predicate admits compatible routes to read-only execution and keeps route rejections", async () => {
   isolatedEnvironment();
   const token = generateExternalClientToken();
 
   const plus = withExternalClient(externalProviderConfig(), token);
-  await withServer(plus, async ({ port, upstream, adapterStarts }) => {
-    for (const model of ["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high"]) {
-      const response = await post(port, "/v1/responses", responsesBody(model), clientHeaders(token));
-      expect([model, response.status, await response.text()]).toEqual([model, 501, EXECUTION_GATE_BODY]);
-    }
-    for (const model of [
-      "gpt-5.6-sol",
-      "chatgpt-web/not-a-route",
-      "chatgpt-web/luna",
-      "chatgpt-web/think",
-      "chatgpt-web/zero-risk",
-      "chatgpt-web/zero-risk-pro",
-      "chatgpt-web/extra-high",
-      "chatgpt-web/pro",
-    ]) {
-      const response = await post(port, "/v1/responses", responsesBody(model), clientHeaders(token));
-      const text = await response.text();
-      expect([model, response.status, JSON.parse(text).error.type]).toEqual([model, 400, "invalid_request_error"]);
-      expect([model, text.includes("unsupported_operation")]).toEqual([model, false]);
-    }
-    expect(upstream.length).toBe(0);
-    expect(adapterStarts()).toBe(0);
-  });
+  let adapterRuns = 0;
+  const factory = () => emittingAdapter(
+    "external-read-only-adapter",
+    () => { adapterRuns += 1; },
+  );
+  for (const model of ["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high"]) {
+    const response = await responseRequest(
+      inProcessRequest(responsesBody(model), clientHeaders(token)),
+      plus,
+      factory,
+    );
+    expect([model, response.status]).toEqual([model, 200]);
+  }
+  expect(adapterRuns).toBe(3);
+  for (const model of [
+    "gpt-5.6-sol",
+    "chatgpt-web/not-a-route",
+    "chatgpt-web/luna",
+    "chatgpt-web/think",
+    "chatgpt-web/zero-risk",
+    "chatgpt-web/zero-risk-pro",
+    "chatgpt-web/extra-high",
+    "chatgpt-web/pro",
+  ]) {
+    const response = await responseRequest(
+      inProcessRequest(responsesBody(model), clientHeaders(token)),
+      plus,
+      factory,
+    );
+    const text = await response.text();
+    expect([model, response.status, JSON.parse(text).error.type]).toEqual([model, 400, "invalid_request_error"]);
+    expect([model, text.includes("unsupported_operation")]).toEqual([model, false]);
+  }
+  expect(adapterRuns).toBe(3);
 
   const gated = withExternalClient({ ...externalProviderConfig(), proAvailable: true, extraHighAvailable: true }, token);
-  await withServer(gated, async ({ port }) => {
-    for (const model of ["chatgpt-web/extra-high", "chatgpt-web/pro"]) {
-      const response = await post(port, "/v1/responses", responsesBody(model), clientHeaders(token));
-      expect([model, response.status, await response.text()]).toEqual([model, 501, EXECUTION_GATE_BODY]);
-    }
-  });
+  for (const model of ["chatgpt-web/extra-high", "chatgpt-web/pro"]) {
+    const response = await responseRequest(
+      inProcessRequest(responsesBody(model), clientHeaders(token)),
+      gated,
+      factory,
+    );
+    expect([model, response.status]).toEqual([model, 200]);
+  }
 
   const lunaOnly = withExternalClient({ ...externalProviderConfig(), solAvailable: false }, token);
-  await withServer(lunaOnly, async ({ port }) => {
-    for (const model of ["chatgpt-web/luna", "chatgpt-web/think"]) {
-      const response = await post(port, "/v1/responses", responsesBody(model), clientHeaders(token));
-      expect([model, response.status]).toEqual([model, 400]);
-    }
-  });
+  for (const model of ["chatgpt-web/luna", "chatgpt-web/think"]) {
+    const response = await responseRequest(
+      inProcessRequest(responsesBody(model), clientHeaders(token)),
+      lunaOnly,
+      factory,
+    );
+    expect([model, response.status]).toEqual([model, 400]);
+  }
 
   const zeroRisk = withExternalClient(
     { ...externalProviderConfig("full"), browserInteractionMode: "manual", solAvailable: true },
     token,
   );
-  await withServer(zeroRisk, async ({ port }) => {
-    for (const model of ["chatgpt-web/zero-risk", "chatgpt-web/zero-risk-pro"]) {
-      const response = await post(port, "/v1/responses", responsesBody(model), clientHeaders(token));
-      expect([model, response.status]).toEqual([model, 400]);
-    }
-  });
+  for (const model of ["chatgpt-web/zero-risk", "chatgpt-web/zero-risk-pro"]) {
+    const response = await responseRequest(
+      inProcessRequest(responsesBody(model), clientHeaders(token)),
+      zeroRisk,
+      factory,
+    );
+    expect([model, response.status]).toEqual([model, 400]);
+  }
 });
 
-test("the temporary gate stops before parsing, continuation, and turn sessions", async () => {
+test("external route admission precedes parsing and rejects local continuation", async () => {
   isolatedEnvironment();
   const token = generateExternalClientToken();
   const config = withExternalClient(externalProviderConfig(), token);
   chatGptTurnSessions.clear();
-  await withServer(config, async ({ port, upstream, adapterStarts }) => {
-    // The Responses parser would reject this body; the gate answers first.
-    const unparsable = await post(port, "/v1/responses", { model: "chatgpt-web/light", input: 42 }, clientHeaders(token));
-    expect(unparsable.status).toBe(501);
+  let adapterRuns = 0;
+  const factory = () => emittingAdapter(
+    "external-read-only-adapter",
+    () => { adapterRuns += 1; },
+  );
+  // The Responses parser rejects this body after route admission passes.
+  const unparsable = await responseRequest(
+    inProcessRequest({ model: "chatgpt-web/light", input: 42 }, clientHeaders(token)),
+    config,
+    factory,
+  );
+  expect(unparsable.status).toBe(400);
 
-    // Local continuation state would answer 409; the gate answers first.
-    const continuation = await post(
-      port,
-      "/v1/responses",
+  // Bridge-local continuation is never used for authenticated external traffic.
+  const continuation = await responseRequest(
+    inProcessRequest(
       responsesBody("chatgpt-web/light", { previous_response_id: "resp_missing" }),
       clientHeaders(token),
-    );
-    const text = await continuation.text();
-    expect([continuation.status, text]).toEqual([501, EXECUTION_GATE_BODY]);
-    expect([text.includes(token), text.includes("hermes-local")]).toEqual([false, false]);
-    expect([upstream.length, adapterStarts(), chatGptTurnSessions.activeCount()]).toEqual([0, 0, 0]);
-  });
+    ),
+    config,
+    factory,
+  );
+  const text = await continuation.text();
+  expect(continuation.status).toBe(400);
+  expect(text.includes("previous_response_id")).toBe(true);
+  expect([text.includes(token), text.includes("hermes-local")]).toEqual([false, false]);
+  expect([adapterRuns, chatGptTurnSessions.activeCount()]).toEqual([0, 0]);
 });
 
 test("external requests cannot mint native authority from believable metadata", async () => {
@@ -314,13 +337,10 @@ test("external requests cannot mint native authority from believable metadata", 
   const metadata = JSON.stringify({ thread_id: "thread_spoof", turn_id: "turn_spoof" });
   const bound: Array<{ threadId: string; turnId: string }> = [];
   let adapterRuns = 0;
-  const adapterFactory = (): ProviderAdapter => ({
-    name: "spy-adapter",
-    async runTurn() {
-      adapterRuns += 1;
-      throw new Error("the browser adapter must not start");
-    },
-  });
+  const adapterFactory = () => emittingAdapter(
+    "spy-adapter",
+    () => { adapterRuns += 1; },
+  );
 
   const cases: Array<[string, unknown, Array<[string, string]>]> = [
     ["body metadata", responsesBody("chatgpt-web/light", { client_metadata: { "x-codex-turn-metadata": metadata } }), clientHeaders(token)],
@@ -340,10 +360,10 @@ test("external requests cannot mint native authority from believable metadata", 
       adapterFactory,
       { onTurnIdentity: identity => bound.push(identity) },
     );
-    expect([label, response.status, await response.text()]).toEqual([label, 501, EXECUTION_GATE_BODY]);
+    expect([label, response.status]).toEqual([label, 200]);
   }
   expect(bound).toEqual([]);
-  expect(adapterRuns).toBe(0);
+  expect(adapterRuns).toBe(4);
 });
 
 test("legacy header-absent behavior is unchanged", async () => {

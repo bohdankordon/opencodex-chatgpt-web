@@ -566,3 +566,42 @@ test("module stays clear of native authority, server, and secret-store dependenc
     expect(source.includes(token)).toBe(false);
   }
 });
+
+test("canonicalizer rejects cyclic input with a generic error", () => {
+  const marker = "cyclic-marker-secret";
+  const params: Record<string, unknown> = { label: marker };
+  (params as Record<string, unknown>).self = params;
+  let message = "";
+  try {
+    buildExternalExecutionContract(baseInput({ tools: [baseTool({ parameters: params })] }));
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  expect(message.length > 0).toBe(true);
+  expect(message.includes(marker)).toBe(false);
+});
+
+test("canonicalizer rejects Date and non-plain objects without leaking contents", () => {
+  const marker = "date-marker-secret";
+  const params = { created: new Date(0), label: marker };
+  let message = "";
+  try {
+    buildExternalExecutionContract(baseInput({ tools: [baseTool({ parameters: params })] }));
+  } catch (error) {
+    message = error instanceof Error ? error.message : "";
+  }
+  expect(message.length > 0).toBe(true);
+  expect(message.includes(marker)).toBe(false);
+});
+
+test("canonicalizer rejects non-finite numbers and undefined members generically", () => {
+  for (const params of [{ value: Number.POSITIVE_INFINITY }, { value: undefined }]) {
+    let message = "";
+    try {
+      buildExternalExecutionContract(baseInput({ tools: [baseTool({ parameters: params })] }));
+    } catch (error) {
+      message = error instanceof Error ? error.message : "";
+    }
+    expect(message.length > 0).toBe(true);
+  }
+});

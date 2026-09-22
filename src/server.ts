@@ -1,5 +1,6 @@
-import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
+import { chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
+import { buildExternalExecutionContract, buildExternalRequestIdentity } from "./adapters/chatgpt-web/external-identity";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
@@ -543,8 +544,10 @@ function externalProviderTurnMetadataError(
 
 /** One generic message for every external-client authentication failure, whatever its cause. */
 const EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE = "External client authentication failed";
-/** Temporary Phase D gate message; execution arrives with the external request identity work. */
-const EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE = "Authenticated external-client execution is not enabled yet";
+/** Read-only Phase F1 gate message for authenticated external requests that carry tool capability or continuation state. */
+const EXTERNAL_CLIENT_TOOLS_DISABLED_MESSAGE = "Authenticated external-client tool execution is not enabled yet";
+/** Authenticated external requests always send complete history; bridge-local continuation is never used for them. */
+const EXTERNAL_CLIENT_PREVIOUS_RESPONSE_MESSAGE = "Authenticated external clients must send complete input history and cannot use previous_response_id";
 const EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE = "Authenticated external-client compaction is not supported";
 const EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE = "Authenticated external-client native search is not supported";
 const EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE = "Authenticated external-client native image requests are not supported";
@@ -634,32 +637,192 @@ function authenticateExternalClientRequest(
 }
 
 /**
- * Temporary Phase D execution gate.
+ * Authenticated external tool gate (Phase F1 read-only boundary).
  *
- * Authenticated external admission succeeds here, but execution stays deferred: the ChatGPT Web
- * adapter is still native-identity-based, so an external request must not fabricate thread or turn
- * handles merely to enter it. A later stage replaces this gate with the external execution runtime
- * and consumes the authority passed here.
+ * Phase F1 executes only requests with no external tool capability or tool-loop
+ * continuation state. Anything tool-bearing fails closed here before any adapter,
+ * session, browser, broker, or environment work begins.
  */
-function externalClientExecutionGate(authority: AuthenticatedExternalClientAuthority): Response {
-  if (authority.admissionClass !== "authenticated-external") {
-    throw new Error("The external execution gate requires authenticated external authority");
+function externalWireInputHasToolOutput(input: unknown): boolean {
+  if (!Array.isArray(input)) return false;
+  for (const item of input) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+    const wireType = (item as { type?: unknown }).type;
+    if (wireType === "function_call_output" || wireType === "custom_tool_call_output" || wireType === "tool_search_output") return true;
   }
-  return externalClientUnsupportedResponse(EXTERNAL_CLIENT_EXECUTION_DISABLED_MESSAGE);
+  return false;
+}
+
+function isExternalToolBearingRequest(parsed: CodexParsedRequest, raw: unknown): boolean {
+  const tools = parsed.context.tools;
+  if (tools !== undefined && tools.length > 0) return true;
+  for (const message of parsed.context.messages) {
+    if (message.role === "toolResult") return true;
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type === "toolCall") return true;
+      }
+    }
+  }
+  const holder = raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as { input?: unknown }).input
+    : undefined;
+  return externalWireInputHasToolOutput(holder);
+}
+
+function hasExternalPreviousResponseId(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const value = (raw as { previous_response_id?: unknown }).previous_response_id;
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+}
+/**
+ * Authenticated external read-only execution (Phase F1).
+ *
+ * Runs only after external authentication and route admission succeed. Previous-response
+ * continuation is rejected, tool-bearing requests fail closed, and everything else
+ * executes through the ChatGPT Web adapter under request-scoped external identity with
+ * timestamp-free wire input. No local continuation state is created.
+ */
+async function externalClientReadOnlyResponse(
+  req: Request,
+  config: AppConfig,
+  authority: AuthenticatedExternalClientAuthority,
+  raw: unknown,
+  adapterFactory: ChatGptWebAdapterFactory,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  if (hasExternalPreviousResponseId(raw)) {
+    return formatErrorResponse(400, "invalid_request_error", EXTERNAL_CLIENT_PREVIOUS_RESPONSE_MESSAGE);
+  }
+  let parsed: CodexParsedRequest;
+  try {
+    parsed = parseRequest(raw);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  if (parsed._opaqueMultiAgentV2Payload) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "ChatGPT Web cannot read this encrypted cross-backend subagent payload. Start a new Compatibility V1 task.",
+    );
+  }
+  if (isExternalToolBearingRequest(parsed, raw)) {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_TOOLS_DISABLED_MESSAGE);
+  }
+  const routeSlug = parsed.modelId;
+  let execRoute: ChatGptWebModelRoute;
+  try {
+    execRoute = routeChatGptWebRequest(parsed, config);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  const provider = providerConfig(config);
+  const holder = raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as { input?: unknown }).input
+    : undefined;
+  const contract = buildExternalExecutionContract({
+    clientId: authority.client.clientId,
+    routeSlug,
+    adapterEffort: execRoute.interactionMode === "automatic" ? execRoute.adapterEffort : execRoute.codexEffort,
+    hideThinkingSummary: parsed.options.hideThinkingSummary === true,
+    verbosity: parsed.options.verbosity,
+    outputFormat: parsed.options.outputFormat,
+    systemPrompt: parsed.context.systemPrompt ?? [],
+    tools: parsed.context.tools,
+    expandedInput: holder,
+  });
+  const identity = buildExternalRequestIdentity(chatGptWebExecutionNamespace(provider), contract);
+  parsed._externalRequestIdentity = identity;
+  const cancelledError = chatGptTurnSessions.cancelledError(identity.traceId);
+  if (cancelledError) {
+    return new Response(JSON.stringify({
+      error: {
+        type: "client_closed_request",
+        code: "client_cancelled",
+        message: cancelledError.message,
+      },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const adapter = adapterFactory(provider);
+  const queue = new AsyncEventQueue<AdapterEvent>();
+  const abort = new AbortController();
+  if (req.signal.aborted) abort.abort();
+  else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
+  const run = async () => {
+    try {
+      await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: abort.signal }, event => {
+        options.onAdapterEvent?.(event);
+        queue.push(event);
+      });
+    } catch (error) {
+      const event: AdapterEvent = { type: "error", message: error instanceof Error ? error.message : String(error) };
+      options.onAdapterEvent?.(event);
+      queue.push(event);
+    } finally {
+      queue.close();
+    }
+  };
+  const maps = toolBridgeMaps(parsed);
+  if (parsed.stream) {
+    void run();
+    const stream = bridgeToResponsesSSE(
+      queue,
+      routeSlug,
+      maps.toolNsMap,
+      maps.freeformToolNames,
+      maps.toolSearchToolNames,
+      () => abort.abort(),
+      2_000,
+      {
+        hideThinkingSummary: parsed.options.hideThinkingSummary,
+        ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
+          ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
+          : {}),
+      },
+    );
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
+  await run();
+  const events = await queue.collect();
+  const json = buildResponseJSON(events, routeSlug, {
+    hideThinkingSummary: parsed.options.hideThinkingSummary,
+    toolNsMap: maps.toolNsMap,
+    freeformToolNames: maps.freeformToolNames,
+    toolSearchToolNames: maps.toolSearchToolNames,
+  });
+  return Response.json(json);
 }
 
 /**
- * Route admission for an authenticated external client, then the temporary execution gate.
+ * Route admission for an authenticated external client, then read-only execution.
  *
  * Only route information may influence the result at this point, and compatibility is decided by
  * the reviewed shared predicate rather than by a second allowlist. Nothing here expands
  * continuation state, parses the Responses semantic body, or touches the turn-session registry.
  */
-function externalClientRouteAdmission(
+async function externalClientRouteAdmission(
+  req: Request,
   config: AppConfig,
   authority: AuthenticatedExternalClientAuthority,
   requestedModel: unknown,
-): Response {
+  raw: unknown,
+  adapterFactory: ChatGptWebAdapterFactory,
+  options: ResponseRequestOptions,
+): Promise<Response> {
   if (typeof requestedModel !== "string" || !isChatGptWebModelSlug(requestedModel)) {
     return formatErrorResponse(
       400,
@@ -678,7 +841,7 @@ function externalClientRouteAdmission(
   if (!isChatGptWebRouteAvailableToExternalClient(route, config)) {
     return externalClientRouteRejection(requestedModel);
   }
-  return externalClientExecutionGate(authority);
+  return externalClientReadOnlyResponse(req, config, authority, raw, adapterFactory, options);
 }
 
 export async function responseRequest(
@@ -711,7 +874,7 @@ export async function responseRequest(
   const externalAuthentication = authenticateExternalClientRequest(req, config, externalClientHeader);
   if (externalAuthentication.kind === "rejected") return externalAuthentication.response;
   if (externalAuthentication.kind === "authenticated") {
-    return externalClientRouteAdmission(config, externalAuthentication.authority, requestedModel);
+    return externalClientRouteAdmission(req, config, externalAuthentication.authority, requestedModel, raw, adapterFactory, options);
   }
   let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
   try {

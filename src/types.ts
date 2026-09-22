@@ -1,3 +1,4 @@
+import type { ExternalRequestIdentity } from "./adapters/chatgpt-web/external-identity";
 export interface CodexParsedRequest {
   modelId: string;
   previousResponseId?: string;
@@ -7,6 +8,8 @@ export interface CodexParsedRequest {
   _rawBody?: unknown;
   /** Set only by the external-provider HTTP boundary after native turn metadata is validated. */
   _externalProviderTrusted?: boolean;
+  /** Request-scoped identity for authenticated external clients. Never carries secrets or native handles. */
+  _externalRequestIdentity?: ExternalRequestIdentity;
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
   /**

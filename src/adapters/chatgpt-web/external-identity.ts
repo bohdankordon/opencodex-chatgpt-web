@@ -236,3 +236,17 @@ export function buildExternalRequestIdentity(
     traceId: externalTraceId(namespace, requestKey),
   };
 }
+
+/**
+ * Server wiring notes (no behavior change).
+ *
+ * expandedInput is the timestamp-free canonical Responses wire input taken directly
+ * from the validated raw request body. It is never the parsed Codex message list,
+ * because the parser stamps runtime timestamps that must not enter request identity.
+ *
+ * Identical V1 execution contracts intentionally share one content-addressed request
+ * identity. That is exact-retry semantics, not a collision.
+ *
+ * Any change to key material or canonicalization requires a contract-version bump.
+ * V1 semantics must never be reinterpreted in place.
+ */
