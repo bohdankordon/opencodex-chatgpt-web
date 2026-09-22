@@ -20,6 +20,7 @@ import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./
 import type { AppConfig } from "./config";
 import { isExternalProviderMode, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
+import { readExternalClientHeader } from "./external-client";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
@@ -391,7 +392,15 @@ export async function modelsRequest(
   onFailure?: (failure: ModelCatalogFailure) => void,
 ): Promise<Response> {
   if (isExternalProviderMode(config)) {
-    const catalog = buildExternalProviderModelCatalog(config);
+    // Catalog presentation only. Any dedicated client header selects the external-client
+    // presentation, and its validity is deliberately not consulted: model discovery is not an
+    // authorization decision, so nothing here reads externalClients, verifies a token, or looks
+    // at Authorization.
+    const externalClientHeader = readExternalClientHeader(req.headers);
+    const catalog = buildExternalProviderModelCatalog(
+      config,
+      externalClientHeader.present ? "external-client" : "legacy",
+    );
     const body = JSON.stringify(catalog);
     return new Response(body, {
       status: 200,

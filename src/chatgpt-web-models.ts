@@ -396,6 +396,28 @@ export function availableChatGptWebModelRoutes(
     && (!route.requiresExtraHigh || capabilities.extraHighAvailable));
 }
 
+/**
+ * Whether one ChatGPT Web route may serve an authenticated external client.
+ *
+ * Total on its own: the caller may pass any route, including one that
+ * availableChatGptWebModelRoutes() would never return for these capabilities, so request
+ * admission can reuse this predicate without depending on catalog pre-filtering. Only automatic
+ * Sol-family routes are compatible; native passthrough, Luna/Think, Zero Risk, and account-gated
+ * rows this account cannot use are not.
+ */
+export function isChatGptWebRouteAvailableToExternalClient(
+  route: ChatGptWebModelRoute,
+  capabilities: ChatGptWebAccountCapabilities,
+): boolean {
+  if (capabilities.browserInteractionMode === "manual") return false;
+  if (capabilities.solAvailable !== true) return false;
+  if (route.interactionMode !== "automatic") return false;
+  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return false;
+  if (route.requiresPro && !capabilities.proAvailable) return false;
+  if (route.requiresExtraHigh && capabilities.extraHighAvailable !== true) return false;
+  return true;
+}
+
 export function requireChatGptWebModelRoute(
   modelId: string,
   capabilities: ChatGptWebAccountCapabilities,
