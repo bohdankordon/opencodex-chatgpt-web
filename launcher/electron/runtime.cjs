@@ -1345,6 +1345,73 @@ class RuntimeHost {
     return { ...result, enabled: enabled === true };
   }
 
+  async setFreshConversationPerTurn(enabled, ownershipInput, expectation, afterRuntimeReady) {
+    if (typeof enabled !== "boolean") throw new Error("Fresh conversation preference must be a boolean");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "fresh-conversation-per-turn");
+    const policy = buildSetupOwnershipPolicy({ integrationMode: ownership.integrationMode,
+      operation: "fresh-conversation-per-turn", profile: this.launcherProfile });
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing browser conversation retention");
+    if ((current.config?.browserInteractionMode ?? "automatic") !== "automatic") {
+      throw new Error("New browser chats per turn are unavailable in Zero Risk mode");
+    }
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...ownershipArgs(policy),
+      ...(development ? [] : ["--restart-service"]),
+      enabled ? "--fresh-conversation" : "--retained-conversation",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling a new browser chat for each turn" : "Restoring browser chat retention",
+      successMessage: enabled ? "New browser chats per turn enabled" : "Browser chat retention restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
+      ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
+    };
+    const result = development
+      ? await this.runDevSetup("fresh-conversation-per-turn", args, options)
+      : await this.runSetup("fresh-conversation-per-turn", args, options);
+    return { ...result, enabled };
+  }
+
+  async setUseSavedChats(enabled, ownershipInput, expectation, afterRuntimeReady) {
+    if (typeof enabled !== "boolean") throw new Error("Saved chat preference must be a boolean");
+    const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "use-saved-chats");
+    const policy = buildSetupOwnershipPolicy({ integrationMode: ownership.integrationMode,
+      operation: "use-saved-chats", profile: this.launcherProfile });
+    const current = this.runtimeConfigSnapshot();
+    if (!current.configured) throw new Error("Initialize the runtime before changing saved chats");
+    const development = this.launcherProfile === "development";
+    const args = [
+      ...(development ? ["dev", "setup"] : ["setup"]),
+      current.mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor", this.browserDescriptorPath,
+      ...this.browserInteractionArgs(),
+      "--acknowledge-unofficial",
+      ...ownershipArgs(policy),
+      ...(development ? [] : ["--restart-service"]),
+      enabled ? "--saved-chats" : "--temporary-chats",
+    ];
+    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
+    const options = {
+      message: enabled ? "Enabling saved ChatGPT conversations" : "Restoring Temporary Chat",
+      successMessage: enabled ? "Saved ChatGPT conversations enabled" : "Temporary Chat restored",
+      timeoutMs: CORE_SETUP_TIMEOUT_MS,
+      ownershipPolicy: policy,
+      ...(afterRuntimeReady ? { afterRuntimeReady } : {}),
+    };
+    const result = development
+      ? await this.runDevSetup("use-saved-chats", args, options)
+      : await this.runSetup("use-saved-chats", args, options);
+    return { ...result, enabled };
+  }
+
   async setZeroRiskPro(enabled, ownershipInput, expectation, afterRuntimeReady) {
     // G1 validates ownership provenance; the threaded mode is consumed by G2.
     const ownership = this.validateSetupOwnership(extractRequestedIntegrationMode(ownershipInput), expectation, "zero-risk-pro");
@@ -1721,7 +1788,7 @@ class RuntimeHost {
         ...failures,
       ].join("; ");
       this.publishOperation?.({ name, status: "failed", message });
-      throw new Error(message);
+      throw new Error(message, { cause: error });
     } finally {
       this.lifecycleOperation = null;
     }
