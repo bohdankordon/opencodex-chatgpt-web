@@ -694,6 +694,7 @@ export function createChatGptWebAdapter(
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
+        ...(externalExec === true ? { forceTemporaryChat: true } : {}),
         capabilities: turnCapabilities,
         prepare: async () => ({
           ...compileChatGptWebPrompt(

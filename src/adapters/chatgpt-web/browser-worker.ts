@@ -173,7 +173,7 @@ const settleChatGptUi = (): Promise<void> => (
   new Promise(resolveSettle => setTimeout(resolveSettle, CHATGPT_UI_SETTLE_MS))
 );
 
-class ChatGptConnectorCatalogStaleError extends Error {
+export class ChatGptConnectorCatalogStaleError extends Error {
   constructor(
     readonly appName: string,
     readonly triggerAttempts: number,
@@ -1246,6 +1246,8 @@ export interface BrowserTurn {
   modelId: string;
   reasoning?: string;
   modelFamily?: "5.6" | "6";
+  /** Authenticated external executions always start on a fresh Temporary Chat surface. */
+  forceTemporaryChat?: true;
   capabilities: ChatGptWebCapabilities;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
@@ -4579,6 +4581,7 @@ export class ChatGptBrowserWorker {
       ? { ...turn.capabilities, localToolsEnabled: true }
       : turn.capabilities;
     const requestedMode = resolveChatGptWebModelMode(turn.modelId, turn.reasoning, browserCapabilities);
+    const useSavedChats = turn.forceTemporaryChat === true ? false : this.config.useSavedChats;
     const prepare = reuseConversation ? turn.prepareResume : turn.prepare;
     if (!prepare) throw new Error("The retained ChatGPT conversation has no continuation prompt");
     const prepared = await prepare();
@@ -4808,7 +4811,7 @@ export class ChatGptBrowserWorker {
           () => this.prepareChatSurface(
             page,
             checkpoint => diagnostics.capture(page, checkpoint),
-            this.config.useSavedChats,
+            useSavedChats,
           ),
         );
       }
@@ -5019,7 +5022,7 @@ export class ChatGptBrowserWorker {
               await this.prepareChatSurface(
                 page,
                 checkpoint => diagnostics.capture(page, checkpoint),
-                this.config.useSavedChats,
+                useSavedChats,
               );
               mode = await this.selectModelAndEffort(
                 page,

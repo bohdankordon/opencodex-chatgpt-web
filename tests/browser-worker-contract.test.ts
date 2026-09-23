@@ -1,16 +1,18 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptConnectorCatalogStaleError, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptConnectorAttachmentMode, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { ensureChatGptPersonalizedConnectorAccess, chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
+import { LAUNCHER_BROWSER_HOST_KIND, LAUNCHER_BROWSER_IDLE_URL, readLauncherBrowserHostDescriptor } from "../src/launcher-browser-host";
 import { parseChatGptEffortSliderState } from "../src/chatgpt-session";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import type { CodexProviderConfig } from "../src/types";
@@ -758,7 +760,9 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
   expect(pressOptions?.signal).toBeInstanceOf(AbortSignal);
 });
 
-test("two-part saved chats re-prove unchanged effort after the first message creates the conversation URL", async () => {
+for (const [savedPreference, forceTemporaryChat] of [
+  [false, false], [true, false], [false, true], [true, true],
+] as const) test(`browser turn surface policy saved=${savedPreference} external=${forceTemporaryChat}`, async () => {
   const root = mkdtempSync(join(tmpdir(), "saved-chat-multipart-"));
   const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
   const prepared = { ...compileChatGptWebPrompt({
@@ -770,10 +774,10 @@ test("two-part saved chats re-prove unchanged effort after the first message cre
   }, capabilities, undefined, { experimentalMultipartParts: 2 }), release() {} };
   const worker: any = ChatGptBrowserWorker.forProvider({
     adapter: "chatgpt-web", baseUrl: `browser://${root}`,
-    chatgptWeb: { useSavedChats: true, browserDiagnosticsPath: root },
+    chatgptWeb: { useSavedChats: savedPreference, browserDiagnosticsPath: root },
   });
   let url = "https://chatgpt.com/";
-  const savedUrl = "https://chatgpt.com/c/00000000-0000-4000-8000-000000000001";
+  const continuedUrl = "https://chatgpt.com/c/00000000-0000-4000-8000-000000000001";
   const selections: string[] = [];
   const control = { innerText: async () => "Instant", getAttribute: async () => "false" };
   const controls: any = { filter: () => controls, count: async () => 1, first: () => control };
@@ -785,7 +789,9 @@ test("two-part saved chats re-prove unchanged effort after the first message cre
   let sends = 0;
   const finished = new Error("final send reached with a current effort proof");
   Object.assign(worker, {
-    prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => { expect(saved).toBeTrue(); },
+    prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => {
+      expect(saved).toBe(savedPreference && !forceTemporaryChat);
+    },
     activeComposer: async () => composer,
     selectModelAndEffort: async () => {
       selections.push(url);
@@ -799,18 +805,130 @@ test("two-part saved chats re-prove unchanged effort after the first message cre
       _progress: unknown, lifecycle: { onSendActivated(): Promise<void> }) => {
       await lifecycle.onSendActivated();
       if (++sends === 2) throw finished;
-      url = savedUrl;
+      url = continuedUrl;
       return "user_turn";
     },
   });
   try {
     await expect(worker.runBrowserTurn({
-      traceId: "saved_multipart", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+      traceId: "surface_policy_multipart", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "low", capabilities,
+      ...(forceTemporaryChat ? { forceTemporaryChat: true as const } : {}),
       prepare: async () => prepared, onTextDelta() {}, onReasoningSummary() {},
     }, undefined, page)).rejects.toBe(finished);
     expect(sends).toBe(2);
-    expect(selections).toEqual(["https://chatgpt.com/", savedUrl]);
+    expect(selections).toEqual(["https://chatgpt.com/", continuedUrl]);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("one accepted external physical Send writes one identity-free Limits receipt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "external-limits-send-"));
+  const receipts: Record<string, unknown>[] = [];
+  const control = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk));
+    if (request.url === "/v1/turn/usage") receipts.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"ok":true}');
+  });
+  await new Promise<void>(resolve => control.listen(0, "127.0.0.1", resolve));
+  const address = control.address();
+  if (!address || typeof address === "string") throw new Error("missing local Limits fixture port");
+  const descriptor = join(root, "launcher.json");
+  writeFileSync(descriptor, JSON.stringify({
+    version: 3, kind: LAUNCHER_BROWSER_HOST_KIND, profile: "production", pid: process.pid,
+    endpoint: `http://127.0.0.1:${address.port}`, control: {
+      endpoint: `http://127.0.0.1:${address.port}`,
+      token: "launcher-control-token-0123456789abcdefghijklmnop",
+    },
+    helper: { executable: process.execPath, script: import.meta.path },
+    partition: "persist:codex-web-gpt-chatgpt", idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+    surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { launcher_surface_id_0123456789AB: "native-owned-target" },
+    createdAt: new Date().toISOString(),
+  }), { mode: 0o600 });
+  readLauncherBrowserHostDescriptor(descriptor);
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const worker: any = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`,
+    chatgptWeb: { useSavedChats: true, browserDiagnosticsPath: root, browserHostDescriptorPath: descriptor },
+  });
+  const page = Object.assign(new EventEmitter(), {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
+    isClosed: () => false,
+    evaluate: async () => ({ userId: "private-user", accountId: "private-account", planType: "pro", structure: "personal", needsAttention: false }),
+  });
+  const accepted = new Error("fake physical Send accepted");
+  let sends = 0;
+  Object.assign(worker, {
+    prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => { expect(saved).toBeFalse(); },
+    selectModelAndEffort: async () => ({ effort: "high", localTools: false, usageModel: "other" }),
+    captureSubmissionBaseline: async () => ({}),
+    attachPromptWithCompactionRetry: async () => {},
+    attachFiles: async () => {},
+    assertSelectedEffort: async () => {},
+    sendAttachedPrompt: async (_page: unknown, _baseline: unknown, _capture: unknown, _signal: unknown,
+      _progress: unknown, lifecycle: { onSendActivated(): Promise<void>; onSubmitted(): void }) => {
+      sends++;
+      await lifecycle.onSendActivated();
+      lifecycle.onSubmitted();
+      throw accepted;
+    },
+  });
+  try {
+    await expect(worker.runBrowserTurn({
+      traceId: "external-limits-fake", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "high",
+      forceTemporaryChat: true, capabilities,
+      prepare: async () => ({ text: "Fake external prompt", images: [], release() {} }),
+      onTextDelta() {},
+    }, undefined, page, false, true)).rejects.toBe(accepted);
+    expect(sends).toBe(1);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ phase: "usage", traceId: "external-limits-fake", receipt: { model: "other" } });
+    expect(JSON.stringify(receipts[0])).not.toMatch(/threadId|turnId|environment|private-user|private-account|secret/);
+    expect(JSON.stringify(receipts[0])).not.toContain("launcher-control-token-0123456789abcdefghijklmnop");
+  } finally {
+    await new Promise<void>(resolve => control.close(() => resolve()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("one browser turn keeps its Temporary Chat override through catalog re-preparation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "temporary-reprepare-"));
+  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  const worker: any = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`,
+    chatgptWeb: { useSavedChats: true, browserDiagnosticsPath: root },
+  });
+  const page = Object.assign(new EventEmitter(), {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
+    isClosed: () => false,
+    evaluate: async () => { throw new Error("No real browser in recovery fixture"); },
+    reload: async () => {},
+  });
+  const surfaceChoices: boolean[] = [];
+  const stop = new Error("re-preparation completed");
+  let attachments = 0;
+  Object.assign(worker, {
+    prepareChatSurface: async (_page: unknown, _capture: unknown, saved: boolean) => { surfaceChoices.push(saved); },
+    selectModelAndEffort: async () => ({ effort: "high", localTools: true }),
+    captureSubmissionBaseline: async () => ({}),
+    attachPromptWithCompactionRetry: async () => {
+      if (++attachments === 1) throw new ChatGptConnectorCatalogStaleError("Codex Native2", 1);
+      throw stop;
+    },
+  });
+  try {
+    await expect(worker.runBrowserTurn({
+      traceId: "temporary-reprepare", modelId: CHATGPT_WEB_MODEL_ID, reasoning: "high",
+      forceTemporaryChat: true, capabilities,
+      prepare: async () => ({ text: "Fake prompt", images: [], release() {} }),
+      onTextDelta() {},
+    }, undefined, page)).rejects.toBe(stop);
+    expect(surfaceChoices).toEqual([false, false]);
+    expect(attachments).toBe(2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("submission observation recovery resumes with rebound locators and is strictly bounded", async () => {
