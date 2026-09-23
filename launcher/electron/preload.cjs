@@ -8,6 +8,8 @@ function subscription(channel, listener) {
 
 contextBridge.exposeInMainWorld("codexWebLauncher", {
   snapshot: () => ipcRenderer.invoke("launcher:snapshot"),
+  getLimits: () => ipcRenderer.invoke("launcher:limits"),
+  setupLimits: () => ipcRenderer.invoke("launcher:limits-setup"),
   setLanguage: (language) => ipcRenderer.invoke("launcher:set-language", language),
   openSocial: (target) => ipcRenderer.invoke("launcher:open-social", target),
   completeOnboarding: (language, browserInteractionMode) => ipcRenderer.invoke(
@@ -42,6 +44,8 @@ contextBridge.exposeInMainWorld("codexWebLauncher", {
   setAutostart: (enabled) => ipcRenderer.invoke("launcher:autostart", enabled),
   setBiggerContext: (enabled, options) => ipcRenderer.invoke("launcher:bigger-context", enabled, options),
   setSkillAttachments: (enabled, options) => ipcRenderer.invoke("launcher:skill-attachments", enabled, options),
+  setFreshConversationPerTurn: (enabled, options) => ipcRenderer.invoke("launcher:fresh-conversation-per-turn", enabled, options),
+  setUseSavedChats: (enabled, options) => ipcRenderer.invoke("launcher:use-saved-chats", enabled, options),
   setZeroRiskPro: (enabled, options) => ipcRenderer.invoke("launcher:zero-risk-pro", enabled, options),
   setBrowserInteractionMode: (mode, options) => ipcRenderer.invoke("launcher:browser-interaction-mode", mode, options),
   setPreference: (key, value) => ipcRenderer.invoke("launcher:set-preference", key, value),

@@ -806,6 +806,7 @@ test("failed first-time setup removes its route before restoring the unconfigure
   const codexHome = path.join(root, "codex");
   const journalPath = path.join(coreHome, "codex", "integration-journal.json");
   const recoveryJournalPath = path.join(coreHome, "codex", "integration-journal.recovery.json");
+  const setupError = new Error("synthetic setup failure");
   const configPath = path.join(root, "config.json");
   const codexConfigPath = path.join(codexHome, "config.toml");
   const codexModelsCachePath = path.join(codexHome, "models_cache.json");
@@ -844,7 +845,7 @@ test("failed first-time setup removes its route before restoring the unconfigure
     fs.writeFileSync(recoveryJournalPath, "partial recovery journal\n");
     fs.writeFileSync(codexConfigPath, "partially changed codex config\n");
     fs.rmSync(codexModelsCachePath);
-    throw new Error("synthetic setup failure");
+    throw setupError;
   };
   try {
     await assert.rejects(
@@ -853,7 +854,11 @@ test("failed first-time setup removes its route before restoring the unconfigure
         ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
         { ownershipPolicy: directTransactionPolicy("setup-core") },
       ),
-      /synthetic setup failure; incomplete first-time setup was rolled back/,
+      error => {
+        assert.match(error.message, /synthetic setup failure; incomplete first-time setup was rolled back/);
+        assert.equal(error.cause, setupError);
+        return true;
+      },
     );
     assert.deepEqual(calls.map((args) => args.join(" ")), [
       "setup --browser-only --integration-mode direct --replace-codex-route --preflight-only",
@@ -1076,7 +1081,7 @@ test("failed terminal migration verifies the unchanged previous runtime instead 
   ]);
 });
 
-test("failed launcher update restores every mutable setup file before restarting the previous runtime", async () => {
+test("failed fresh-conversation setting restores every mutable setup file before restarting the previous runtime", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-setup-checkpoint-"));
   const coreHome = path.join(root, "core");
   const codexHome = path.join(root, "codex");
@@ -1093,6 +1098,8 @@ test("failed launcher update restores every mutable setup file before restarting
   const oldConfig = {
     mode: "full",
     browserHost: "launcher",
+    browserInteractionMode: "automatic",
+    experimentalFreshConversationPerTurn: false,
     releaseVersion: "0.1.16",
     tunnel: {
       runtimeKeyFile: keyPath,
@@ -1143,7 +1150,7 @@ test("failed launcher update restores every mutable setup file before restarting
   });
   host.run = async (_name, args) => {
     if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
-    fs.writeFileSync(configPath, `${JSON.stringify({ ...oldConfig, releaseVersion: "0.2.0" })}\n`);
+    fs.writeFileSync(configPath, `${JSON.stringify({ ...oldConfig, releaseVersion: "0.2.0", experimentalFreshConversationPerTurn: true })}\n`);
     fs.writeFileSync(journalPath, "new journal\n");
     fs.writeFileSync(recoveryJournalPath, "new recovery journal\n");
     fs.writeFileSync(keyPath, "new key\n");
@@ -2262,4 +2269,63 @@ test("D17 DEV configured Direct remains allowed", async () => {
   const result = await fixture.host.setupDevCore();
   assert.equal(result.mode, "browser-only");
   assert.notEqual(fixture.invocation(), undefined);
+});
+test("fresh-conversation preference uses production and DEV setup without forcing mode or other preferences", async () => {
+  for (const makeHost of [hostFor, devHostFor]) {
+    for (const mode of ["browser-only", "full"]) {
+      const existing = { mode, browserInteractionMode: "automatic", autoApproveToolCalls: true,
+        experimentalFreshConversationPerTurn: false, experimentalSkillAttachments: true };
+      const fixture = makeHost(existing);
+      for (const enabled of [true, false]) {
+        assert.equal((await fixture.host.setFreshConversationPerTurn(enabled)).enabled, enabled);
+        const { name, args } = fixture.invocation();
+        assert.equal(name, "fresh-conversation-per-turn");
+        assert.deepEqual(args.slice(0, makeHost === devHostFor ? 2 : 1), makeHost === devHostFor ? ["dev", "setup"] : ["setup"]);
+        assert.equal(args.includes(`--${mode}`), true);
+        assert.equal(args.includes(enabled ? "--fresh-conversation" : "--retained-conversation"), true);
+        assert.equal(args.includes(enabled ? "--retained-conversation" : "--fresh-conversation"), false);
+        assert.equal(args.includes("--auto-approve-tool-calls"), true);
+        assert.equal(args.includes("--restart-service"), makeHost === hostFor);
+        assert.equal(args.includes("--replace-codex-route"), makeHost === hostFor);
+        assert.equal(args.includes("--integration-mode"), makeHost === hostFor);
+        assert.equal(existing.experimentalFreshConversationPerTurn, false, "setter must delegate persistence to setup");
+        assert.equal(existing.experimentalSkillAttachments, true);
+      }
+    }
+    for (const config of [null, { mode: "full", browserInteractionMode: "manual" }]) {
+      const fixture = makeHost(config);
+      await assert.rejects(() => fixture.host.setFreshConversationPerTurn(true), /Initialize|Zero Risk/);
+      await assert.rejects(() => fixture.host.setFreshConversationPerTurn(false), /Initialize|Zero Risk/);
+      assert.equal(fixture.invocation(), undefined);
+    }
+    for (const interaction of ["automatic", "manual"]) {
+      const saved = makeHost({ mode: "full", browserInteractionMode: interaction }, interaction);
+      for (const enabled of [true, false]) {
+        await saved.host.setUseSavedChats(enabled);
+        assert.equal(saved.invocation().args.includes(enabled ? "--saved-chats" : "--temporary-chats"), true);
+        assert.equal(saved.invocation().args.includes("--full"), true);
+        assert.equal(saved.invocation().args.includes("--fresh-conversation"), false);
+      }
+      await assert.rejects(() => saved.host.setUseSavedChats("true"), /boolean/);
+    }
+    const fixture = makeHost({ mode: "browser-only", browserInteractionMode: "automatic" });
+    await assert.rejects(() => fixture.host.setFreshConversationPerTurn("true"), /boolean/);
+    assert.equal(fixture.invocation(), undefined);
+  }
+});
+
+test("conversation preferences preserve external route ownership", async () => {
+  const external = { mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" };
+  for (const [setter, enabled] of [["setFreshConversationPerTurn", true], ["setUseSavedChats", true]]) {
+    const fixture = hostFor(external);
+    const result = await fixture.host[setter](enabled, { integrationMode: "external-provider" });
+    assert.equal(result.enabled, true);
+    const { args } = fixture.invocation();
+    assert.deepEqual(args.slice(args.indexOf("--integration-mode"), args.indexOf("--integration-mode") + 2),
+      ["--integration-mode", "external-provider"]);
+    assert.equal(args.includes("--replace-codex-route"), false);
+    const mismatch = hostFor(external);
+    await assert.rejects(mismatch.host[setter](enabled, { integrationMode: "direct" }), /ownership mismatch/);
+    assert.equal(mismatch.invocation(), undefined);
+  }
 });
