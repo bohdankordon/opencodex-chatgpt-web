@@ -168,7 +168,7 @@ async function inspectStoredState(
     try {
       const verifierPage = await verifierContext.newPage();
       await verifierPage.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
-      await chatGptComposer(verifierPage).first().waitFor({ state: "visible", timeout: 60_000 });
+      await chatGptComposer(verifierPage).filter({ visible: true }).first().waitFor({ state: "visible", timeout: 60_000 });
       await assertAuthenticatedChatGptPage(verifierPage);
       await assertTemporaryChatPage(verifierPage);
       return { ...await detectChatGptAccountCapabilities(verifierPage), url: verifierPage.url() };
@@ -411,7 +411,7 @@ export async function loginToChatGpt(
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
-    const composer = chatGptComposer(page).first();
+    const composer = chatGptComposer(page).filter({ visible: true }).first();
     try {
       await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
     } catch {
