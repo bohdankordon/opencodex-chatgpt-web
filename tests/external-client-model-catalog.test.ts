@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   CHATGPT_WEB_LUNA_MODEL_ROUTE,
   CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE,
+  CHATGPT_WEB_LEGACY_MODEL_ROUTES,
   CHATGPT_WEB_MODEL_ROUTES,
   CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
   CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE,
@@ -60,32 +61,40 @@ const lunaOnly = { solAvailable: false, proAvailable: false };
 const zeroRisk = { solAvailable: true, proAvailable: true, extraHighAvailable: true, browserInteractionMode: "manual" as const };
 
 test("the external route predicate accepts automatic Sol routes for a capable account", () => {
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/light"), sol)).toBe(true);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/medium"), sol)).toBe(true);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/high"), sol)).toBe(true);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/extra-high"), solExtraHigh)).toBe(true);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/pro"), solPro)).toBe(true);
+  for (const slug of ["chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol"]) {
+    expect(isChatGptWebRouteAvailableToExternalClient(route(slug), sol)).toBe(true);
+  }
+  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/gpt-5.6-sol"), solExtraHigh)).toBe(true);
+  for (const slug of ["chatgpt-web/gpt-5.6-pro", "chatgpt-web/gpt-6-pro"]) {
+    expect(isChatGptWebRouteAvailableToExternalClient(route(slug), solPro)).toBe(true);
+  }
+  for (const legacy of CHATGPT_WEB_LEGACY_MODEL_ROUTES) {
+    expect(isChatGptWebRouteAvailableToExternalClient(legacy, solPro)).toBe(true);
+  }
 });
 
 test("the external route predicate rejects gated routes this account cannot use", () => {
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/extra-high"), sol)).toBe(false);
-  expect(isChatGptWebRouteAvailableToExternalClient(
-    route("chatgpt-web/extra-high"),
-    { ...sol, extraHighAvailable: undefined },
-  )).toBe(false);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/pro"), sol)).toBe(false);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/pro"), solExtraHigh)).toBe(false);
+  for (const slug of ["chatgpt-web/gpt-5.6-pro", "chatgpt-web/gpt-6-pro"]) {
+    expect(isChatGptWebRouteAvailableToExternalClient(route(slug), sol)).toBe(false);
+    expect(isChatGptWebRouteAvailableToExternalClient(route(slug), solExtraHigh)).toBe(false);
+  }
+  const legacyXhigh = CHATGPT_WEB_LEGACY_MODEL_ROUTES.find(candidate => candidate.slug === "chatgpt-web/extra-high")!;
+  expect(isChatGptWebRouteAvailableToExternalClient(legacyXhigh, sol)).toBe(false);
+  expect(isChatGptWebRouteAvailableToExternalClient(legacyXhigh, { ...sol, extraHighAvailable: undefined })).toBe(false);
+  const legacyPro = CHATGPT_WEB_LEGACY_MODEL_ROUTES.find(candidate => candidate.slug === "chatgpt-web/pro")!;
+  expect(isChatGptWebRouteAvailableToExternalClient(legacyPro, sol)).toBe(false);
+  expect(isChatGptWebRouteAvailableToExternalClient(legacyPro, solExtraHigh)).toBe(false);
 });
 
 test("the external route predicate is safe when a route is passed directly", () => {
   // None of these combinations can reach the predicate through availableChatGptWebModelRoutes(),
   // which is exactly why the predicate must be total on its own.
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/light"), lunaOnly)).toBe(false);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/pro"), lunaOnly)).toBe(false);
+  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/gpt-5.6-sol-instant"), lunaOnly)).toBe(false);
+  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/gpt-5.6-pro"), lunaOnly)).toBe(false);
   expect(isChatGptWebRouteAvailableToExternalClient(CHATGPT_WEB_LUNA_MODEL_ROUTE, lunaOnly)).toBe(false);
   expect(isChatGptWebRouteAvailableToExternalClient(CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE, sol)).toBe(false);
   expect(isChatGptWebRouteAvailableToExternalClient(CHATGPT_WEB_LUNA_THINK_MODEL_ROUTE, lunaOnly)).toBe(false);
-  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/light"), zeroRisk)).toBe(false);
+  expect(isChatGptWebRouteAvailableToExternalClient(route("chatgpt-web/gpt-5.6-sol-instant"), zeroRisk)).toBe(false);
   expect(isChatGptWebRouteAvailableToExternalClient(
     CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
     { ...zeroRisk, browserInteractionMode: undefined },
@@ -100,117 +109,102 @@ test("the external route predicate is safe when a route is passed directly", () 
   )).toBe(false);
 });
 
-test("the legacy external-provider catalog keeps its exact rows", () => {
-  const catalog = buildExternalProviderModelCatalog(externalProviderConfig());
-  expect(catalog).toEqual({
+test("6.0 external-provider rows keep their native capability profile", () => {
+  const browserOnly = buildExternalProviderModelCatalog(externalProviderConfig()) as {
+    object: string; data: Array<Record<string, unknown> & { id: string }>;
+  };
+  expect(browserOnly).toEqual({
     object: "list",
     data: [
       {
-        id: "chatgpt-web/light",
-        object: "model",
-        created: 0,
-        owned_by: "codex-chatgpt-web",
-        name: "ChatGPT Web — Instant",
-        display_name: "ChatGPT Web — Instant",
-        description: "ChatGPT Web Instant through the native Codex harness.",
-        context_window: 41_000,
-        max_context_window: 41_000,
-        input_modalities: ["text", "image"],
-        capabilities: ["reasoning", "compact"],
-        supports_tools: false,
-        supports_reasoning: true,
-        supports_compact: true,
-        reasoning_efforts: ["low"],
-        default_reasoning_effort: "low",
+        id: "chatgpt-web/gpt-5.6-sol-instant",
+        object: "model", created: 0, owned_by: "codex-chatgpt-web",
+        name: "GPT-5.6 Sol Instant (Web)", display_name: "GPT-5.6 Sol Instant (Web)",
+        description: "GPT-5.6 Sol Instant through ChatGPT, with its own context and compaction budget.",
+        context_window: 41_000, max_context_window: 41_000,
+        input_modalities: ["text", "image"], capabilities: ["reasoning", "compact"],
+        supports_tools: false, supports_reasoning: true, supports_compact: true,
+        reasoning_efforts: ["low"], default_reasoning_effort: "low",
       },
       {
-        id: "chatgpt-web/medium",
-        object: "model",
-        created: 0,
-        owned_by: "codex-chatgpt-web",
-        name: "ChatGPT Web — Medium",
-        display_name: "ChatGPT Web — Medium",
-        description: "ChatGPT Web Medium through the native Codex harness.",
-        context_window: 90_000,
-        max_context_window: 90_000,
-        input_modalities: ["text", "image"],
-        capabilities: ["reasoning", "compact"],
-        supports_tools: false,
-        supports_reasoning: true,
-        supports_compact: true,
-        reasoning_efforts: ["medium"],
-        default_reasoning_effort: "medium",
-      },
-      {
-        id: "chatgpt-web/high",
-        object: "model",
-        created: 0,
-        owned_by: "codex-chatgpt-web",
-        name: "ChatGPT Web — High",
-        display_name: "ChatGPT Web — High",
-        description: "ChatGPT Web High through the native Codex harness.",
-        context_window: 90_000,
-        max_context_window: 90_000,
-        input_modalities: ["text", "image"],
-        capabilities: ["reasoning", "compact"],
-        supports_tools: false,
-        supports_reasoning: true,
-        supports_compact: true,
-        reasoning_efforts: ["high"],
-        default_reasoning_effort: "high",
+        id: "chatgpt-web/gpt-5.6-sol",
+        object: "model", created: 0, owned_by: "codex-chatgpt-web",
+        name: "GPT-5.6 Sol (Web)", display_name: "GPT-5.6 Sol (Web)",
+        description: "GPT-5.6 Sol through ChatGPT with Medium, High, or account-supported Extra High reasoning.",
+        context_window: 90_000, max_context_window: 90_000,
+        input_modalities: ["text", "image"], capabilities: ["reasoning", "compact"],
+        supports_tools: false, supports_reasoning: true, supports_compact: true,
+        reasoning_efforts: ["medium", "high"], default_reasoning_effort: "high",
       },
     ],
   });
+  const full = externalProviderConfig("full");
+  const implicit = buildExternalProviderModelCatalog(full);
+  expect(implicit).toEqual(buildExternalProviderModelCatalog(full, "legacy"));
+  const fullRows = (implicit as { data: Array<Record<string, unknown>> }).data;
+  expect(fullRows.map(row => row.id)).toEqual(modelIds(browserOnly as { data: Array<{ id: string }> }));
+  for (const row of fullRows) {
+    expect(row).toMatchObject({
+      capabilities: ["reasoning", "tools", "compact"],
+      supports_tools: true, supports_compact: true,
+    });
+  }
 });
 
-test("the legacy profile stays the default and the Full legacy rows keep their tool surface", () => {
-  const config = externalProviderConfig("full");
-  const implicit = buildExternalProviderModelCatalog(config) as { data: Array<Record<string, unknown>> };
-  const explicit = buildExternalProviderModelCatalog(config, "legacy") as { data: Array<Record<string, unknown>> };
-  expect(implicit).toEqual(explicit);
-  expect(implicit.data.map(row => row.id)).toEqual([
-    "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high",
+test("external-client catalog advertises grouped efforts and F1 capabilities only", () => {
+  const plus = buildExternalProviderModelCatalog(externalProviderConfig("full"), "external-client") as {
+    data: Array<Record<string, unknown>>;
+  };
+  expect(plus.data.map(row => row.id)).toEqual([
+    "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
   ]);
-  expect(implicit.data[0]).toMatchObject({
-    capabilities: ["reasoning", "tools", "compact"],
-    supports_tools: true,
-    supports_reasoning: true,
-    supports_compact: true,
-    context_window: 41_000,
+  expect(plus.data[0]).toMatchObject({
+    reasoning_efforts: ["low"], default_reasoning_effort: "low",
   });
-});
-
-test("an automatic Sol account serves the same routes under either profile", () => {
-  const config = externalProviderConfig();
-  const legacy = buildExternalProviderModelCatalog(config) as { data: Array<{ id: string }> };
-  const external = buildExternalProviderModelCatalog(config, "external-client") as { data: Array<{ id: string }> };
-  expect(modelIds(legacy)).toEqual(["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high"]);
-  expect(modelIds(external)).toEqual(modelIds(legacy));
-  // Identical on this account is correct: the profile filters, it does not manufacture a difference.
-  expect(external).toEqual(legacy);
-});
-
-test("gated rows survive external-client filtering exactly when the account permits them", () => {
+  expect(plus.data[1]).toMatchObject({
+    reasoning_efforts: ["medium", "high"], default_reasoning_effort: "high",
+  });
+  for (const row of plus.data) {
+    expect(row).toMatchObject({
+      capabilities: ["reasoning"], supports_tools: false, supports_compact: false,
+    });
+  }
   const extraHigh = { ...externalProviderConfig(), extraHighAvailable: true };
-  expect(modelIds(buildExternalProviderModelCatalog(extraHigh, "external-client") as { data: Array<{ id: string }> }))
-    .toEqual(["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high", "chatgpt-web/extra-high"]);
+  const xhigh = buildExternalProviderModelCatalog(extraHigh, "external-client") as { data: Array<Record<string, unknown>> };
+  expect(xhigh.data[1]).toMatchObject({
+    reasoning_efforts: ["medium", "high", "xhigh"], default_reasoning_effort: "high",
+  });
+  expect(xhigh.data.map(row => row.id)).toEqual(plus.data.map(row => row.id));
 
   const pro = { ...externalProviderConfig("full"), proAvailable: true, extraHighAvailable: true };
-  expect(modelIds(buildExternalProviderModelCatalog(pro, "external-client") as { data: Array<{ id: string }> }))
-    .toEqual([
-      "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high", "chatgpt-web/extra-high", "chatgpt-web/pro",
-    ]);
-
-  const proWithoutExtraHigh = { ...externalProviderConfig("full"), proAvailable: true, extraHighAvailable: false };
-  expect(modelIds(buildExternalProviderModelCatalog(proWithoutExtraHigh, "external-client") as { data: Array<{ id: string }> }))
-    .toEqual(["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high", "chatgpt-web/pro"]);
+  const proRows = (buildExternalProviderModelCatalog(pro, "external-client") as { data: Array<Record<string, unknown>> }).data;
+  expect(proRows.map(row => row.id)).toEqual([
+    "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
+    "chatgpt-web/gpt-5.6-pro", "chatgpt-web/gpt-6-pro",
+  ]);
+  expect(proRows.filter(row => row.id === "chatgpt-web/gpt-5.6-sol")).toHaveLength(1);
+  for (const row of proRows.slice(2)) {
+    expect(row).toMatchObject({
+      reasoning_efforts: ["max"], default_reasoning_effort: "max",
+      capabilities: ["reasoning"], supports_tools: false, supports_compact: false,
+    });
+  }
+  const proWithoutExtraHigh = { ...pro, extraHighAvailable: false };
+  const noXhighRows = (buildExternalProviderModelCatalog(proWithoutExtraHigh, "external-client") as {
+    data: Array<Record<string, unknown>>;
+  }).data;
+  expect(noXhighRows.map(row => row.id)).toEqual(proRows.map(row => row.id));
+  expect(noXhighRows[1]!.reasoning_efforts).toEqual(["medium", "high"]);
+  expect(proRows.every(row => !String(row.id).includes("luna") && !String(row.id).includes("zero-risk"))).toBe(true);
+  expect(proRows.every(row => !["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high",
+    "chatgpt-web/extra-high", "chatgpt-web/pro"].includes(String(row.id)))).toBe(true);
 });
 
 test("Luna-only and Zero Risk accounts expose no external-client rows", () => {
   const luna = { ...externalProviderConfig(), solAvailable: false };
   const lunaLegacy = buildExternalProviderModelCatalog(luna) as { data: Array<{ id: string }> };
   const lunaExternal = buildExternalProviderModelCatalog(luna, "external-client") as { data: unknown[] };
-  expect(modelIds(lunaLegacy)).toEqual(["chatgpt-web/luna", "chatgpt-web/think"]);
+  expect(modelIds(lunaLegacy)).toEqual(["chatgpt-web/gpt-5.6-luna"]);
   expect(lunaExternal.data).toEqual([]);
 
   const manual = { ...externalProviderConfig("full"), browserInteractionMode: "manual" as const, solAvailable: true };
@@ -224,18 +218,22 @@ test("Luna-only and Zero Risk accounts expose no external-client rows", () => {
   expect((buildExternalProviderModelCatalog(manualPro, "external-client") as { data: unknown[] }).data).toEqual([]);
 });
 
-test("external-client filtering repackages no row metadata", () => {
+test("external-client profile changes only F1 capability claims", () => {
   const config = { ...externalProviderConfig("full"), proAvailable: true, extraHighAvailable: true };
   const legacy = buildExternalProviderModelCatalog(config) as { data: Array<Record<string, unknown>> };
   const external = buildExternalProviderModelCatalog(config, "external-client") as { data: Array<Record<string, unknown>> };
-  expect(external.data.length).toBeGreaterThan(3);
+  expect(external.data.map(row => row.id)).toEqual(legacy.data.map(row => row.id));
   for (const row of external.data) {
     const match = legacy.data.find(candidate => candidate.id === row.id);
     if (!match) throw new Error("The legacy profile is missing row " + String(row.id));
-    expect(row).toEqual(match);
+    expect(row).toEqual({
+      ...match,
+      capabilities: ["reasoning"],
+      supports_tools: false,
+      supports_compact: false,
+    });
   }
 });
-
 function nativeModelsFixture(): Record<string, unknown> {
   return {
     models: [{
@@ -300,8 +298,12 @@ test("header presence - not header validity - selects the external-provider cata
       expect([label, response.status]).toEqual([label, 200]);
       bodies.push(await response.text());
     }
-    // On an automatic Sol account both profiles render the same rows, so equal bodies are correct.
-    for (const body of bodies) expect(body).toBe(legacyBody);
+    for (const body of bodies) {
+      expect(body).not.toBe(legacyBody);
+      expect(JSON.parse(body).data.map((row: { id: string }) => row.id))
+        .toEqual(["chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol"]);
+      expect(JSON.parse(body).data.every((row: { supports_compact: boolean }) => row.supports_compact === false)).toBe(true);
+    }
     // The external-provider catalog never contacts native Codex, whatever the header says.
     expect(upstream).toHaveLength(0);
   });
@@ -314,7 +316,7 @@ test("a Luna-only account shows a different external-provider catalog once the h
     const legacy = await fetch(catalogUrl(port));
     const legacyBody = await legacy.text();
     expect(JSON.parse(legacyBody).data.map((row: { id: string }) => row.id))
-      .toEqual(["chatgpt-web/luna", "chatgpt-web/think"]);
+      .toEqual(["chatgpt-web/gpt-5.6-luna"]);
 
     const withHeader = await fetch(catalogUrl(port), {
       headers: [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]],
@@ -432,9 +434,10 @@ test("Direct mode rejects the dedicated header instead of forwarding it upstream
 
     const body = JSON.parse(withoutBody) as { models: Array<{ slug: string; supported_in_api?: boolean }> };
     expect(body.models.map(model => model.slug)).toEqual([
-      "gpt-5.6-sol", "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high",
+      "gpt-5.6-sol", "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
+      "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high",
     ]);
-    expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))).toHaveLength(3);
+    expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))).toHaveLength(5);
   });
 });
 
@@ -449,7 +452,7 @@ test("the external-client profile is never served on the Direct models path", as
     expect(upstream).toHaveLength(1);
     expect(legacyBody.models[0]!.slug).toBe("gpt-5.6-sol");
     expect(legacyBody.models.filter(model => model.slug.startsWith("chatgpt-web/")).map(model => model.slug))
-      .toEqual(["chatgpt-web/luna", "chatgpt-web/think"]);
+      .toEqual(["chatgpt-web/gpt-5.6-luna", "chatgpt-web/luna", "chatgpt-web/think"]);
 
     // Header present is a flat 401 in Direct mode: the restricted catalog is never served here.
     const restricted = await fetch(catalogUrl(port), {

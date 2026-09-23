@@ -182,6 +182,15 @@ test("every external authentication failure returns one byte-equivalent flat 401
   }
   expect(bodies).toHaveLength(cases.length);
   expect(new Set(bodies).size).toBe(1);
+  for (const config of [direct, external]) {
+    await withServer(config, async ({ port, upstream, adapterStarts }) => {
+      const response = await post(port, "/v1/responses", responsesBody("chatgpt-web/gpt-5.6-sol", {
+        reasoning: { effort: "invented" },
+      }), clientHeaders(wrongSameLength));
+      expect([response.status, await response.text()]).toEqual([401, AUTH_FAILURE_BODY]);
+      expect([upstream.length, adapterStarts()]).toEqual([0, 0]);
+    });
+  }
 });
 
 test("authentication precedes every route decision", async () => {
@@ -296,7 +305,90 @@ test("the shared predicate admits compatible routes to read-only execution and k
   }
 });
 
-test("external route admission precedes parsing and rejects local continuation", async () => {
+test("grouped effort admission and trusted family reach one resolved external execution", async () => {
+  isolatedEnvironment();
+  const token = generateExternalClientToken();
+  const config = withExternalClient({ ...externalProviderConfig(), proAvailable: true, extraHighAvailable: true }, token);
+  const seen: CodexParsedRequest[] = [];
+  const factory = () => emittingAdapter("resolved-route-spy", parsed => seen.push(parsed));
+  const call = async (model: string, effort?: string, account = config, extra: Record<string, unknown> = {}) => {
+    const response = await responseRequest(inProcessRequest(responsesBody(model, {
+      stream: false,
+      ...(effort === undefined ? {} : { reasoning: { effort } }),
+      ...extra,
+    }), clientHeaders(token)), account, factory);
+    return response.status;
+  };
+  for (const [model, effort, family] of [
+    ["chatgpt-web/gpt-5.6-sol-instant", "low", "5.6"],
+    ["chatgpt-web/gpt-5.6-sol", "medium", "5.6"],
+    ["chatgpt-web/gpt-5.6-sol", "high", "5.6"],
+    ["chatgpt-web/gpt-5.6-sol", "xhigh", "5.6"],
+    ["chatgpt-web/gpt-5.6-pro", "max", "5.6"],
+    ["chatgpt-web/gpt-6-pro", "max", "6"],
+  ] as const) {
+    expect(await call(model, effort, config, {
+      _chatgptModelFamily: "spoofed",
+      client_metadata: { modelFamily: "spoofed", _chatgptModelFamily: "spoofed" },
+    })).toBe(200);
+    const parsed = seen.at(-1)!;
+    expect(parsed.options.reasoning).toBe(effort);
+    expect(parsed._chatgptModelFamily).toBe(family);
+    expect(parsed.modelId).toBe("gpt-5.6-sol");
+  }
+  expect(await call("chatgpt-web/gpt-5.6-sol")).toBe(200);
+  expect(seen.at(-1)!.options.reasoning).toBe("high");
+  const keys = seen.map(parsed => parsed._externalRequestIdentity!.requestKey);
+  expect(new Set(keys.slice(1, 4)).size).toBe(3);
+  expect(keys[2]).toBe(keys[6]); // Explicit High and the default are one logical execution.
+  expect(keys[4]).not.toBe(keys[5]); // Pro family is part of routeSlug, not V1 material.
+  expect(await call("chatgpt-web/gpt-5.6-sol", "medium")).toBe(200);
+  expect(seen.at(-1)!._externalRequestIdentity!.requestKey).toBe(keys[1]);
+
+  const beforeRejected = seen.length;
+  for (const [model, effort] of [
+    ["chatgpt-web/gpt-5.6-sol", "low"],
+    ["chatgpt-web/gpt-5.6-sol", "invented"],
+    ["chatgpt-web/gpt-5.6-pro", "high"],
+    ["chatgpt-web/gpt-6-pro", "medium"],
+  ]) expect(await call(model!, effort!)).toBe(400);
+  const noXhigh = withExternalClient({ ...externalProviderConfig(), extraHighAvailable: false }, token);
+  expect(await call("chatgpt-web/gpt-5.6-sol", "xhigh", noXhigh)).toBe(400);
+  const noPro = withExternalClient(externalProviderConfig(), token);
+  expect(await call("chatgpt-web/gpt-5.6-pro", "max", noPro)).toBe(400);
+  expect(await call("chatgpt-web/gpt-6-pro", "max", noPro)).toBe(400);
+  expect(seen).toHaveLength(beforeRejected);
+});
+
+test("legacy external slugs keep their fixed binding only for matching effort", async () => {
+  isolatedEnvironment();
+  const token = generateExternalClientToken();
+  const config = withExternalClient({ ...externalProviderConfig(), proAvailable: true }, token);
+  const seen: CodexParsedRequest[] = [];
+  const factory = () => emittingAdapter("legacy-route-spy", parsed => seen.push(parsed));
+  for (const [model, effort, resolved] of [
+    ["chatgpt-web/medium", "medium", "medium"],
+    ["chatgpt-web/pro", "max", "max"],
+    ["chatgpt-web/pro", "ultra", "max"],
+  ]) {
+    const response = await responseRequest(inProcessRequest(responsesBody(model, {
+      stream: false, reasoning: { effort },
+    }), clientHeaders(token)), config, factory);
+    expect(response.status).toBe(200);
+    expect(seen.at(-1)!.options.reasoning).toBe(resolved);
+    expect(seen.at(-1)!._chatgptModelFamily).toBeUndefined();
+  }
+  const before = seen.length;
+  for (const effort of ["low", "xhigh", "invented"]) {
+    const response = await responseRequest(inProcessRequest(responsesBody("chatgpt-web/medium", {
+      reasoning: { effort },
+    }), clientHeaders(token)), config, factory);
+    expect(response.status).toBe(400);
+  }
+  expect(seen).toHaveLength(before);
+});
+
+test("external route admission parses after authentication and rejects local continuation", async () => {
   isolatedEnvironment();
   const token = generateExternalClientToken();
   const config = withExternalClient(externalProviderConfig(), token);
@@ -439,7 +531,8 @@ test("legacy header-absent behavior is unchanged", async () => {
     const catalog = await models.json() as { models: Array<{ slug: string }> };
     expect(models.status).toBe(200);
     expect(catalog.models.filter(model => model.slug.startsWith("chatgpt-web/")).map(model => model.slug))
-      .toEqual(["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high"]);
+      .toEqual(["chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
+        "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high"]);
   });
 });
 

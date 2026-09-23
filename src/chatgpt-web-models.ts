@@ -504,7 +504,7 @@ export function isChatGptWebRouteAvailableToExternalClient(
   if (capabilities.browserInteractionMode === "manual") return false;
   if (capabilities.solAvailable !== true) return false;
   if (route.interactionMode !== "automatic") return false;
-  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) return false;
+  if (route.backendModel !== CHATGPT_WEB_BACKEND_MODEL) return false;
   if (route.requiresPro && !capabilities.proAvailable) return false;
   if (route.requiresExtraHigh && capabilities.extraHighAvailable !== true) return false;
   return true;

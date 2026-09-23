@@ -325,7 +325,7 @@ test("D and E - changed input and second client each start a fresh browser turn"
   expect(submissions).toHaveLength(3);
 });
 
-test("F - incoming reasoning max on medium still executes at resolved medium effort", async () => {
+test("F - unrelated incoming effort on a legacy route is rejected before browser execution", async () => {
   isolatedEnvironment();
   chatGptTurnSessions.clear();
   submissions.length = 0;
@@ -337,10 +337,8 @@ test("F - incoming reasoning max on medium still executes at resolved medium eff
     reasoning: { effort: "max", summary: "auto" },
   });
   const { status } = await externalJson(body, config, token);
-  expect(status).toBe(200);
-  expect(submissions).toHaveLength(1);
-  expect(submissions[0]!.reasoning).toBe("medium");
-  expect(submissions[0]!.modelId).toBe("gpt-5.6-sol");
+  expect(status).toBe(400);
+  expect(submissions).toHaveLength(0);
 });
 
 test("G - verbosity and output format travel the existing parser and serializer path", async () => {
@@ -414,6 +412,52 @@ test("full-history second turn starts a fresh browser turn without retained conv
   expect(submissions).toHaveLength(2);
   expect(submissions[1]!.retainConversation).toBeFalsy();
   expect(submissions[1]!.prepareResume).toBe(false);
+});
+
+test("both Responses compaction forms fail closed before browser and native environment work", async () => {
+  isolatedEnvironment();
+  chatGptTurnSessions.clear();
+  submissions.length = 0;
+  seenParsed.length = 0;
+  spyEnvironmentStore();
+  spyBroker();
+  try {
+    const token = generateExternalClientToken();
+    const config = withExternalClient(externalProviderConfig(), token);
+    const metadata = {
+      request_kind: "compaction",
+      thread_id: "thread_spoof",
+      turn_id: "turn_spoof",
+      compaction: { implementation: "responses", strategy: "memento" },
+    };
+    const bodies = [
+      responsesBody("chatgpt-web/gpt-5.6-sol", {
+        input: [{ type: "compaction_trigger" }],
+      }),
+      responsesBody("chatgpt-web/gpt-5.6-sol", {
+        client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) },
+      }),
+    ];
+    for (const body of bodies) {
+      const bound: unknown[] = [];
+      const response = await responseRequest(
+        inProcessRequest(body, clientHeaders(token)), config, observingAdapterFactory,
+        { onTurnIdentity: identity => bound.push(identity) },
+      );
+      const text = await response.text();
+      expect(response.status).toBe(501);
+      expect(text).toContain("Authenticated external-client compaction is not supported");
+      expect(bound).toEqual([]);
+    }
+    expect(submissions).toHaveLength(0);
+    expect(seenParsed).toHaveLength(0);
+    expect(resolveCalls).toHaveLength(0);
+    expect(brokerCalls).toHaveLength(0);
+    expect(chatGptTurnSessions.activeCount()).toBe(0);
+  } finally {
+    restoreEnvironmentStore();
+    restoreBroker();
+  }
 });
 
 test("tool-bearing external requests fail closed with 501 and never start the worker", async () => {

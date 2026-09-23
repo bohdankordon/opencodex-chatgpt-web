@@ -693,35 +693,12 @@ async function externalClientReadOnlyResponse(
   config: AppConfig,
   authority: AuthenticatedExternalClientAuthority,
   raw: unknown,
+  parsed: CodexParsedRequest,
+  execRoute: ChatGptWebModelRoute,
   adapterFactory: ChatGptWebAdapterFactory,
   options: ResponseRequestOptions,
 ): Promise<Response> {
-  if (hasExternalPreviousResponseId(raw)) {
-    return formatErrorResponse(400, "invalid_request_error", EXTERNAL_CLIENT_PREVIOUS_RESPONSE_MESSAGE);
-  }
-  let parsed: CodexParsedRequest;
-  try {
-    parsed = parseRequest(raw);
-  } catch (error) {
-    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
-  }
-  if (parsed._opaqueMultiAgentV2Payload) {
-    return formatErrorResponse(
-      400,
-      "invalid_request_error",
-      "ChatGPT Web cannot read this encrypted cross-backend subagent payload. Start a new Compatibility V1 task.",
-    );
-  }
-  if (isExternalToolBearingRequest(parsed, raw)) {
-    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_TOOLS_DISABLED_MESSAGE);
-  }
-  const routeSlug = parsed.modelId;
-  let execRoute: ChatGptWebModelRoute;
-  try {
-    execRoute = routeChatGptWebRequest(parsed, config);
-  } catch (error) {
-    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
-  }
+  const routeSlug = (raw as { model: string }).model;
   const provider = providerConfig(config);
   const holder = raw !== null && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { input?: unknown }).input
@@ -812,9 +789,8 @@ async function externalClientReadOnlyResponse(
 /**
  * Route admission for an authenticated external client, then read-only execution.
  *
- * Only route information may influence the result at this point, and compatibility is decided by
- * the reviewed shared predicate rather than by a second allowlist. Nothing here expands
- * continuation state, parses the Responses semantic body, or touches the turn-session registry.
+ * Authentication has already completed. Parse once and resolve the caller's effort with the
+ * same trusted route resolver used by execution before constructing a browser adapter.
  */
 async function externalClientRouteAdmission(
   req: Request,
@@ -834,16 +810,44 @@ async function externalClientRouteAdmission(
         : "A model is required for an authenticated external client",
     );
   }
+  if (hasExternalPreviousResponseId(raw)) {
+    return formatErrorResponse(400, "invalid_request_error", EXTERNAL_CLIENT_PREVIOUS_RESPONSE_MESSAGE);
+  }
+  let parsed: CodexParsedRequest;
+  try {
+    parsed = parseRequest(raw);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  if (parsed._compactionRequest) {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE);
+  }
+  if (parsed._opaqueMultiAgentV2Payload) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "ChatGPT Web cannot read this encrypted cross-backend subagent payload. Start a new Compatibility V1 task.",
+    );
+  }
+  if (isExternalToolBearingRequest(parsed, raw)) {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_TOOLS_DISABLED_MESSAGE);
+  }
+  const wireEffort = (raw as { reasoning?: { effort?: unknown } }).reasoning?.effort;
+  // The shared parser normalizes known efforts (including ultra -> max). Preserve an unknown
+  // explicit string for the route resolver to reject instead of silently using its default.
+  if (typeof wireEffort === "string" && parsed.options.reasoning === undefined) parsed.options.reasoning = wireEffort;
   let route: ChatGptWebModelRoute;
   try {
-    route = requireChatGptWebModelRoute(requestedModel, config);
-  } catch {
+    route = routeChatGptWebRequest(parsed, config);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  if (!isChatGptWebRouteAvailableToExternalClient(route, config)
+    || (!route.supportedCodexEfforts && wireEffort !== undefined
+      && wireEffort !== route.codexEffort && wireEffort !== route.adapterEffort)) {
     return externalClientRouteRejection(requestedModel);
   }
-  if (!isChatGptWebRouteAvailableToExternalClient(route, config)) {
-    return externalClientRouteRejection(requestedModel);
-  }
-  return externalClientReadOnlyResponse(req, config, authority, raw, adapterFactory, options);
+  return externalClientReadOnlyResponse(req, config, authority, raw, parsed, route, adapterFactory, options);
 }
 
 export async function responseRequest(

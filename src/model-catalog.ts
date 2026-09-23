@@ -39,8 +39,8 @@ export function buildExternalProviderModelCatalog(
     : available;
   const models = routes.map(route => {
     const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config);
-    const supportsTools = config.mode === "full";
-    const supportsCompact = route.backendModel !== CHATGPT_WEB_LUNA_BACKEND_MODEL;
+    const supportsTools = profile !== "external-client" && config.mode === "full";
+    const supportsCompact = profile !== "external-client" && route.backendModel !== CHATGPT_WEB_LUNA_BACKEND_MODEL;
     const inputModalities = route.interactionMode === "manual" ? ["text"] : ["text", "image"];
     const capabilities = ["reasoning", ...(supportsTools ? ["tools"] : []), ...(supportsCompact ? ["compact"] : [])];
     return {
