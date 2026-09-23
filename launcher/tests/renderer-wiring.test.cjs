@@ -589,6 +589,9 @@ test("fresh-conversation IPC commits only after setup succeeds and refuses activ
     const syncSource = electronMain.slice(electronMain.indexOf("function syncFreshConversationPreference("), electronMain.indexOf("function registerIpc("));
     vm.runInNewContext(syncSource + source, {
       handle: (_channel, callback) => { handler = callback; }, browserHost,
+      extractRequestedIntegrationMode: options => options?.integrationMode,
+      resolveSetupOwnership: () => ({ integrationMode: "direct", expectation: {} }),
+      createRepairRuntimeValidation: () => async () => {},
       releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
       runtimeHost: { currentOperation: () => null, runtimeConfigSnapshot: () => ({ config }), [method]: async enabled => {
         calls++;
@@ -635,12 +638,19 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   let config = { browserInteractionMode: "automatic", experimentalFreshConversationPerTurn: true };
   const runtimeHost = {
     currentOperation: () => null,
+    assertOwnershipExpectationCurrent() {},
     runtimeConfigSnapshot: () => ({ config }), browserConnectorName: () => "Codex Native2",
     setupConnectorName: () => "Codex Native2", mcpCredentialsConfigured: () => true,
     setBrowserInteractionMode: async mode => { config.browserInteractionMode = mode; return { configured: true }; },
   };
   const sandbox = {
     handle: (name, handler) => handlers.set(name, handler), runtimeHost,
+    getIntegrationInstallationState: () => "configured",
+    extractRequestedIntegrationMode: options => options?.integrationMode,
+    resolveSetupOwnership: () => ({ integrationMode: "direct", expectation: {} }),
+    createRepairRuntimeValidation: () => async () => {},
+    composeAfterRuntimeReady: (first, second) => async () => { await first?.(); await second?.(); },
+    repairCompletionPatch: (_ownership, patch) => patch,
     releaseRetainedConversation: require("../electron/retained-turn-release.cjs").releaseRetainedConversation,
     stateStore: { read: () => ({ ...state }), update: patch => Object.assign(state, patch) },
     browserHost: { activeTraceId: null, turnTabs: new Map(), currentOperation: () => null, snapshot: () => ({}),

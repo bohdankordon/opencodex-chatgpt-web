@@ -3353,6 +3353,9 @@ test("off-on-off fresh conversation changes retire completed history before it c
       main.slice(main.indexOf(`handle("${channel}",`),
       main.indexOf(`handle("${nextChannel}",`)), {
       handle: (_channel, callback) => { handler = callback; }, browserHost: fixture, releaseRetainedConversation,
+      extractRequestedIntegrationMode: options => options?.integrationMode,
+      resolveSetupOwnership: () => ({ integrationMode: "direct", expectation: {} }),
+      createRepairRuntimeValidation: () => async () => {},
       runtimeHost: { currentOperation: () => null, runtimeConfigSnapshot: () => ({ config }), [method]: async enabled => {
         if (failSetup) throw new Error("setup rejected");
         await new Promise(resolve => { commit = resolve; });

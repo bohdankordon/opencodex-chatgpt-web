@@ -18,10 +18,12 @@ test("operation set is closed and rejects arbitrary strings", () => {
   assert.deepEqual([...SETUP_OPERATIONS].sort(), [
     "bigger-context",
     "browser-interaction-mode",
+    "fresh-conversation-per-turn",
     "runtime-upgrade",
     "setup-core",
     "setup-mcp",
     "skill-attachments",
+    "use-saved-chats",
     "zero-risk-pro",
   ]);
   for (const bad of [undefined, null, "", "setup", "Setup-Core", "uninstall", "route-connect", 42, ["setup-core"]]) {
@@ -39,6 +41,8 @@ test("direct production policy preserves the exact replace-route matrix", () => 
     "setup-mcp": true,
     "bigger-context": true,
     "skill-attachments": true,
+    "fresh-conversation-per-turn": true,
+    "use-saved-chats": true,
     "zero-risk-pro": true,
     "browser-interaction-mode": true,
     "runtime-upgrade": false,

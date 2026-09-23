@@ -38,7 +38,7 @@ export function buildExternalProviderModelCatalog(config: AppConfig): JsonObject
       supports_tools: supportsTools,
       supports_reasoning: true,
       supports_compact: supportsCompact,
-      reasoning_efforts: [route.codexEffort],
+      reasoning_efforts: [...chatGptWebRouteEfforts(route, config)],
       default_reasoning_effort: route.codexEffort,
     } satisfies JsonObject;
   });

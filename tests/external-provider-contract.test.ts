@@ -96,9 +96,8 @@ test("external-provider model lists do not call native Codex and omit unavailabl
   expect(response.status).toBe(200);
   const body = await response.json() as { data: Array<{ id: string; capabilities?: string[] }> };
   expect(body.data.map(model => model.id)).toEqual([
-    "chatgpt-web/light",
-    "chatgpt-web/medium",
-    "chatgpt-web/high",
+    "chatgpt-web/gpt-5.6-sol-instant",
+    "chatgpt-web/gpt-5.6-sol",
   ]);
   expect(body.data.every(model => model.capabilities?.includes("tools") !== true)).toBe(true);
 });
@@ -110,10 +109,30 @@ test("external-provider Full catalogs advertise tools and compact only for suppo
   const catalog = buildExternalProviderModelCatalog(config) as {
     data: Array<{ id: string; capabilities: string[]; context_window: number }>;
   };
-  expect(catalog.data.map(model => model.id)).toContain("chatgpt-web/pro");
-  expect(catalog.data.find(model => model.id === "chatgpt-web/high")?.capabilities).toEqual(
+  expect(catalog.data.map(model => model.id)).toContain("chatgpt-web/gpt-5.6-pro");
+  expect(catalog.data.find(model => model.id === "chatgpt-web/gpt-5.6-sol")?.capabilities).toEqual(
     expect.arrayContaining(["tools", "compact", "reasoning"]),
   );
+});
+
+test("external-provider catalog groups account-supported effort without advertising legacy routes", () => {
+  const config = defaultConfig("browser-only");
+  config.integrationMode = "external-provider";
+  config.extraHighAvailable = false;
+  const catalog = buildExternalProviderModelCatalog(config) as {
+    data: Array<{ id: string; reasoning_efforts: string[]; default_reasoning_effort: string }>;
+  };
+  expect(catalog.data.map(model => model.id)).toEqual([
+    "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
+  ]);
+  expect(catalog.data.find(model => model.id === "chatgpt-web/gpt-5.6-sol")?.reasoning_efforts)
+    .toEqual(["medium", "high"]);
+  expect(catalog.data.find(model => model.id === "chatgpt-web/gpt-5.6-sol")?.default_reasoning_effort)
+    .toBe("high");
+  config.extraHighAvailable = true;
+  expect((buildExternalProviderModelCatalog(config) as typeof catalog).data
+    .find(model => model.id === "chatgpt-web/gpt-5.6-sol")?.reasoning_efforts)
+    .toEqual(["medium", "high", "xhigh"]);
 });
 
 test("external-provider Responses reject unknown models instead of native fallback", async () => {

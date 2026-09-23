@@ -543,16 +543,19 @@ function loadSnapshotHandler(canonical) {
   const handlers = {};
   const sandbox = {
     ipcMain: {},
+    send() {},
     registerLoggedIpc: (_ipcMain, _logger, channel, handler) => { handlers[channel] = handler; },
     readIntegrationInstallationState,
     runtimeSupervisor: { readSetupConfig: () => canonical.value },
     runtimeHost: {
       supervisor: { readSetupConfig: () => canonical.value },
+      currentOperation: () => null,
+      runtimeConfigSnapshot: () => ({ config: canonical.value }),
       browserConnectorName: () => "Codex",
       setupConnectorName: () => "Codex Zero Risk",
       mcpCredentialsConfigured: () => false,
     },
-    browserHost: { snapshot: () => null },
+    browserHost: { snapshot: () => null, turnTabs: new Map() },
     LAUNCHER_PROFILE: { kind: "production", codexHome: "C:/codex" },
     CORE_HOME: "C:/core",
     launcherUserData: "C:/user-data",
@@ -570,7 +573,7 @@ function loadSnapshotHandler(canonical) {
   const registerIpc = vm.runInNewContext(source, sandbox);
   registerIpc({
     logger: { recent: () => [] },
-    stateStore: { read: () => ({ version: 1, language: null }) },
+    stateStore: { read: () => ({ version: 1, language: null }), update: patch => ({ version: 1, language: null, ...patch }) },
   });
   return handlers["launcher:snapshot"];
 }
