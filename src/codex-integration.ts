@@ -45,6 +45,7 @@ import {
   textFormat,
 } from "./codex-integration-document";
 import {
+  assertBuiltinModelProvider,
   assertPreservedPreviousAssignments,
   assertPreservedPreviousRealtimeAssignment,
   installRoute,
@@ -300,7 +301,10 @@ export function preflightCodexIntegration(
       );
       return;
     }
-    if (existing.version === 10) return;
+    if (existing.version === 10) {
+      assertBuiltinModelProvider(currentText);
+      return;
+    }
     const baseline = managedJournalIsActive(existing)
       ? restoreManagedRoute(currentText, existing)
       : currentText;

@@ -1,4 +1,5 @@
 import languages from "../electron/languages.json";
+import type { LimitsSnapshot } from "./limits-types";
 
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
@@ -19,7 +20,7 @@ export type LauncherInstallationState = "missing" | "configured" | "damaged";
 export interface IntegrationModeOption {
   integrationMode?: LauncherIntegrationMode;
 }
-export type Surface = "browser" | "setup" | "mcp" | "activity" | "settings";
+export type Surface = "browser" | "setup" | "mcp" | "activity" | "limits" | "settings";
 
 export interface LauncherState {
   version: 1;
@@ -33,6 +34,8 @@ export interface LauncherState {
   browserInteractionMode: BrowserInteractionMode;
   experimentalBiggerContext: boolean;
   experimentalSkillAttachments: boolean;
+  experimentalFreshConversationPerTurn: boolean;
+  useSavedChats: boolean;
   zeroRiskProEnabled: boolean;
   sidebarOpen: boolean;
   sidebarWidth: number;
@@ -141,6 +144,8 @@ export interface LauncherSnapshot {
 
 export interface LauncherApi {
   snapshot(): Promise<LauncherSnapshot>;
+  getLimits(): Promise<LimitsSnapshot>;
+  setupLimits(): Promise<LimitsSnapshot>;
   setLanguage(language: Language): Promise<LauncherState>;
   openSocial(target: "github" | "x"): Promise<LauncherState>;
   completeOnboarding(language: Language, browserInteractionMode: BrowserInteractionMode): Promise<LauncherState>;
@@ -177,6 +182,8 @@ export interface LauncherApi {
   setAutostart(enabled: boolean): Promise<{ state: LauncherState; supported: boolean; enabled: boolean }>;
   setBiggerContext(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
   setSkillAttachments(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
+  setFreshConversationPerTurn(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
+  setUseSavedChats(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
   setZeroRiskPro(enabled: boolean, options?: IntegrationModeOption): Promise<LauncherState>;
   setBrowserInteractionMode(mode: BrowserInteractionMode, options?: IntegrationModeOption): Promise<{
     state: LauncherState;
