@@ -1,5 +1,6 @@
-import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
+import { chatGptWebExecutionNamespace, chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
+import { buildExternalExecutionContract, buildExternalRequestIdentity } from "./adapters/chatgpt-web/external-identity";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
@@ -20,6 +21,14 @@ import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./
 import type { AppConfig } from "./config";
 import { isExternalProviderMode, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
+import {
+  dummyTimingSafeCompare,
+  findExternalClient,
+  parseBearerToken,
+  readExternalClientHeader,
+  verifyExternalClientToken,
+  type ExternalClientHeaderState,
+} from "./external-client";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
 import { createHash } from "node:crypto";
@@ -32,6 +41,7 @@ import {
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   isChatGptWebModelSlug,
+  isChatGptWebRouteAvailableToExternalClient,
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
@@ -45,7 +55,12 @@ import {
 } from "./responses/compaction";
 import { parseRequest } from "./responses/parser";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
-import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
+import {
+  namespacedToolName,
+  type AdapterEvent,
+  type CodexParsedRequest,
+  type RequestAuthority,
+} from "./types";
 import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
@@ -393,7 +408,15 @@ export async function modelsRequest(
   onFailure?: (failure: ModelCatalogFailure) => void,
 ): Promise<Response> {
   if (isExternalProviderMode(config)) {
-    const catalog = buildExternalProviderModelCatalog(config);
+    // Catalog presentation only. Any dedicated client header selects the external-client
+    // presentation, and its validity is deliberately not consulted: model discovery is not an
+    // authorization decision, so nothing here reads externalClients, verifies a token, or looks
+    // at Authorization.
+    const externalClientHeader = readExternalClientHeader(req.headers);
+    const catalog = buildExternalProviderModelCatalog(
+      config,
+      externalClientHeader.present ? "external-client" : "legacy",
+    );
     const body = JSON.stringify(catalog);
     return new Response(body, {
       status: 200,
@@ -403,6 +426,11 @@ export async function modelsRequest(
       },
     });
   }
+  // Direct mode has no external-client lifecycle. Any dedicated header fails closed here, before
+  // the native models request, so neither the client id nor an external token can be forwarded
+  // into the native Codex trust domain. No credential is validated and no client id is inspected,
+  // so this cannot become a credential oracle.
+  if (readExternalClientHeader(req.headers).present) return externalClientAuthFailure();
   let upstream: Response;
   let sent = false;
   try {
@@ -516,6 +544,312 @@ function externalProviderTurnMetadataError(
   );
 }
 
+/** One generic message for every external-client authentication failure, whatever its cause. */
+const EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE = "External client authentication failed";
+/** Read-only Phase F1 gate message for authenticated external requests that carry tool capability or continuation state. */
+const EXTERNAL_CLIENT_TOOLS_DISABLED_MESSAGE = "Authenticated external-client tool execution is not enabled yet";
+/** Authenticated external requests always send complete history; bridge-local continuation is never used for them. */
+const EXTERNAL_CLIENT_PREVIOUS_RESPONSE_MESSAGE = "Authenticated external clients must send complete input history and cannot use previous_response_id";
+const EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE = "Authenticated external-client compaction is not supported";
+const EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE = "Authenticated external-client native search is not supported";
+const EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE = "Authenticated external-client native image requests are not supported";
+
+/** The single response construction path shared by every external authentication failure. */
+function externalClientAuthFailure(): Response {
+  return formatErrorResponse(401, "authentication_error", EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE);
+}
+
+/**
+ * Deterministic "this build does not support the operation for an authenticated external client"
+ * answer, used by every native-capable endpoint. Built directly rather than through
+ * formatErrorResponse because the shared classifier maps every 5xx onto
+ * server_error/upstream_server_error, which would advertise a failed upstream instead of an
+ * operation this build does not support yet.
+ */
+function externalClientUnsupportedResponse(message: string): Response {
+  return new Response(
+    JSON.stringify({ error: { message, type: "unsupported_operation", code: "unsupported_operation" } }),
+    { status: 501, headers: { "Content-Type": "application/json" } },
+  );
+}
+
+function externalClientRouteRejection(model: string): Response {
+  return formatErrorResponse(
+    400,
+    "model_not_found",
+    `Model ${model} is not available to an authenticated external client`,
+  );
+}
+
+/** The authority an authenticated external client request carries; never contains the secret. */
+type AuthenticatedExternalClientAuthority = Extract<
+  RequestAuthority,
+  { admissionClass: "authenticated-external" }
+>;
+
+/**
+ * Result of classifying one request against the dedicated external-client header.
+ *
+ * "absent" means the request is a legacy request and the caller continues its existing path;
+ * "rejected" carries the one shared flat 401 every external authentication failure uses; and
+ * "authenticated" carries external authority for the endpoint to answer with.
+ */
+type ExternalClientAuthentication =
+  | { readonly kind: "absent" }
+  | { readonly kind: "rejected"; readonly response: Response }
+  | { readonly kind: "authenticated"; readonly authority: AuthenticatedExternalClientAuthority };
+
+/**
+ * The single external-client authentication primitive.
+ *
+ * Every endpoint that can reach a native Codex boundary calls this before doing native work, so the
+ * dedicated header can never leak into a native passthrough path. Direct mode fails closed before
+ * any credential work, and every credential shape answers with the same flat 401, so the response
+ * reveals nothing about client existence, token shape, route availability, or integration mode.
+ */
+function authenticateExternalClientRequest(
+  req: Request,
+  config: AppConfig,
+  headerState?: ExternalClientHeaderState,
+): ExternalClientAuthentication {
+  const header = headerState ?? readExternalClientHeader(req.headers);
+  if (!header.present) return { kind: "absent" };
+  if (!isExternalProviderMode(config)) return { kind: "rejected", response: externalClientAuthFailure() };
+  const presented = parseBearerToken(req.headers.get("authorization"));
+  if (!header.valid) {
+    dummyTimingSafeCompare(presented ?? "");
+    return { kind: "rejected", response: externalClientAuthFailure() };
+  }
+  if (presented === undefined) return { kind: "rejected", response: externalClientAuthFailure() };
+  const record = findExternalClient(config.externalClients, header.clientId);
+  if (!record) {
+    dummyTimingSafeCompare(presented);
+    return { kind: "rejected", response: externalClientAuthFailure() };
+  }
+  if (!verifyExternalClientToken(record, presented)) {
+    return { kind: "rejected", response: externalClientAuthFailure() };
+  }
+  return {
+    kind: "authenticated",
+    authority: {
+      admissionClass: "authenticated-external",
+      client: { kind: "external-client", clientId: record.id },
+    },
+  };
+}
+
+/**
+ * Authenticated external tool gate (Phase F1 read-only boundary).
+ *
+ * Phase F1 executes only requests with no external tool capability or tool-loop
+ * continuation state. Anything tool-bearing fails closed here before any adapter,
+ * session, browser, broker, or environment work begins.
+ */
+function externalWireInputHasToolOutput(input: unknown): boolean {
+  if (!Array.isArray(input)) return false;
+  for (const item of input) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) continue;
+    const wireType = (item as { type?: unknown }).type;
+    if (wireType === "function_call_output" || wireType === "custom_tool_call_output" || wireType === "tool_search_output") return true;
+  }
+  return false;
+}
+
+function isExternalToolBearingRequest(parsed: CodexParsedRequest, raw: unknown): boolean {
+  const tools = parsed.context.tools;
+  if (tools !== undefined && tools.length > 0) return true;
+  for (const message of parsed.context.messages) {
+    if (message.role === "toolResult") return true;
+    if (message.role === "assistant") {
+      for (const part of message.content) {
+        if (part.type === "toolCall") return true;
+      }
+    }
+  }
+  const holder = raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as { input?: unknown }).input
+    : undefined;
+  return externalWireInputHasToolOutput(holder);
+}
+
+function hasExternalPreviousResponseId(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const value = (raw as { previous_response_id?: unknown }).previous_response_id;
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+}
+/**
+ * Authenticated external read-only execution (Phase F1).
+ *
+ * Runs only after external authentication and route admission succeed. Previous-response
+ * continuation is rejected, tool-bearing requests fail closed, and everything else
+ * executes through the ChatGPT Web adapter under request-scoped external identity with
+ * timestamp-free wire input. No local continuation state is created.
+ */
+async function externalClientReadOnlyResponse(
+  req: Request,
+  config: AppConfig,
+  authority: AuthenticatedExternalClientAuthority,
+  raw: unknown,
+  parsed: CodexParsedRequest,
+  execRoute: ChatGptWebModelRoute,
+  adapterFactory: ChatGptWebAdapterFactory,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  const routeSlug = (raw as { model: string }).model;
+  const provider = providerConfig(config);
+  const holder = raw !== null && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as { input?: unknown }).input
+    : undefined;
+  const contract = buildExternalExecutionContract({
+    clientId: authority.client.clientId,
+    routeSlug,
+    adapterEffort: execRoute.interactionMode === "automatic" ? execRoute.adapterEffort : execRoute.codexEffort,
+    hideThinkingSummary: parsed.options.hideThinkingSummary === true,
+    verbosity: parsed.options.verbosity,
+    outputFormat: parsed.options.outputFormat,
+    systemPrompt: parsed.context.systemPrompt ?? [],
+    tools: parsed.context.tools,
+    expandedInput: holder,
+  });
+  const identity = buildExternalRequestIdentity(chatGptWebExecutionNamespace(provider), contract);
+  parsed._externalRequestIdentity = identity;
+  const cancelledError = chatGptTurnSessions.cancelledError(identity.traceId);
+  if (cancelledError) {
+    return new Response(JSON.stringify({
+      error: {
+        type: "client_closed_request",
+        code: "client_cancelled",
+        message: cancelledError.message,
+      },
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  const adapter = adapterFactory(provider);
+  const queue = new AsyncEventQueue<AdapterEvent>();
+  const abort = new AbortController();
+  if (req.signal.aborted) abort.abort();
+  else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
+  const run = async () => {
+    try {
+      await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: abort.signal }, event => {
+        options.onAdapterEvent?.(event);
+        queue.push(event);
+      });
+    } catch (error) {
+      const event: AdapterEvent = { type: "error", message: error instanceof Error ? error.message : String(error) };
+      options.onAdapterEvent?.(event);
+      queue.push(event);
+    } finally {
+      queue.close();
+    }
+  };
+  const maps = toolBridgeMaps(parsed);
+  if (parsed.stream) {
+    void run();
+    const stream = bridgeToResponsesSSE(
+      queue,
+      routeSlug,
+      maps.toolNsMap,
+      maps.freeformToolNames,
+      maps.toolSearchToolNames,
+      () => abort.abort(),
+      2_000,
+      {
+        hideThinkingSummary: parsed.options.hideThinkingSummary,
+        ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
+          ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
+          : {}),
+      },
+    );
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
+  await run();
+  const events = await queue.collect();
+  const json = buildResponseJSON(events, routeSlug, {
+    hideThinkingSummary: parsed.options.hideThinkingSummary,
+    toolNsMap: maps.toolNsMap,
+    freeformToolNames: maps.freeformToolNames,
+    toolSearchToolNames: maps.toolSearchToolNames,
+  });
+  return Response.json(json);
+}
+
+/**
+ * Route admission for an authenticated external client, then read-only execution.
+ *
+ * Authentication has already completed. Parse once and resolve the caller's effort with the
+ * same trusted route resolver used by execution before constructing a browser adapter.
+ */
+async function externalClientRouteAdmission(
+  req: Request,
+  config: AppConfig,
+  authority: AuthenticatedExternalClientAuthority,
+  requestedModel: unknown,
+  raw: unknown,
+  adapterFactory: ChatGptWebAdapterFactory,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  if (typeof requestedModel !== "string" || !isChatGptWebModelSlug(requestedModel)) {
+    return formatErrorResponse(
+      400,
+      "model_not_found",
+      typeof requestedModel === "string"
+        ? `Model ${requestedModel} is not provided by codex-chatgpt-web`
+        : "A model is required for an authenticated external client",
+    );
+  }
+  if (hasExternalPreviousResponseId(raw)) {
+    return formatErrorResponse(400, "invalid_request_error", EXTERNAL_CLIENT_PREVIOUS_RESPONSE_MESSAGE);
+  }
+  let parsed: CodexParsedRequest;
+  try {
+    parsed = parseRequest(raw);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  if (parsed._compactionRequest) {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE);
+  }
+  if (parsed._opaqueMultiAgentV2Payload) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "ChatGPT Web cannot read this encrypted cross-backend subagent payload. Start a new Compatibility V1 task.",
+    );
+  }
+  if (isExternalToolBearingRequest(parsed, raw)) {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_TOOLS_DISABLED_MESSAGE);
+  }
+  const wireEffort = (raw as { reasoning?: { effort?: unknown } }).reasoning?.effort;
+  // The shared parser normalizes known efforts (including ultra -> max). Preserve an unknown
+  // explicit string for the route resolver to reject instead of silently using its default.
+  if (typeof wireEffort === "string" && parsed.options.reasoning === undefined) parsed.options.reasoning = wireEffort;
+  let route: ChatGptWebModelRoute;
+  try {
+    route = routeChatGptWebRequest(parsed, config);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  if (!isChatGptWebRouteAvailableToExternalClient(route, config)
+    || (!route.supportedCodexEfforts && wireEffort !== undefined
+      && wireEffort !== route.codexEffort && wireEffort !== route.adapterEffort)) {
+    return externalClientRouteRejection(requestedModel);
+  }
+  return externalClientReadOnlyResponse(req, config, authority, raw, parsed, route, adapterFactory, options);
+}
+
 export async function responseRequest(
   req: Request,
   config: AppConfig,
@@ -539,6 +873,15 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
+  // The dedicated header classifies admission before any native authority is read: a
+  // present-invalid header must never fall through to the legacy path, and only the legacy branch
+  // below may extract native Codex identity from the body.
+  const externalClientHeader = readExternalClientHeader(req.headers);
+  const externalAuthentication = authenticateExternalClientRequest(req, config, externalClientHeader);
+  if (externalAuthentication.kind === "rejected") return externalAuthentication.response;
+  if (externalAuthentication.kind === "authenticated") {
+    return externalClientRouteAdmission(req, config, externalAuthentication.authority, requestedModel, raw, adapterFactory, options);
+  }
   let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
   try {
     nativeIdentity = extractCodexTurnIdentityFromBody(raw);
@@ -765,6 +1108,16 @@ export async function compactRequest(
       "invalid_request_error",
       error instanceof Error ? error.message : "Compaction request body must be a JSON object",
     );
+  }
+  // External clients never reach the legacy compact implementation: classification happens before
+  // metadata promotion, native identity extraction, model validation, route resolution, and any
+  // continuation state, so spoofed native metadata cannot bind native authority and no pre-auth
+  // model or metadata oracle exists. Every authenticated external compact request gets the same
+  // unsupported answer whatever it asked for.
+  const externalCompact = authenticateExternalClientRequest(req, config);
+  if (externalCompact.kind === "rejected") return externalCompact.response;
+  if (externalCompact.kind === "authenticated") {
+    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE);
   }
   raw = applyCodexTurnMetadataHeader(raw, req, { headerWins: true });
   let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
@@ -1146,6 +1499,13 @@ export function startServer(
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        // Dedicated external-client traffic never enters a native passthrough boundary: Direct mode
+        // fails closed, and external-provider authenticates before the unsupported answer.
+        const externalSearch = authenticateExternalClientRequest(req, config);
+        if (externalSearch.kind === "rejected") return externalSearch.response;
+        if (externalSearch.kind === "authenticated") {
+          return externalClientUnsupportedResponse(EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE);
+        }
         if (isExternalProviderMode(config)) {
           return formatErrorResponse(501, "unsupported_operation", "Native search is not provided by codex-chatgpt-web in external-provider mode");
         }
@@ -1159,6 +1519,13 @@ export function startServer(
       if (req.method === "POST"
         && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits")) {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        // Same trust-domain gate as search: no image request may carry an external credential or
+        // the dedicated client header into the native Codex boundary.
+        const externalImages = authenticateExternalClientRequest(req, config);
+        if (externalImages.kind === "rejected") return externalImages.response;
+        if (externalImages.kind === "authenticated") {
+          return externalClientUnsupportedResponse(EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE);
+        }
         if (isExternalProviderMode(config)) {
           return formatErrorResponse(501, "unsupported_operation", "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode");
         }

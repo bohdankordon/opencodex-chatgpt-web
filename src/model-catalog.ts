@@ -5,6 +5,7 @@ import {
   chatGptWebRouteEfforts,
   CHATGPT_WEB_MODEL_PREFIX,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
+  isChatGptWebRouteAvailableToExternalClient,
   resolveChatGptWebContextLimits,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
@@ -12,15 +13,34 @@ import {
 type JsonObject = Record<string, unknown>;
 
 /**
+ * How the external-provider catalog is presented. A presentation choice only: it is selected
+ * before any credential is validated and never carries request authority. "external-client" is
+ * the model-discovery view for a caller that identified itself with the dedicated client header;
+ * "legacy" is the unchanged view.
+ */
+export type ModelCatalogProfile =
+  | "legacy"
+  | "external-client";
+
+/**
  * Build the catalog served to an external router. It is intentionally independent from the
  * native Codex catalog: no upstream request or official authentication is needed to enumerate
  * the Web routes that this process can actually serve.
  */
-export function buildExternalProviderModelCatalog(config: AppConfig): JsonObject {
-  const models = availableChatGptWebModelRoutes(config).map(route => {
+export function buildExternalProviderModelCatalog(
+  config: AppConfig,
+  profile: ModelCatalogProfile = "legacy",
+): JsonObject {
+  const available = availableChatGptWebModelRoutes(config);
+  // Both profiles render the same rows through the same mapping below; only route selection
+  // differs, so an unchanged route set stays byte-identical.
+  const routes = profile === "external-client"
+    ? available.filter(route => isChatGptWebRouteAvailableToExternalClient(route, config))
+    : available;
+  const models = routes.map(route => {
     const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, config);
-    const supportsTools = config.mode === "full";
-    const supportsCompact = route.backendModel !== CHATGPT_WEB_LUNA_BACKEND_MODEL;
+    const supportsTools = profile !== "external-client" && config.mode === "full";
+    const supportsCompact = profile !== "external-client" && route.backendModel !== CHATGPT_WEB_LUNA_BACKEND_MODEL;
     const inputModalities = route.interactionMode === "manual" ? ["text"] : ["text", "image"];
     const capabilities = ["reasoning", ...(supportsTools ? ["tools"] : []), ...(supportsCompact ? ["compact"] : [])];
     return {

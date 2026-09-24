@@ -25,6 +25,23 @@ import type { BrokerToolRequest } from "./turn-broker";
 // estimates differ slightly between the prepared browser prompt and later Codex tool rounds.
 const ESTIMATE_TURN_TOKEN = "turn_00000000000000000000000000000000";
 
+/**
+ * Native Luna rolling-checkpoint gate for usage estimation.
+ *
+ * Native thread/turn identity is evaluated lazily: authenticated external
+ * executions fail closed before any native identity helper runs, non-Luna
+ * native requests skip extraction entirely, and Luna compaction turns skip
+ * it as well. Only a native, non-compaction Luna turn with complete native
+ * identity enables checkpoint capture.
+ */
+export function shouldCaptureLunaCheckpoint(parsed: CodexParsedRequest): boolean {
+  if (parsed._externalRequestIdentity !== undefined) return false;
+  if (parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID) return false;
+  if (parsed._compactionRequest) return false;
+  const identity = extractChatGptTurnIdentity(parsed);
+  return Boolean(identity.threadId && identity.turnId);
+}
+
 export interface ChatGptWebRoundEvidence {
   answer?: string;
   reasoning?: string[];
@@ -44,7 +61,6 @@ export function estimateChatGptWebInputTokens(
   const mode = manual
     ? { localTools: true }
     : resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
-  const identity = extractChatGptTurnIdentity(parsed);
   const compiled = compileChatGptWebPrompt(
     parsed,
     capabilities,
@@ -52,9 +68,7 @@ export function estimateChatGptWebInputTokens(
     {
       ...options,
       ...(manual ? { manualControl: true as const } : {}),
-      captureLunaCheckpoint: parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
-        && !parsed._compactionRequest
-        && Boolean(identity.threadId && identity.turnId),
+      captureLunaCheckpoint: shouldCaptureLunaCheckpoint(parsed),
     },
   );
   return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId);

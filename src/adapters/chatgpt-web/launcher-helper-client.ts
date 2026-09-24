@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
+import { ensureHelperObservabilitySink, recordHelperReasoning } from "./helper-observability";
 import type { CompiledChatGptWebPrompt } from "./prompt";
 import type { BrowserTurn, ResolvedBrowserConfig } from "./browser-worker";
 import {
@@ -210,6 +211,9 @@ export class LauncherBrowserHelperClient {
 
   async run(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    // Fail closed before spawn/Send: an explicitly enabled but unusable observability sink
+    // rejects here so acceptance can never mistake misconfiguration for absent reasoning.
+    ensureHelperObservabilitySink();
     await this.ensureChild();
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
@@ -553,6 +557,16 @@ export class LauncherBrowserHelperClient {
         pending.turn.onLunaCheckpoint({ checkpoint: message.checkpoint, answerHash: message.answerHash });
       }
       else if (message.event === "reasoning" && message.text) {
+        // Metadata-only daemon receipt after the parser accepted the frame and before
+        // forwarding it. A receipt failure fails the turn through the existing local
+        // failure path rather than silently dropping evidence (handleLine runs on a
+        // readline event, so it must not throw).
+        try {
+          recordHelperReasoning("daemon_receive", message.id, message.text, message.continuation === true);
+        } catch (error) {
+          this.abortWithLocalFailure(message.id, error instanceof Error ? error : new Error(String(error)), pending);
+          return;
+        }
         pending.turn.onReasoningSummary?.(message.text, message.continuation === true);
       }
       else if (message.event === "commentary" && message.text) pending.turn.onCommentary?.(message.text, message.continuation === true);

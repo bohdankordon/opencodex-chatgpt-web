@@ -1,12 +1,21 @@
 import { expect, test } from "bun:test";
-import { estimateChatGptWebInputTokens, resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
+import {
+  estimateChatGptWebInputTokens,
+  estimateChatGptWebUsage,
+  resolveBiggerContextMultipartParts,
+  shouldCaptureLunaCheckpoint,
+} from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateChatGptWebImageTokens, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/browser-worker";
 import { estimateTokens } from "../src/lib/token-estimate";
+import { CHATGPT_WEB_LUNA_MODEL_ID } from "../src/adapters/chatgpt-web/model";
+import { CHATGPT_LUNA_CHECKPOINT_MARKER } from "../src/adapters/chatgpt-web/rolling-checkpoint";
+import type { ExternalRequestIdentity } from "../src/adapters/chatgpt-web/external-identity";
 import type { CodexParsedRequest } from "../src/types";
 
 const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+const lunaCapabilities = { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false };
 
 function request(text: string): CodexParsedRequest {
   return {
@@ -16,6 +25,148 @@ function request(text: string): CodexParsedRequest {
     options: { reasoning: "high" },
   };
 }
+
+function externalIdentity(): ExternalRequestIdentity {
+  const key = "r".repeat(64);
+  return {
+    requestKey: key,
+    executionKey: "ns:" + key,
+    roundKey: key,
+    retryKey: "ns:" + key,
+    ownerKey: "ns:" + key,
+    traceId: "trace-external",
+  };
+}
+
+function nativeIdentityBody(): Record<string, unknown> {
+  return {
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_native", turn_id: "turn_native" }),
+    },
+  };
+}
+
+/**
+ * Observe native identity-material reads without mocks: extractChatGptTurnIdentity
+ * reaches parsed._rawBody, so a counting getter proves whether the helper ran.
+ * Usage estimation otherwise never touches _rawBody, so a zero count is meaningful.
+ */
+function observableRawBody(parsed: CodexParsedRequest, backing: unknown): () => number {
+  let reads = 0;
+  let value = backing;
+  Object.defineProperty(parsed, "_rawBody", {
+    enumerable: true,
+    configurable: true,
+    get: () => { reads += 1; return value; },
+    set: (next: unknown) => { value = next; },
+  });
+  return () => reads;
+}
+
+test("external Sol usage estimation never evaluates native identity material", () => {
+  const parsed = request("external sol probe");
+  parsed._externalRequestIdentity = externalIdentity();
+  const rawBodyReads = observableRawBody(parsed, nativeIdentityBody());
+  expect(shouldCaptureLunaCheckpoint(parsed)).toBe(false);
+  expect(rawBodyReads()).toBe(0);
+  const inputTokens = estimateChatGptWebInputTokens(parsed, capabilities);
+  expect(Number.isFinite(inputTokens)).toBe(true);
+  expect(rawBodyReads()).toBe(0);
+  const usage = estimateChatGptWebUsage(parsed, { answer: "ok" }, capabilities);
+  expect(usage.inputTokens).toBe(inputTokens);
+  expect(rawBodyReads()).toBe(0);
+});
+
+test("impossible external Luna state fails closed before native identity extraction", () => {
+  const parsed: CodexParsedRequest = {
+    modelId: CHATGPT_WEB_LUNA_MODEL_ID,
+    stream: false,
+    context: { messages: [{ role: "user", content: "external luna probe", timestamp: 1 }] },
+    options: { reasoning: "low" },
+    _externalRequestIdentity: externalIdentity(),
+  };
+  const rawBodyReads = observableRawBody(parsed, nativeIdentityBody());
+  expect(shouldCaptureLunaCheckpoint(parsed)).toBe(false);
+  expect(rawBodyReads()).toBe(0);
+  const inputTokens = estimateChatGptWebInputTokens(parsed, lunaCapabilities);
+  expect(Number.isFinite(inputTokens)).toBe(true);
+  expect(rawBodyReads()).toBe(0);
+});
+
+test("native non-Luna usage estimation skips native identity extraction", () => {
+  const parsed = request("native sol probe");
+  const rawBodyReads = observableRawBody(parsed, nativeIdentityBody());
+  expect(shouldCaptureLunaCheckpoint(parsed)).toBe(false);
+  expect(rawBodyReads()).toBe(0);
+  expect(Number.isFinite(estimateChatGptWebInputTokens(parsed, capabilities))).toBe(true);
+  expect(rawBodyReads()).toBe(0);
+});
+
+test("native Luna checkpoint semantics survive lazy identity extraction", () => {
+  const normal: CodexParsedRequest = {
+    modelId: CHATGPT_WEB_LUNA_MODEL_ID,
+    stream: false,
+    context: { messages: [{ role: "user", content: "native luna probe", timestamp: 1 }] },
+    options: { reasoning: "low" },
+  };
+  const normalReads = observableRawBody(normal, nativeIdentityBody());
+  expect(shouldCaptureLunaCheckpoint(normal)).toBe(true);
+  expect(normalReads()).toBeGreaterThan(0);
+  const estimated = estimateChatGptWebInputTokens(normal, lunaCapabilities);
+  const withCheckpoint = estimateCompiledChatGptWebInputTokens(
+    compileChatGptWebPrompt(normal, lunaCapabilities, undefined, { captureLunaCheckpoint: true }),
+    CHATGPT_WEB_LUNA_MODEL_ID,
+  );
+  const withoutCheckpoint = estimateCompiledChatGptWebInputTokens(
+    compileChatGptWebPrompt(normal, lunaCapabilities, undefined, { captureLunaCheckpoint: false }),
+    CHATGPT_WEB_LUNA_MODEL_ID,
+  );
+  expect(estimated).toBe(withCheckpoint);
+  expect(estimated).not.toBe(withoutCheckpoint);
+  expect(compileChatGptWebPrompt(normal, lunaCapabilities, undefined, { captureLunaCheckpoint: true }).text)
+    .toContain(CHATGPT_LUNA_CHECKPOINT_MARKER);
+
+  const missing: CodexParsedRequest = {
+    modelId: CHATGPT_WEB_LUNA_MODEL_ID,
+    stream: false,
+    context: { messages: [{ role: "user", content: "native luna probe", timestamp: 1 }] },
+    options: { reasoning: "low" },
+    _rawBody: {},
+  };
+  expect(shouldCaptureLunaCheckpoint(missing)).toBe(false);
+  expect(compileChatGptWebPrompt(missing, lunaCapabilities, undefined, { captureLunaCheckpoint: false }).text)
+    .not.toContain(CHATGPT_LUNA_CHECKPOINT_MARKER);
+
+  const compaction: CodexParsedRequest = {
+    modelId: CHATGPT_WEB_LUNA_MODEL_ID,
+    stream: false,
+    context: { messages: [{ role: "user", content: "native luna probe", timestamp: 1 }] },
+    options: { reasoning: "low" },
+    _compactionRequest: true,
+  };
+  const compactionReads = observableRawBody(compaction, nativeIdentityBody());
+  expect(shouldCaptureLunaCheckpoint(compaction)).toBe(false);
+  expect(compactionReads()).toBe(0);
+});
+
+test("native identity extraction in usage.ts lives only behind the Luna/native guard", async () => {
+  const source = await Bun.file(new URL("../src/adapters/chatgpt-web/usage.ts", import.meta.url)).text();
+  const callSites = source.split("extractChatGptTurnIdentity(").length - 1;
+  expect(callSites).toBe(1);
+  const guardStart = source.indexOf("export function shouldCaptureLunaCheckpoint");
+  expect(guardStart).toBeGreaterThanOrEqual(0);
+  const callIndex = source.indexOf("extractChatGptTurnIdentity(");
+  expect(callIndex).toBeGreaterThan(guardStart);
+  const externalGuard = source.indexOf("_externalRequestIdentity", guardStart);
+  const modelGuard = source.indexOf("CHATGPT_WEB_LUNA_MODEL_ID", guardStart);
+  const compactionGuard = source.indexOf("_compactionRequest", guardStart);
+  expect(externalGuard).toBeGreaterThan(guardStart);
+  expect(modelGuard).toBeGreaterThan(guardStart);
+  expect(compactionGuard).toBeGreaterThan(guardStart);
+  expect(externalGuard).toBeLessThan(callIndex);
+  expect(modelGuard).toBeLessThan(callIndex);
+  expect(compactionGuard).toBeLessThan(callIndex);
+});
 
 test.each([
   ["highly compressible", "a".repeat(480_000)],
