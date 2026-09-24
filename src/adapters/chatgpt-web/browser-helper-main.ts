@@ -1,8 +1,10 @@
 import { validateSkillFiles } from "./skill-attachments";
 import { createInterface } from "node:readline";
 import { stdin, stderr, stdout } from "node:process";
+import { writeFileSync } from "node:fs";
 import type { CodexProviderConfig } from "../../types";
 import { ChatGptBrowserWorker, closeChatGptBrowserWorkers, type BrowserTurn } from "./browser-worker";
+import { ensureHelperObservabilitySink, recordHelperReasoning } from "./helper-observability";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "./adapter-error";
 import type { ChatGptWebCapabilities } from "./model";
 import { createProcessLineWriter } from "./process-line-writer";
@@ -289,13 +291,19 @@ async function run(message: RunMessage): Promise<void> {
         throw new Error("Browser helper could not persist multipart acknowledgement evidence");
       }
     },
-    onReasoningSummary: (text, continuation) => writeProtocol({
-      type: "event",
-      id: message.id,
-      event: "reasoning",
-      text,
-      ...(continuation ? { continuation: true } : {}),
-    }),
+    onReasoningSummary: (text, continuation) => {
+      // Metadata-only helper observability: record the emission without touching the
+      // protocol frame below, which stays byte/order equivalent. A receipt failure
+      // throws into the worker turn and surfaces as an explicit helper error frame.
+      recordHelperReasoning("helper_emit", message.id, text, continuation === true);
+      return writeProtocol({
+        type: "event",
+        id: message.id,
+        event: "reasoning",
+        text,
+        ...(continuation ? { continuation: true } : {}),
+      });
+    },
     onCommentary: (text, continuation) => writeProtocol({ type: "event", id: message.id, event: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
     onTextDelta: text => writeProtocol({ type: "event", id: message.id, event: "text", text }),
     ...(message.turn.captureLunaCheckpoint ? {
@@ -535,4 +543,16 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
+// Fail closed first: when helper observability is explicitly enabled, `ready` must imply a
+// usable receipt sink, so a real request can never reach Send with unobservable reasoning.
+// A synchronous stderr write guarantees the reason survives the immediate exit below.
+try {
+  ensureHelperObservabilitySink();
+} catch (error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  try {
+    writeFileSync(2, "Browser helper observability is misconfigured: " + detail + "\n");
+  } catch { /* The non-zero exit code is the fail-closed signal. */ }
+  process.exit(1);
+}
 writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack", "skill-attachments"] });

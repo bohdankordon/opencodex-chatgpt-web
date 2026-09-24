@@ -82,6 +82,7 @@ import {
   resolveChatGptWebTransportLimits,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
+import { recordHelperReasoning } from "./helper-observability";
 import { assertChatGptModelFamily, selectChatGptModelFamily } from "./model-selection";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import {
@@ -5257,7 +5258,13 @@ export class ChatGptBrowserWorker {
           })();
           for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
             if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
-            else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
+            else {
+              // Metadata-only helper observability: prove the extraction layer produced
+              // public reasoning before invoking the turn callback. Disabled by default;
+              // when enabled but unusable this throws and fails the turn explicitly.
+              recordHelperReasoning("public_reasoning", turn.traceId, trace.text, trace.continuation === true);
+              turn.onReasoningSummary?.(trace.text, trace.continuation === true);
+            }
           }
           if (textDelta) emitMarkdownDelta(textDelta);
           const domError = domHealthTracker.update({
