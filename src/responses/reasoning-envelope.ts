@@ -21,6 +21,11 @@ export interface ReasoningEnvelope {
    * so replay needs it even though the visible summary was suppressed.
    */
   txt?: string;
+  /**
+   * Visible public summary replay marker. Its text stays in reasoning.summary; this metadata
+   * contains no hidden reasoning and lets clients preserve the item via encrypted_content.
+   */
+  sum?: true;
 }
 
 export function encodeReasoningEnvelope(envelope: ReasoningEnvelope): string {
@@ -33,7 +38,7 @@ export function decodeReasoningEnvelope(encryptedContent: string): ReasoningEnve
   try {
     const parsed: unknown = JSON.parse(Buffer.from(encryptedContent.slice(BRIDGE_REASONING_PREFIX.length), "base64").toString("utf-8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const obj = parsed as { sig?: unknown; red?: unknown };
+    const obj = parsed as { sig?: unknown; red?: unknown; sum?: unknown };
     const envelope: ReasoningEnvelope = {};
     if (typeof obj.sig === "string") envelope.sig = obj.sig;
     if (Array.isArray(obj.red)) {
@@ -42,7 +47,8 @@ export function decodeReasoningEnvelope(encryptedContent: string): ReasoningEnve
     }
     const txt = (parsed as { txt?: unknown }).txt;
     if (typeof txt === "string" && txt.length > 0) envelope.txt = txt;
-    return envelope.sig || envelope.red || envelope.txt ? envelope : null;
+    if (obj.sum === true) envelope.sum = true;
+    return envelope.sig || envelope.red || envelope.txt || envelope.sum ? envelope : null;
   } catch {
     return null;
   }

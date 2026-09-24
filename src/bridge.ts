@@ -294,7 +294,7 @@ export function bridgeToResponsesSSE(
           item_id: currentReasoning.itemId, output_index: currentReasoning.outputIndex, summary_index: 0,
           part: { type: "summary_text", text: currentReasoning.text },
         });
-        const encrypted = takeReasoningEnvelope();
+        const encrypted = takeReasoningEnvelope() ?? encodeReasoningEnvelope({ sum: true });
         const item = {
           type: "reasoning", id: currentReasoning.itemId,
           summary: [{ type: "summary_text", text: currentReasoning.text }],
@@ -904,7 +904,9 @@ export function buildResponseJSON(
     if (batchRedacted.length > 0) envelope.red = batchRedacted;
     const hidden = options?.hideThinkingSummary === true;
     if (hidden && currentSummaryReasoning && (envelope.sig || envelope.red)) envelope.txt = currentSummaryReasoning;
-    const encrypted = envelope.sig || envelope.red || envelope.txt ? encodeReasoningEnvelope(envelope) : undefined;
+    if (!hidden && currentSummaryReasoning && !envelope.sig && !envelope.red) envelope.sum = true;
+    const encrypted = envelope.sig || envelope.red || envelope.txt || envelope.sum
+      ? encodeReasoningEnvelope(envelope) : undefined;
     batchSignature = undefined;
     batchRedacted = [];
     if (hidden && !encrypted) { currentSummaryReasoning = ""; return; }
