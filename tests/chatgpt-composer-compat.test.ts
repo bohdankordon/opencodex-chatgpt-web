@@ -63,7 +63,9 @@ function composerPage(
 }
 
 function lunaCapablePage(options: { semanticVisible: boolean; legacyVisible: boolean }) {
-  const effortButton: any = { last: () => effortButton, isVisible: async () => false };
+  // The combined H6 + 6.1 probe scopes the effort control with a visible
+  // filter instead of selecting .last(); the mock exposes both shapes.
+  const effortButton: any = { last: () => effortButton, filter: () => effortButton, isVisible: async () => false };
   const composerForm: any = { count: async () => 1, locator: () => effortButton };
   const total = (options.semanticVisible ? 1 : 0) + (options.legacyVisible ? 1 : 0);
   const combined: any = {
