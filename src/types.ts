@@ -15,8 +15,9 @@ export interface CodexParsedRequest {
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
   /**
-   * Dedicated native compaction, identified by compaction_trigger or canonical responses/memento
-   * metadata. Both run without local tools; their output contracts differ.
+   * Dedicated native compaction, identified by compaction_trigger or text-compatible
+   * responses/memento metadata (native `responses` or routed `responses_compaction_v2`).
+   * Both run without local tools; their output contracts differ.
    */
   _compactionRequest?: boolean;
   /** Native compact.rs expects assistant text; remote v2 (the default) expects a compaction item. */

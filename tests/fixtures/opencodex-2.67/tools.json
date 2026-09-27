@@ -1,0 +1,29 @@
+{
+  "_provenance": "CAPTURED + SOURCE (declaration shapes wire-observed; lowering per OpenCodex 2.67 compat source; call round-trips observed)",
+  "declarations_codex_side": [
+    { "type": "function", "name": "exec_command", "description": "Run a shell command.", "strict": false, "parameters": { "type": "object" } },
+    { "type": "custom", "name": "apply_patch", "description": "Apply a patch envelope.", "format": { "type": "grammar", "syntax": "lark", "definition": "start: begin_patch" } },
+    { "type": "namespace", "name": "clock", "description": "Clock tools.", "tools": [{ "type": "function", "name": "sleep", "description": "Sleep.", "parameters": { "type": "object" } }] },
+    { "type": "tool_search", "execution": "client", "description": "Search for additional tools.", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } }
+  ],
+  "declarations_provider_side": [
+    { "type": "function", "name": "exec_command", "description": "Run a shell command.", "strict": false, "parameters": { "type": "object" } },
+    { "type": "function", "name": "apply_patch", "description": "Apply a patch envelope.", "parameters": { "type": "object", "properties": { "input": { "type": "string", "description": "Raw input for this client-executed custom tool." } }, "required": ["input"], "additionalProperties": false } },
+    { "type": "function", "name": "clock__sleep", "description": "Sleep.", "parameters": { "type": "object" } },
+    { "type": "function", "name": "tool_search", "description": "Search for additional tools.", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } }
+  ],
+  "tool_search_round": [
+    { "type": "tool_search_call", "id": "tsc_s4a_01", "call_id": "tscall_s4a_01", "arguments": { "query": "subagent spawn", "limit": 8 } },
+    { "type": "tool_search_output", "call_id": "tscall_s4a_01", "status": "completed", "tools": [{ "type": "namespace", "name": "subagents", "description": "Subagents.", "tools": [{ "type": "function", "name": "spawn_worker", "description": "Spawn a worker.", "parameters": { "type": "object" } }] }] },
+    { "type": "function_call", "call_id": "call_s4a_spawn_01", "name": "subagents__spawn_worker", "arguments": "{\"task\":\"Summarize.\"}" }
+  ],
+  "function_call_round": [
+    { "type": "function_call", "id": "fc_s4a_01", "call_id": "call_s4a_01", "name": "exec_command", "arguments": "{\"command\":[\"echo\",\"round-0\"]}" },
+    { "type": "function_call_output", "call_id": "call_s4a_01", "output": "round-0" },
+    { "type": "custom_tool_call", "id": "ctc_s4a_01", "call_id": "call_s4a_patch_01", "name": "apply_patch", "input": "*** Begin Patch\n*** Add File: synthetic.txt\n+hello\n*** End Patch" },
+    { "type": "custom_tool_call_output", "call_id": "call_s4a_patch_01", "output": "OK" },
+    { "type": "function_call", "id": "fc_s4a_02", "call_id": "call_s4a_denied_01", "name": "exec_command", "arguments": "{\"command\":[\"echo\",\"denied\"]}" },
+    { "type": "function_call_output", "call_id": "call_s4a_denied_01", "output": "Error: the user denied approval for exec_command (approval_denied)." }
+  ],
+  "_denial_note": "Denials travel as output text; the parser surfaces them as non-error tool results. Tests assert the text is preserved and document isError:false as a structural limitation."
+}

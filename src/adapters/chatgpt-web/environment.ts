@@ -353,7 +353,13 @@ export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): Chat
 /** A remote compaction may summarize an instruction from an earlier turn. */
 export function extractChatGptCompactionSourceRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision {
   if (!parsed._compactionRequest) throw new Error("ChatGPT web compaction source requires a compaction request");
-  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId);
+  const identity = extractChatGptTurnIdentity(parsed);
+  // A routed compaction turn arrives fully stripped of item ids and turn provenance
+  // (OpenCodex removes them under store:false). Bind its source instruction through the same
+  // trusted native turn authority that stripped normal turns already use; without this the
+  // bridge cannot complete a genuine routed summarizer turn.
+  const revision = latestChatGptTurnUserRevision(parsed, identity.turnId)
+    ?? (identity.turnId ? strippedRoutedUserRevision(parsed, identity.turnId) : undefined);
   if (!revision) throw new Error("ChatGPT web compaction requires a source user message");
   return revision;
 }

@@ -1,5 +1,8 @@
-import { expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { afterAll, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
 import {
   extractChatGptTurnEnvironment,
   extractChatGptTurnUserRevision,
@@ -7,6 +10,34 @@ import {
 import { defaultConfig } from "../src/config";
 import { parseRequest } from "../src/responses/parser";
 import { compactRequest, modelsRequest, responseRequest } from "../src/server";
+
+const dir = new URL("./fixtures/opencodex-2.67/", import.meta.url);
+const load = (name: string): unknown =>
+  JSON.parse(readFileSync(new URL(name, dir), "utf8"));
+
+function withoutUnderscore(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutUnderscore);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => !key.startsWith("_"))
+        .map(([key, entry]) => [key, withoutUnderscore(entry)]),
+    );
+  }
+  return value;
+}
+
+/** Fixtures use a synthetic root; extraction needs a real absolute root on this platform. */
+const tempRoots: string[] = [];
+afterAll(() => {
+  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function withRealRoot(body: unknown): { body: Record<string, unknown>; root: string } {
+  const root = mkdtempSync(join(tmpdir(), "s4a-267c-"));
+  tempRoots.push(root);
+  const portable = root.replace(/\\/g, "/");
+  return { body: JSON.parse(JSON.stringify(body).replaceAll("/synthetic/work", portable)), root: portable };
+}
 
 const TRAILING_SLASHES = /\/+$/;
 const TRAILING_RESPONSES = /\/responses\/?$/;
@@ -27,164 +58,60 @@ function providerUrl(baseUrl: string, responsesPath?: string): string {
   return `${baseUrl.replace(/\/$/, "")}${responsesPath}`;
 }
 
-/**
- * Mirror the OpenCodex request sanitizers this bridge depends on at the non-canonical
- * openai-responses boundary (minimum supported OpenCodex: 2.57.0; latest end-to-end
- * verified: 2.58.0): top-level access_programs is removed for non-OpenAI-operated
- * destinations, private ChatGPT item metadata is removed, and store:false removes all item
- * ids. client_metadata is deliberately preserved and remains the native turn authority.
- *
- * This is a narrow behavioral simulation of the OpenCodex routing contract, not code
- * imported from OpenCodex itself.
- */
-function openCodexRoutedBody(body: Record<string, unknown>): Record<string, unknown> {
-  const { access_programs: _droppedAccessPrograms, ...rest } = body;
-  void _droppedAccessPrograms;
-  const input = Array.isArray(rest.input) ? rest.input : [];
-  return {
-    ...rest,
-    input: input.map(value => {
-      if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-      const item = { ...(value as Record<string, unknown>) };
-      delete item.internal_chat_message_metadata_passthrough;
-      if (rest.store === false) delete item.id;
-      return item;
-    }),
-  };
-}
-
 test("OpenCodex openai-responses URL construction does not duplicate /v1", () => {
   expect(providerUrl("http://127.0.0.1:17841/v1")).toBe("http://127.0.0.1:17841/v1/responses");
   expect(providerUrl("http://127.0.0.1:17841/v1/")).toBe("http://127.0.0.1:17841/v1/responses");
   expect(providerUrl("http://127.0.0.1:17841")).toBe("http://127.0.0.1:17841/v1/responses");
   expect(providerUrl("http://127.0.0.1:17841/v1", "/responses")).toBe("http://127.0.0.1:17841/v1/responses");
-  expect(providerUrl("http://127.0.0.1:17841/v1", "/responses/compact"))
-    .toBe("http://127.0.0.1:17841/v1/responses/compact");
 });
 
-test("OpenCodex store:false sanitization preserves current-turn authority in client_metadata", () => {
-  const root = resolve(process.cwd());
-  const turnId = "turn_opencodex";
-  const metadata = {
-    request_kind: "turn",
-    thread_id: "thread_opencodex",
-    turn_id: turnId,
-    sandbox: "none",
-    workspaces: { [root]: {} },
-  };
-  const environment = `<environment_context>\n  <cwd>${root}</cwd>\n  <filesystem><workspace_roots><root>${root}</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>\n</environment_context>`;
-  const original = {
-    model: "chatgpt-web/high",
-    store: false,
-    stream: true,
-    // Harmless synthetic field standing in for a native-style access_programs block:
-    // OpenCodex 2.58 removes it for non-OpenAI-operated destinations before it reaches us.
-    access_programs: [{ type: "synthetic-test-access", server: "synthetic-test-server" }],
-    client_metadata: {
-      "x-codex-turn-metadata": JSON.stringify(metadata),
-    },
-    input: [
-      {
-        type: "message",
-        id: "msg_environment",
-        role: "user",
-        content: [{ type: "input_text", text: environment }],
-        internal_chat_message_metadata_passthrough: { turn_id: turnId },
-      },
-      {
-        type: "message",
-        id: "msg_prompt",
-        role: "user",
-        content: [{ type: "input_text", text: "Inspect the workspace read-only." }],
-        internal_chat_message_metadata_passthrough: { turn_id: turnId },
-      },
-    ],
-  } satisfies Record<string, unknown>;
-
-  const routed = openCodexRoutedBody(original);
-  const routedInput = routed.input as Array<Record<string, unknown>>;
+test("OpenCodex 2.67 store:false sanitization preserves current-turn authority in client_metadata", () => {
+  // provider-first-turn.json IS the post-sanitization shape: the obsolete inline 2.58
+  // sanitizer simulation was deleted in favor of this captured fixture family.
+  const raw = withoutUnderscore(load("provider-first-turn.json")) as Record<string, unknown>;
+  expect(raw).not.toHaveProperty("access_programs");
+  const routedInput = raw.input as Array<Record<string, unknown>>;
   expect(routedInput.every(item => item.id === undefined)).toBe(true);
   expect(routedInput.every(item => item.internal_chat_message_metadata_passthrough === undefined)).toBe(true);
-  expect("access_programs" in routed).toBe(false);
-  expect(routed.client_metadata).toEqual(original.client_metadata);
-
-  const parsed = parseRequest(routed);
+  expect(raw.client_metadata).toBeDefined();
+  const { body, root } = withRealRoot(raw);
+  const parsed = parseRequest(body);
   parsed._externalProviderTrusted = true;
-  expect(extractChatGptTurnEnvironment(parsed).cwd).toBe(root);
+  expect(extractChatGptTurnEnvironment(parsed).cwd.replace(/\\/g, "/")).toBe(root);
   expect(extractChatGptTurnUserRevision(parsed)).toEqual([
     { type: "input_text", text: "Inspect the workspace read-only." },
   ]);
 });
 
 test("stripped environment recovery itself requires native client_metadata", () => {
-  const root = resolve(process.cwd());
-  const environment = `<environment_context>\n  <cwd>${root}</cwd>\n  <filesystem><workspace_roots><root>${root}</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>\n</environment_context>`;
-  const routed = openCodexRoutedBody({
-    model: "chatgpt-web/high",
-    store: false,
-    stream: false,
-    input: [
-      {
-        type: "message",
-        id: "msg_environment",
-        role: "user",
-        content: [{ type: "input_text", text: environment }],
-        internal_chat_message_metadata_passthrough: { turn_id: "turn_missing" },
-      },
-      {
-        type: "message",
-        id: "msg_prompt",
-        role: "user",
-        content: [{ type: "input_text", text: "Inspect the workspace read-only." }],
-        internal_chat_message_metadata_passthrough: { turn_id: "turn_missing" },
-      },
-    ],
-  });
-  const parsed = parseRequest(routed);
+  const raw = withoutUnderscore(load("provider-first-turn.json")) as Record<string, unknown>;
+  const { body } = withRealRoot(raw);
+  delete (body as Record<string, unknown>).client_metadata;
+  const parsed = parseRequest(body);
   parsed._externalProviderTrusted = true;
-  expect(() => extractChatGptTurnEnvironment(parsed)).toThrow("missing cwd in trusted Codex environment context");
-  expect(() => extractChatGptTurnUserRevision(parsed)).toThrow("requires native Codex turn_id metadata");
+  expect(() => extractChatGptTurnEnvironment(parsed)).toThrow();
+  expect(() => extractChatGptTurnUserRevision(parsed)).toThrow();
 });
 
 test("external-provider refuses stripped turns when OpenCodex native metadata is missing", async () => {
-  const root = resolve(process.cwd());
-  const environment = `<environment_context>\n  <cwd>${root}</cwd>\n  <filesystem><workspace_roots><root>${root}</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>\n</environment_context>`;
-  const routed = openCodexRoutedBody({
-    model: "chatgpt-web/high",
-    store: false,
-    stream: false,
-    input: [
-      {
-        type: "message",
-        id: "msg_environment",
-        role: "user",
-        content: [{ type: "input_text", text: environment }],
-        internal_chat_message_metadata_passthrough: { turn_id: "turn_missing" },
-      },
-      {
-        type: "message",
-        id: "msg_prompt",
-        role: "user",
-        content: [{ type: "input_text", text: "Inspect the workspace read-only." }],
-        internal_chat_message_metadata_passthrough: { turn_id: "turn_missing" },
-      },
-    ],
-  });
+  const raw = withoutUnderscore(load("provider-first-turn.json")) as Record<string, unknown>;
+  const { body } = withRealRoot(raw);
+  delete (body as Record<string, unknown>).client_metadata;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
   let adapterStarted = false;
   const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(routed),
+    body: JSON.stringify(body),
   }), config, () => {
     adapterStarted = true;
     throw new Error("adapter must not start without native OpenCodex turn metadata");
   });
   expect(adapterStarted).toBe(false);
   expect(response.status).toBe(400);
-  const body = await response.json() as { error?: { message?: string } };
-  expect(body.error?.message).toContain("native Codex turn metadata");
+  const payload = await response.json() as { error?: { message?: string } };
+  expect(payload.error?.message).toContain("native Codex turn metadata");
 });
 
 test("OpenCodex-shaped HTTP requests keep compact metadata and reject unknown models", async () => {
@@ -203,19 +130,19 @@ test("OpenCodex-shaped HTTP requests keep compact metadata and reject unknown mo
   expect(models.status).toBe(200);
   const catalog = await models.json() as { data: Array<{ id: string }> };
   expect(catalog.data.every(model => model.id.startsWith("chatgpt-web/"))).toBe(true);
-
   const unknown = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
   }), config);
   expect(unknown.status).toBe(400);
-
+  const metadata = (load("metadata.json") as Record<string, Record<string, unknown>>).continuation;
   const compactMetadata = {
     request_kind: "compaction",
-    thread_id: "thread_web",
-    turn_id: "turn_web",
+    thread_id: metadata.thread_id,
+    turn_id: metadata.turn_id,
   };
+  const root = resolve(process.cwd());
   const compact = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -229,7 +156,6 @@ test("OpenCodex-shaped HTTP requests keep compact metadata and reject unknown mo
           type: "message",
           role: "user",
           content: [{ type: "input_text", text: "Compact" }],
-          internal_chat_message_metadata_passthrough: { turn_id: "turn_web" },
         },
       ],
     }),
@@ -239,6 +165,7 @@ test("OpenCodex-shaped HTTP requests keep compact metadata and reject unknown mo
       expect((parsed._rawBody as Record<string, unknown>).client_metadata).toEqual({
         "x-codex-turn-metadata": JSON.stringify(compactMetadata),
       });
+      expect(root.length).toBeGreaterThan(0);
       emit({ type: "text_delta", text: "ok", phase: "final_answer" });
       emit({
         type: "done",

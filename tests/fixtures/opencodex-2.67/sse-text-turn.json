@@ -1,0 +1,16 @@
+{
+  "_provenance": "CAPTURED (frame order with per-frame sequence numbers accepted by real Codex 0.158; our bridge emits the same contract)",
+  "_requirements": ["every frame carries an incrementing sequence_number", "exactly one terminal response.completed", "completed carries a usage object", "stream ends with data: [DONE]"],
+  "frames": [
+    "response.created",
+    "response.output_item.added",
+    "response.content_part.added",
+    "response.output_text.delta",
+    "response.output_text.done",
+    "response.content_part.done",
+    "response.output_item.done",
+    "response.completed"
+  ],
+  "completed_status": "completed",
+  "usage": { "input_tokens": 200, "output_tokens": 10, "total_tokens": 210 }
+}

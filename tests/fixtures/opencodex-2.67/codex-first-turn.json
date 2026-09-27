@@ -1,0 +1,53 @@
+{
+  "_provenance": "CAPTURED (Codex 0.158.0-alpha.2.1 direct wire shape; values synthetic)",
+  "model": "chatgpt-web/high",
+  "instructions": "Synthetic representative stand-in for the ~15k Codex system prompt (skills prelude plus operating instructions).",
+  "input": [
+    {
+      "type": "message",
+      "id": "msg_s4a_developer_01",
+      "role": "developer",
+      "content": [{ "type": "input_text", "text": "Synthetic developer prelude." }]
+    },
+    {
+      "type": "message",
+      "id": "msg_s4a_environment_01",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "<environment_context>\n  <cwd>/synthetic/work</cwd>\n  <shell>powershell</shell>\n  <filesystem><workspace_roots><root>/synthetic/work</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>" }],
+      "internal_chat_message_metadata_passthrough": { "turn_id": "turn_s4a_01" }
+    },
+    {
+      "type": "message",
+      "id": "msg_s4a_prompt_01",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "Inspect the workspace read-only." }],
+      "internal_chat_message_metadata_passthrough": { "turn_id": "turn_s4a_01" }
+    }
+  ],
+  "tools": [
+    { "type": "function", "name": "exec_command", "description": "Run a shell command.", "strict": false, "parameters": { "type": "object", "properties": { "command": { "type": "array" } } } },
+    { "type": "custom", "name": "apply_patch", "description": "Apply a patch envelope.", "format": { "type": "grammar", "syntax": "lark", "definition": "start: begin_patch" } },
+    { "type": "namespace", "name": "image_gen", "description": "Image tools.", "tools": [{ "type": "function", "name": "imagegen", "description": "Generate an image.", "parameters": { "type": "object" } }] },
+    { "type": "tool_search", "execution": "client", "description": "Search for additional tools.", "parameters": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
+    { "type": "web_search", "external_web_access": true, "search_content_types": ["text", "image"] },
+    { "type": "function", "name": "view_image", "description": "View a local image.", "strict": false, "parameters": { "type": "object" } }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "reasoning": { "effort": "medium" },
+  "store": false,
+  "stream": true,
+  "include": ["reasoning.encrypted_content"],
+  "prompt_cache_key": "thread_s4a_01",
+  "text": { "verbosity": "low" },
+  "access_programs": [{ "type": "synthetic-test-access", "server": "synthetic-test-server" }],
+  "client_metadata": {
+    "thread_id": "thread_s4a_01",
+    "x-codex-window-id": "thread_s4a_01:0",
+    "root_turn_id": "turn_s4a_01",
+    "x-codex-turn-metadata": "{\"installation_id\":\"inst_s4a_01\",\"session_id\":\"sess_s4a_01\",\"thread_id\":\"thread_s4a_01\",\"agent_name\":\"/root\",\"turn_id\":\"turn_s4a_01\",\"window_id\":\"thread_s4a_01:0\",\"window_number\":0,\"context_window_id\":\"ctx_s4a_01\",\"request_kind\":\"turn\",\"root_turn_id\":\"turn_s4a_01\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"none\",\"sandbox_mode\":\"danger-full-access\",\"model\":\"chatgpt-web/high\",\"reasoning_effort\":\"medium\",\"workspaces\":{\"/synthetic/work\":{}}}",
+    "x-codex-installation-id": "inst_s4a_01",
+    "session_id": "sess_s4a_01",
+    "turn_id": "turn_s4a_01"
+  }
+}

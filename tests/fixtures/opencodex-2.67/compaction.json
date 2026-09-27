@@ -1,0 +1,76 @@
+{
+  "_provenance": "CAPTURED + SOURCE (v2_trigger and replay wire-observed in a genuine Codex 0.158 auto-compaction cycle; routed_summarizer per OpenCodex 2.67 source; values synthetic)",
+  "_blocker_resolution": "Captured metadata carries compaction.implementation=responses_compaction_v2 with strategy=memento (plus trigger/reason/phase). The production marker check now accepts responses and responses_compaction_v2 with memento.",
+  "v2_trigger": {
+    "model": "chatgpt-web/high",
+    "instructions": "Synthetic representative stand-in for the Codex system prompt.",
+    "input": [
+      { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Synthetic developer prelude." }] },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "<environment_context>\n  <cwd>/synthetic/work</cwd>\n  <shell>powershell</shell>\n  <filesystem><workspace_roots><root>/synthetic/work</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>" }] },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Run echoes round by round until done." }] },
+      { "type": "function_call", "call_id": "call_s4a_round_0", "name": "exec_command", "arguments": "{\"command\":[\"echo\",\"round-0\"]}" },
+      { "type": "function_call_output", "call_id": "call_s4a_round_0", "output": "round-0" },
+      { "type": "compaction_trigger" }
+    ],
+    "tools": [
+      { "type": "function", "name": "exec_command", "description": "Run a shell command.", "parameters": { "type": "object" } }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "reasoning": { "effort": "medium" },
+    "store": false,
+    "stream": true,
+    "include": ["reasoning.encrypted_content"],
+    "prompt_cache_key": "thread_s4a_01",
+    "text": { "verbosity": "low" },
+    "client_metadata": {
+      "x-codex-turn-metadata": "{\"installation_id\":\"inst_s4a_01\",\"session_id\":\"sess_s4a_01\",\"thread_id\":\"thread_s4a_01\",\"agent_name\":\"/root\",\"turn_id\":\"turn_s4a_01\",\"window_id\":\"thread_s4a_01:0\",\"window_number\":0,\"context_window_id\":\"ctx_s4a_01\",\"request_kind\":\"compaction\",\"root_turn_id\":\"turn_s4a_01\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"none\",\"sandbox_mode\":\"danger-full-access\",\"model\":\"chatgpt-web/high\",\"compaction\":{\"trigger\":\"auto\",\"reason\":\"context_limit\",\"implementation\":\"responses_compaction_v2\",\"phase\":\"mid_turn\",\"strategy\":\"memento\"}}"
+    }
+  },
+  "routed_summarizer": {
+    "_provenance": "SOURCE-CONFIRMED (OpenCodex 2.67 buildRoutedCompactionBody: trigger and additional_tools dropped, tools/tool_choice/parallel_tool_calls/text removed, COMPACT_PROMPT appended, client_metadata preserved)",
+    "model": "chatgpt-web/high",
+    "instructions": "Synthetic representative stand-in for the Codex system prompt.",
+    "input": [
+      { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Synthetic developer prelude." }] },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "<environment_context>\n  <cwd>/synthetic/work</cwd>\n  <shell>powershell</shell>\n  <filesystem><workspace_roots><root>/synthetic/work</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>" }] },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Run echoes round by round until done." }] },
+      { "type": "function_call", "call_id": "call_s4a_round_0", "name": "exec_command", "arguments": "{\"command\":[\"echo\",\"round-0\"]}" },
+      { "type": "function_call_output", "call_id": "call_s4a_round_0", "output": "round-0" },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work." }] }
+    ],
+    "reasoning": { "effort": "medium" },
+    "store": false,
+    "stream": true,
+    "include": ["reasoning.encrypted_content"],
+    "prompt_cache_key": "thread_s4a_01",
+    "client_metadata": {
+      "x-codex-turn-metadata": "{\"installation_id\":\"inst_s4a_01\",\"session_id\":\"sess_s4a_01\",\"thread_id\":\"thread_s4a_01\",\"agent_name\":\"/root\",\"turn_id\":\"turn_s4a_01\",\"window_id\":\"thread_s4a_01:0\",\"window_number\":0,\"context_window_id\":\"ctx_s4a_01\",\"request_kind\":\"compaction\",\"root_turn_id\":\"turn_s4a_01\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"none\",\"sandbox_mode\":\"danger-full-access\",\"model\":\"chatgpt-web/high\",\"compaction\":{\"trigger\":\"auto\",\"reason\":\"context_limit\",\"implementation\":\"responses_compaction_v2\",\"phase\":\"mid_turn\",\"strategy\":\"memento\"}}"
+    }
+  },
+  "replay": {
+    "_provenance": "CAPTURED (post-compaction turn replays the stored compaction item verbatim; window advances, turn/thread/session stable)",
+    "model": "chatgpt-web/high",
+    "instructions": "Synthetic representative stand-in for the Codex system prompt.",
+    "input": [
+      { "type": "message", "role": "developer", "content": [{ "type": "input_text", "text": "Synthetic developer prelude." }] },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "<environment_context>\n  <cwd>/synthetic/work</cwd>\n  <shell>powershell</shell>\n  <filesystem><workspace_roots><root>/synthetic/work</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>" }] },
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Run echoes round by round until done." }] },
+      { "type": "compaction", "id": "comp_s4a_01", "encrypted_content": "ocx1:U3ludGhldGljIHN1bW1hcnk6IHdvcmtzcGFjZSBpbnNwZWN0ZWQsIGNvbnRpbnVlIGltcGxlbWVudGF0aW9uLg==" }
+    ],
+    "tools": [
+      { "type": "function", "name": "exec_command", "description": "Run a shell command.", "parameters": { "type": "object" } }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": true,
+    "reasoning": { "effort": "medium" },
+    "store": false,
+    "stream": true,
+    "include": ["reasoning.encrypted_content"],
+    "prompt_cache_key": "thread_s4a_01",
+    "text": { "verbosity": "low" },
+    "client_metadata": {
+      "x-codex-turn-metadata": "{\"installation_id\":\"inst_s4a_01\",\"session_id\":\"sess_s4a_01\",\"thread_id\":\"thread_s4a_01\",\"agent_name\":\"/root\",\"turn_id\":\"turn_s4a_01\",\"window_id\":\"thread_s4a_01:1\",\"window_number\":1,\"context_window_id\":\"ctx_s4a_02\",\"request_kind\":\"turn\",\"root_turn_id\":\"turn_s4a_01\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"none\",\"sandbox_mode\":\"danger-full-access\",\"model\":\"chatgpt-web/high\",\"workspaces\":{\"/synthetic/work\":{}}}"
+    }
+  }
+}

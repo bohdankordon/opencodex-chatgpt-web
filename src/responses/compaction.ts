@@ -30,8 +30,14 @@ export function isNativeTextCompaction(body: unknown): boolean {
   const request = metadata as Record<string, unknown>;
   if (request.request_kind !== "compaction") return false;
   const protocol = request.compaction as Record<string, unknown> | undefined;
-  if (!protocol || protocol.implementation !== "responses" || protocol.strategy !== "memento") {
-    throw new Error("Unsupported native text compaction protocol; expected responses/memento");
+  // Codex 0.158 mints two text-compatible markers on this path (wire-captured): the native
+  // `responses` form and the routed remote-v2 form `responses_compaction_v2`, both with strategy
+  // `memento`. OpenCodex 2.67 forwards a routed compaction to a non-canonical provider with the
+  // v2 marker intact but the `compaction_trigger` item removed, so the trigger-less shape must
+  // also be accepted here. Anything else stays fail-closed.
+  if (!protocol || protocol.strategy !== "memento"
+    || (protocol.implementation !== "responses" && protocol.implementation !== "responses_compaction_v2")) {
+    throw new Error("Unsupported native text compaction protocol; expected responses/memento or responses_compaction_v2/memento");
   }
   return true;
 }

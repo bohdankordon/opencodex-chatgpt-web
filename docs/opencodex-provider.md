@@ -175,6 +175,16 @@ still exposes `/v1/responses/compact` as its own canonical endpoint contract (us
 mode and the dev harness), but a normal `chatgpt-web` OpenCodex route does not send compaction
 there.
 
+Contract frozen for OpenCodex `2.67.0` with Codex `0.158.0` (see
+`tests/fixtures/opencodex-2.67/`): Codex sends JSON bodies with `content-encoding: zstd`;
+compaction turn metadata carries
+`compaction: {trigger, reason, implementation, phase, strategy}` with `strategy: "memento"`
+and `implementation` of `responses` (native text form) or `responses_compaction_v2`
+(routed remote-v2 form). A routed summarizer turn reaches a non-canonical provider with the
+v2 marker intact but the `compaction_trigger` item and the tool surface removed and the
+checkpoint prompt appended; the bridge answers with assistant text that OpenCodex wraps back
+into the compaction item Codex replays.
+
 The OpenCodex-routed catalog may project a gateway ingestion capability (`supports_tool_use`) on
 these rows even though the bridge catalog itself reports `supports_tools: false`. That projection
 describes OpenCodex-side ingestion, not local Codex tool execution: browser-only turns have no
