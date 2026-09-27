@@ -919,10 +919,10 @@ function hasOpencodexPreviousResponseId(raw: unknown): boolean {
  * normal full replay, Codex tool declarations, tool_search declaration,
  * function_call replay, function_call_output replay, tool_search_call replay,
  * tool_search_output replay (including lowered function_call forms), and
- * compaction via ordinary POST /v1/responses. Tool-bearing requests are ACCEPTED
- * (Codex routinely declares tools even for plain-text turns); S4C will redesign
- * the tool-intent handoff, not S4B. Previous_response_id is rejected (full replay
- * only). No native fallback, no silent default, no closest model.
+ * compaction via ordinary POST /v1/responses. Tool-bearing requests are accepted:
+ * the adapter exposes only request-scoped declarations and returns one Web tool
+ * intent for Codex to execute on its next sampling cycle. Previous_response_id is
+ * rejected (full replay only). No native fallback, silent default, or closest model.
  */
 async function opencodexProviderResponse(
   req: Request,

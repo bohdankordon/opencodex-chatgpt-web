@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
+import Ajv from "ajv";
 import { namespacedToolName, type CodexTool } from "../../types";
 import { VERSION } from "../../version";
 import type { ChatGptTurnEnvironment } from "./environment";
@@ -13,6 +14,7 @@ interface ClaimedTurn {
   bindingId: string;
   activityId: string;
   environment: ChatGptTurnEnvironment & { expiresAt?: number };
+  intentOnly?: boolean;
 }
 
 export type ChatGptMcpContract = "native" | "safe";
@@ -36,6 +38,7 @@ const GATEWAY_AGENT_WAIT_TOOL_NAMES = new Set([
 
 const turnTokenSchema = z.string().min(20).max(256);
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
+const providerSchemaValidator = new Ajv({ strict: false, allErrors: true });
 // Match Codex's default wait interval while returning before the MCP invocation deadline.
 export const CHATGPT_WEB_AGENT_WAIT_POLL_MS = 30_000;
 const AGENT_WAIT_TRANSPORT_RULE = `ChatGPT Web transport rule: wait for exactly ${CHATGPT_WEB_AGENT_WAIT_POLL_MS / 1_000} seconds per call, matching the Codex default, then release the MCP channel so spawned Web agents can use their own tools. A wait timeout is not task completion; check agent progress and wait again if needed. Keep the native tool's declared arguments.`;
@@ -193,6 +196,16 @@ function assertBrowserToolArguments(tool: CodexTool, args: Record<string, unknow
       + " so the shared MCP channel remains available to spawned Web agents",
     );
   }
+}
+
+function assertProviderToolArguments(tool: CodexTool, args: Record<string, unknown>): void {
+  let valid: boolean;
+  try {
+    valid = providerSchemaValidator.validate(tool.parameters, args);
+  } catch (error) {
+    throw new Error(`Codex tool ${wireName(tool)} has an invalid declaration: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!valid) throw new Error(`Arguments do not match the active declaration for ${wireName(tool)}: ${providerSchemaValidator.errorsText()}`);
 }
 
 function assertGatewayToolArguments(name: string, args: Record<string, unknown>): void {
@@ -636,6 +649,7 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
+        if (claimed.intentOnly) throw new Error("Provider turns require an exact codex_tool_call wire_name");
         const { cmd, workdir, yield_time_ms, max_output_tokens, tty, sandbox_permissions, justification, prefix_rule } = input;
         const bound = claimed.environment;
         const permissions = {
@@ -699,6 +713,7 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
+        if (claimed.intentOnly) throw new Error("Provider turns require an exact codex_tool_call wire_name");
         const { session_id, chars, yield_time_ms, max_output_tokens } = input;
         const bound = claimed.environment;
         const tool = exactTool(bound, "write_stdin");
@@ -728,6 +743,7 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
+        if (claimed.intentOnly) throw new Error("Provider turns require an exact codex_tool_call wire_name");
         const { patch } = input;
         const bound = claimed.environment;
         const tool = exactTool(bound, "apply_patch");
@@ -756,6 +772,7 @@ export async function runChatGptMcpServer(options: {
       turnReference(contract, input),
       extra,
       async claimed => {
+        if (claimed.intentOnly) throw new Error("Provider turns require an exact codex_tool_call wire_name");
         const { path, detail } = input;
         const bound = claimed.environment;
         const tool = exactTool(bound, "view_image");
@@ -802,13 +819,14 @@ export async function runChatGptMcpServer(options: {
           wire_name: wireName(tool),
           name: tool.name,
           namespace: tool.namespace ?? null,
-          description: browserToolDescription(tool),
+          description: claimed.intentOnly ? tool.description : browserToolDescription(tool),
           kind: tool.freeform ? "freeform" : tool.toolSearch ? "tool_search" : "function",
-          ...(include_schema ? { parameters: browserToolParameters(tool) } : {}),
+          ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+          ...(include_schema ? { parameters: claimed.intentOnly ? tool.parameters : browserToolParameters(tool) } : {}),
         }));
         let nestedTotal = 0;
         let nestedPage: Array<Record<string, unknown>> = [];
-        const gateway = execGateway(bound);
+        const gateway = claimed.intentOnly ? undefined : execGateway(bound);
         if (gateway) {
           const excludedGatewayNames = bound.tools.map(wireName);
           const nestedOffset = Math.max(0, offset - directMatches.length);
@@ -912,6 +930,7 @@ export async function runChatGptMcpServer(options: {
         const tool = safeVisibleTools(bound, contract)
           .find(candidate => wireName(candidate) === wire_name);
         if (!tool) {
+          if (claimed.intentOnly) throw new Error(`Codex tool is not available in this provider turn: ${wire_name}`);
           const gateway = execGateway(bound);
           const hiddenOuterTool = bound.tools.some(candidate => wireName(candidate) === wire_name);
           if (!gateway || hiddenOuterTool || !gatewayToolNameIsValid(wire_name)) {
@@ -940,7 +959,8 @@ export async function runChatGptMcpServer(options: {
         }
         if (input !== undefined) throw new Error(`Function Codex tool ${wire_name} does not accept freeform input`);
         const invocationArguments = args ?? {};
-        assertBrowserToolArguments(tool, invocationArguments);
+        if (claimed.intentOnly) assertProviderToolArguments(tool, invocationArguments);
+        else assertBrowserToolArguments(tool, invocationArguments);
         return invoke(claimed.bindingId, bound, tool, { arguments: invocationArguments }, extra.signal);
       });
     },

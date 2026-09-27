@@ -31,6 +31,7 @@ interface RunMessage {
     modelFamily?: "5.6" | "6";
     capabilities: ChatGptWebCapabilities;
     nativeConnector?: boolean;
+    forceTemporaryChat?: boolean;
     resumeAvailable?: boolean;
     retainConversation?: boolean;
     requireRetainedConversation?: boolean;
@@ -169,6 +170,9 @@ async function run(message: RunMessage): Promise<void> {
   if (message.turn.nativeConnector !== undefined && typeof message.turn.nativeConnector !== "boolean") {
     throw new Error("Browser helper native connector flag is invalid");
   }
+  if (message.turn.forceTemporaryChat !== undefined && typeof message.turn.forceTemporaryChat !== "boolean") {
+    throw new Error("Browser helper Temporary Chat flag is invalid");
+  }
   if (message.turn.retainConversation !== undefined && typeof message.turn.retainConversation !== "boolean") {
     throw new Error("Browser helper conversation retention flag is invalid");
   }
@@ -225,6 +229,7 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.modelFamily ? { modelFamily: message.turn.modelFamily } : {}),
     capabilities: message.turn.capabilities,
     ...(message.turn.nativeConnector ? { nativeConnector: true } : {}),
+    ...(message.turn.forceTemporaryChat ? { forceTemporaryChat: true } : {}),
     prepare: prepareSelected,
     ...(message.turn.resumeAvailable ? { prepareResume: prepareSelected } : {}),
     ...(message.turn.retainConversation ? { retainConversation: true } : {}),

@@ -473,6 +473,12 @@ export function compileChatGptWebPrompt(
     throw new Error("A read-only ChatGPT Web effort must not receive a local-tool capability token");
   }
   const system = parsed.context.systemPrompt ?? [];
+  const providerSearchLoaded = parsed._externalProviderTrusted === true
+    && parsed.context.messages.some(message => message.role === "toolResult"
+      && message.toolName === "tool_search"
+      && !message.isError
+      && typeof message.content === "string"
+      && message.content.includes("Tool search loaded these tools"));
   const sharedContract = [
     "Act as the model backend for the Codex task encoded below.",
     multipartEnabled
@@ -505,6 +511,15 @@ export function compileChatGptWebPrompt(
       "Do not call local or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
       "Return only the checkpoint summary that the next model needs to resume the task.",
       ]
+    : mode.localTools && parsed._externalProviderTrusted === true
+    ? [
+      "For local work, first inspect codex_tool_inventory for the exact tools declared in this request. Use only a listed wire_name and its exact parameters with codex_tool_call. Do not use codex_exec, codex_apply_patch, codex_write_stdin, or codex_view_image in this provider turn.",
+      "A codex_tool_call only hands one tool intent to Codex. It does not run the tool or return its result in this Web turn. After calling it, stop immediately. Codex executes under its own sandbox and approval policy and supplies the result in a fresh later Web turn.",
+      "Call tool_search only if it is present in this request's inventory and discovery is needed. Deferred tools become available only after their search output appears in the replayed context.",
+      ...(providerSearchLoaded ? ["A prior tool_search result in this replay has already loaded the discovered tools. That satisfies any user instruction to discover them. Inspect the current inventory and call the requested exact loaded tool now; do not search for it again."] : []),
+      "The context is a complete replay. Treat earlier tool calls and tool results as history; do not repeat a call whose result is already present unless the task truly requires another call.",
+      "If a replayed result reports a denial or error, treat it as Codex's decision. Do not retry under another tool name to bypass it.",
+    ]
     : mode.localTools
     ? [
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
@@ -579,6 +594,12 @@ export function compileChatGptWebPrompt(
     ? [
       "<codex_transport_resume>",
       "The task context is complete. Execute the latest active user request now.",
+      "</codex_transport_resume>",
+    ]
+    : mode.localTools && parsed._externalProviderTrusted === true
+    ? [
+      "<codex_transport_resume>",
+      `The task context is complete. Pass turn_token ${turnToken} unchanged to Codex Native inventory and exact tool calls. At most one tool intent is accepted in this Web turn. If no local tool is needed, answer the latest request directly.`,
       "</codex_transport_resume>",
     ]
     : mode.localTools

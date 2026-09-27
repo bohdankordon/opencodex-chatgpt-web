@@ -341,15 +341,14 @@ test("bounded broker calls preserve server-owned closure before advancing the li
   await broker.listen();
   try {
     let settled = false;
-    const call = callTurnBroker(broker.socketPath, { method: "owner_status" }).then(result => {
-      settled = true;
-      return result;
-    });
+    const call = callTurnBroker(broker.socketPath, { method: "owner_status" });
+    void call.then(() => { settled = true; });
     await frameWritten;
     await Bun.sleep(25);
     expect(settled).toBeFalse();
     peer.end();
-    await expect(call).resolves.toEqual({ ready: true });
+    const result = await call;
+    expect(result).toEqual({ ready: true });
   } finally {
     peer?.destroy();
     await broker.close();

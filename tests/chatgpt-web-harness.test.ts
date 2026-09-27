@@ -27,7 +27,7 @@ import { defaultBrokerEndpoint } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
-import type { AdapterEvent, CodexParsedRequest, CodexProviderConfig, CodexTool } from "../src/types";
+import { namespacedToolName, type AdapterEvent, type CodexParsedRequest, type CodexProviderConfig, type CodexTool } from "../src/types";
 
 const tempRoot = join(tmpdir(), `codex-chatgpt-web-harness-${process.pid}-${Date.now()}`);
 mkdirSync(tempRoot, { recursive: true });
@@ -2076,6 +2076,152 @@ describe("ChatGPT outer-native harness v4", () => {
     await broker.close();
   });
 
+  test("provider connector projects only declared tools and commits one intent without execution", async () => {
+    const socketPath = brokerTestEndpoint(`s4c-intent-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    environment.tools = [{
+      name: "direct_echo", description: "Echo a value through Codex", strict: true,
+      parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
+    }];
+    const token = await broker.register(environment, 60_000, "provider-intent", false, "turn", true);
+    const transport = new StdioClientTransport({ command: process.execPath, args: ["src/cli.ts", "mcp", "--broker-socket", socketPath], cwd: process.cwd(), stderr: "pipe" });
+    const client = new Client({ name: "s4c-provider-intent", version: "1.0.0" });
+    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: args });
+    try {
+      await client.connect(transport);
+      const listed = await call("codex_tool_inventory", { turn_token: token });
+      expect(listed.structuredContent).toMatchObject({ total: 1, tools: [{ wire_name: "direct_echo", description: "Echo a value through Codex", strict: true, parameters: environment.tools[0]!.parameters }] });
+      const unknown = await call("codex_tool_call", { turn_token: token, wire_name: "other_echo", arguments: { value: "x" } });
+      expect(unknown.isError).toBe(true);
+      const malformed = await call("codex_tool_call", { turn_token: token, wire_name: "direct_echo", arguments: { value: 3 } });
+      expect(malformed.isError).toBe(true);
+      const convenience = await call("codex_exec", { turn_token: token, cmd: "pwd" });
+      expect(convenience.isError).toBe(true);
+      const accepted = await call("codex_tool_call", { turn_token: token, wire_name: "direct_echo", arguments: { value: "first" } });
+      expect(accepted.isError).not.toBe(true);
+      expect(JSON.stringify(accepted)).toContain("Tool intent handed to Codex");
+      const [intent] = await broker.nextToolBatch(token);
+      expect(intent).toMatchObject({ wireName: "direct_echo", arguments: { value: "first" } });
+      expect(intent!.callId).toMatch(/^call_/);
+      const duplicate = await call("codex_tool_call", { turn_token: token, wire_name: "direct_echo", arguments: { value: "second" } });
+      expect(duplicate.isError).toBe(true);
+      expect((await broker.nextToolBatch(token)).map(request => request.callId)).toEqual([intent!.callId]);
+      broker.revoke(token);
+      const stale = await call("codex_tool_call", { turn_token: token, wire_name: "direct_echo", arguments: { value: "third" } });
+      expect(stale.isError).toBe(true);
+    } finally {
+      await client.close().catch(() => {});
+      await broker.close();
+    }
+  }, 30_000);
+
+  test("provider handoff ends before execution and replays into a fresh Web turn", async () => {
+    const socketPath = brokerTestEndpoint(`s4c-fresh-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://s4c-fresh-${Date.now()}`,
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const prompts: string[] = [];
+    let samples = 0;
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      samples += 1;
+      expect(turn.forceTemporaryChat).toBe(true);
+      expect(turn.retainConversation).not.toBe(true);
+      expect(turn.prepareResume).toBeUndefined();
+      const prepared = await turn.prepare();
+      prompts.push(prepared.text);
+      if (samples === 1) {
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        expect(token).toBeDefined();
+        const claim = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+        const acknowledgement = await callTurnBroker<BrokerToolResult>(socketPath, { method: "invoke", bindingId: claim.bindingId, wireName: "direct_echo", freeform: false, arguments: { value: "hello" } });
+        expect(JSON.stringify(acknowledgement)).toContain("Tool intent handed to Codex");
+        return new Promise<string>((_resolve, reject) => turn.abortSignal!.addEventListener("abort", () => reject(new DOMException("retired", "AbortError")), { once: true }));
+      }
+      expect(prepared.text).toContain("echoed:hello");
+      turn.onTextDelta("echoed:hello");
+      return "echoed:hello";
+    };
+    try {
+      const first = rawWireRequest(environmentXml);
+      first.context.tools = [{ name: "direct_echo", description: "Echo", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } }];
+      first._externalProviderTrusted = true;
+      const adapter = createChatGptWebAdapter(provider);
+      const firstEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(first, { headers: new Headers() }, event => firstEvents.push(event));
+      expect(firstEvents.at(-1)).toMatchObject({ type: "done", stopReason: "tool_use" });
+      const call = firstEvents.find(event => event.type === "tool_call_start");
+      expect(call).toMatchObject({ type: "tool_call_start", name: "direct_echo" });
+      const callId = call?.type === "tool_call_start" ? call.id : "";
+      const response = buildResponseJSON(firstEvents, first.modelId) as { output: Array<{ type: string; call_id?: string }> };
+      expect(response.output.find(item => item.type === "function_call")).toMatchObject({
+        type: "function_call", call_id: callId, name: "direct_echo", arguments: '{"value":"hello"}', status: "completed",
+      });
+      const retryEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(structuredClone(first), { headers: new Headers() }, event => retryEvents.push(event));
+      expect(retryEvents).toEqual(firstEvents);
+      expect(samples).toBe(1);
+      const second = structuredClone(first);
+      second.context.messages.push({ role: "assistant", content: [{ type: "toolCall", id: callId, name: "direct_echo", arguments: { value: "hello" } }], timestamp: 3 });
+      second.context.messages.push({ role: "toolResult", toolCallId: callId, toolName: "direct_echo", content: "echoed:hello", isError: false, timestamp: 4 });
+      (second._rawBody as { input: unknown[] }).input.push({ type: "function_call", call_id: callId, name: "direct_echo", arguments: '{"value":"hello"}' }, { type: "function_call_output", call_id: callId, output: "echoed:hello" });
+      const secondEvents: AdapterEvent[] = [];
+      await adapter.runTurn!(second, { headers: new Headers() }, event => secondEvents.push(event));
+      expect(secondEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop" });
+      expect(secondEvents.some(event => event.type === "text_delta" && event.text === "echoed:hello")).toBe(true);
+      expect(samples).toBe(2);
+      expect(prompts[0]).not.toContain("echoed:hello");
+      expect(prompts[1]).toContain(callId);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  }, 30_000);
+
+  test("provider tool_search replay exposes a deferred exact tool only after discovery", () => {
+    const search = { type: "tool_search", description: "Find deferred tools", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } };
+    const initial = parseRequest({ model: CHATGPT_WEB_MODEL_ID, tools: [search], input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "Find deferred_echo" }] }] });
+    expect(initial.context.tools?.map(tool => namespacedToolName(tool.namespace, tool.name))).toEqual(["tool_search"]);
+    const searchEvents: AdapterEvent[] = [
+      { type: "tool_call_start", id: "call_search_stable", name: "tool_search" },
+      { type: "tool_call_delta", arguments: '{"query":"deferred_echo"}' },
+      { type: "tool_call_end" },
+      { type: "done", stopReason: "tool_use", endTurn: false, usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } },
+    ];
+    const searchResponse = buildResponseJSON(searchEvents, CHATGPT_WEB_MODEL_ID, { toolSearchToolNames: new Set(["tool_search"]) }) as { output: Array<Record<string, unknown>> };
+    expect(searchResponse.output[0]).toMatchObject({ type: "tool_search_call", call_id: "call_search_stable", status: "completed", arguments: { query: "deferred_echo" } });
+    const deferred = { type: "namespace", name: "fixture", tools: [{ type: "function", name: "deferred_echo", description: "Return an echoed value", parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"] }, strict: true }] };
+    const replay = parseRequest({ model: CHATGPT_WEB_MODEL_ID, tools: [search], input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "Find deferred_echo" }] },
+      { type: "tool_search_call", call_id: "call_search_stable", arguments: { query: "deferred_echo" } },
+      { type: "tool_search_output", call_id: "call_search_stable", status: "completed", tools: [deferred] },
+    ] });
+    expect(replay.context.tools?.map(tool => namespacedToolName(tool.namespace, tool.name))).toEqual(["tool_search", "fixture__deferred_echo"]);
+    expect(replay.context.tools?.[1]).toMatchObject({ name: "deferred_echo", namespace: "fixture", description: "Return an echoed value", strict: true, parameters: deferred.tools[0]!.parameters });
+    expect(replay.context.messages.some(message => message.role === "toolResult" && message.toolCallId === "call_search_stable")).toBe(true);
+    replay._externalProviderTrusted = true;
+    expect(compileChatGptWebPrompt(replay, toolCapabilities, "turn_123456789012345678901234").text)
+      .toContain("A prior tool_search result in this replay has already loaded the discovered tools");
+    const orphan = parseRequest({ model: CHATGPT_WEB_MODEL_ID, tools: [search], input: [
+      { type: "tool_search_output", call_id: "unknown", status: "completed", tools: [deferred] },
+    ] });
+    expect(orphan.context.tools?.map(tool => namespacedToolName(tool.namespace, tool.name))).toEqual(["tool_search"]);
+    const failed = parseRequest({ model: CHATGPT_WEB_MODEL_ID, tools: [search], input: [
+      { type: "tool_search_call", call_id: "failed_search", arguments: { query: "deferred_echo" } },
+      { type: "tool_search_output", call_id: "failed_search", status: "failed", tools: [deferred] },
+    ] });
+    expect(failed.context.tools?.map(tool => namespacedToolName(tool.namespace, tool.name))).toEqual(["tool_search"]);
+    const duplicate = parseRequest({ model: CHATGPT_WEB_MODEL_ID, tools: [search], input: [
+      { type: "tool_search_call", call_id: "duplicated_search", arguments: { query: "deferred_echo" } },
+      { type: "tool_search_output", call_id: "duplicated_search", status: "completed", tools: [] },
+      { type: "tool_search_output", call_id: "duplicated_search", status: "completed", tools: [deferred] },
+    ] });
+    expect(duplicate.context.tools?.map(tool => namespacedToolName(tool.namespace, tool.name))).toEqual(["tool_search"]);
+  });
+
   test("makes capability claim retries idempotent until the turn is revoked", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-claim-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
@@ -2210,7 +2356,12 @@ describe("ChatGPT outer-native harness v4", () => {
     }, 10_000);
     await broker.nextToolBatch(token);
     broker.revoke(token);
-    await expect(invocation).rejects.toThrow("revoked");
+    // Capture the asynchronous pipe rejection directly. Bun's `.rejects.toThrow` can leave
+    // this Windows named-pipe assertion pending even after the rejection has arrived.
+    let invocationError: unknown;
+    try { await invocation; } catch (error) { invocationError = error; }
+    expect(invocationError).toBeInstanceOf(Error);
+    expect((invocationError as Error).message).toContain("revoked");
     await expect(callTurnBroker(socketPath, { method: "resolve", bindingId: claimed.bindingId }))
       .rejects.toThrow("has already finished");
     await broker.close();

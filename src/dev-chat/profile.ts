@@ -2,7 +2,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { expandUserPath, getConfigPath } from "../config";
+import { expandUserPath, getConfigPath, stripUtf8Bom } from "../config";
 import {
   readLauncherBrowserHostDescriptor,
   type LauncherBrowserHostDescriptor,
@@ -76,7 +76,7 @@ export function readDevChatExperimentalFeatures(
 ): DevChatExperimentalFeatures {
   let value: unknown;
   try {
-    value = JSON.parse(readFileSync(paths.configPath, "utf8"));
+    value = JSON.parse(stripUtf8Bom(readFileSync(paths.configPath, "utf8")));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { biggerContext: false };
     throw new Error(

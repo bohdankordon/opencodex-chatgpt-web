@@ -30,7 +30,15 @@ installation is still restored).
 
 - Loopback Responses listener on `127.0.0.1`
 - ChatGPT browser login and account capability detection
-- Optional Full-mode broker, MCP tunnel, and tool approvals
+- Optional Full-mode broker and MCP tunnel for Web tool intent capture
+
+In Full mode, the OpenCodex provider projects the current Codex request's tool names,
+descriptions, and schemas into the Web connector. A Web tool call commits one intent;
+the provider returns a completed Responses `function_call` or `tool_search_call` with
+its stable `call_id`. Codex alone executes the tool under its sandbox and approval
+policy. The result or denial arrives through full replay on the next provider request.
+Each provider request starts a fresh Temporary Chat, including after a tool result.
+Direct mode retains its existing synchronous broker flow.
 
 ## Provider authentication (S4B)
 
@@ -82,8 +90,8 @@ Full mode is independent of routing ownership:
 bun run src/cli.ts setup --full --integration-mode external-provider --acknowledge-unofficial
 ```
 
-That still requires the existing tunnel, connector, and tool-approval flow. It does not force
-Browser-only, and it still must not rewrite Codex routing.
+That still requires the existing tunnel and connector. Codex owns local tool approval after
+the provider hands back an intent. It does not force Browser-only or rewrite Codex routing.
 
 ## Migrating an existing Direct installation
 
@@ -108,8 +116,16 @@ OpenCodex owns the Codex route, run setup with the explicit external-provider mo
 codex-chatgpt-web setup --browser-only --integration-mode external-provider --acknowledge-unofficial
 ```
 
-Use `--full` instead of `--browser-only` when the ChatGPT Web route should retain the existing MCP
-tool flow.
+Use `--full` instead of `--browser-only` when the ChatGPT Web route should expose the current
+Codex request's MCP tools for intent capture.
+
+For native Codex deferred MCP discovery, configure the OpenCodex provider with
+`codexToolMode: "shell"`, then refresh the Codex model catalog with `ocx sync`.
+The routed Codex catalog row must have `supports_search_tool: true` and leave
+`tool_mode` unset. Codex then initially declares `tool_search` while deferring MCP
+tool definitions until its search result is replayed. Without that catalog row,
+Codex falls back to unknown-model metadata; MCP tools may be declared eagerly.
+This setting belongs to OpenCodex's provider configuration, not to the Web bridge.
 
 Setup deliberately refuses the ownership switch while the previous managed Direct route is still
 active, while its non-route managed state is inconsistent, or while `openai_base_url` still points
@@ -120,8 +136,8 @@ rather than permitting an automatic route takeover.
 ## OpenCodex registration
 
 Minimum supported OpenCodex version: `2.57.0` (`main@44de45dfdc33d30af22502d2bed98014fe16d83b`).
-Latest end-to-end verified version: OpenCodex `2.58.0`
-(`6fe4cd0de85d63b8cdd0c3552e5e8883c0a029ee`).
+Latest end-to-end verified version: OpenCodex `2.67.0` with Codex CLI
+`0.158.0-alpha.2.1` (including native `tool_search` and deferred MCP replay).
 The `openai-responses` adapter posts to `{baseUrl}/v1/responses` unless `responsesPath` is set, so
 `baseUrl` may be either `http://127.0.0.1:17841` or `http://127.0.0.1:17841/v1`; OpenCodex
 normalizes both to the same Responses endpoint.
@@ -161,6 +177,7 @@ provider object is:
       "adapter": "openai-responses",
       "baseUrl": "http://127.0.0.1:17841/v1",
       "allowPrivateNetwork": true,
+      "codexToolMode": "shell",
       "apiKey": "<contents of <app-home>/opencodex-provider-token>"
     }
   }
@@ -208,9 +225,8 @@ into the compaction item Codex replays.
 
 The OpenCodex-routed catalog may project a gateway ingestion capability (`supports_tool_use`) on
 these rows even though the bridge catalog itself reports `supports_tools: false`. That projection
-describes OpenCodex-side ingestion, not local Codex tool execution: browser-only turns have no
-access to the local Codex computer, and the bridge says so explicitly in its turn commentary
-rather than executing anything locally.
+describes OpenCodex-side ingestion. Full-mode provider turns expose only tools declared in the
+current Codex request; browser-only turns have no access to the local Codex computer.
 
 This contract is covered by compatibility tests so changes in either OpenCodex's request
 sanitization or Codex's turn metadata shape fail visibly during an upstream sync.

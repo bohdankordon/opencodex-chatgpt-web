@@ -65,7 +65,7 @@ function loopbackHealthBaseURL(value) {
 }
 
 function readJson(pathname) {
-  return JSON.parse(fs.readFileSync(pathname, "utf8"));
+  return JSON.parse(fs.readFileSync(pathname, "utf8").replace(/^\uFEFF/, ""));
 }
 
 function errorMessage(error) {

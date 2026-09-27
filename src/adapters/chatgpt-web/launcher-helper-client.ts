@@ -280,7 +280,7 @@ export class LauncherBrowserHelperClient {
             browserHostDescriptorPath: this.config.browserHostDescriptorPath!,
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
-            autoApproveToolCalls: this.config.autoApproveToolCalls,
+            autoApproveToolCalls: turn.autoApproveToolCalls ?? this.config.autoApproveToolCalls,
             useSavedChats: this.config.useSavedChats,
           },
           turn: {
@@ -290,6 +290,7 @@ export class LauncherBrowserHelperClient {
             ...(turn.modelFamily ? { modelFamily: turn.modelFamily } : {}),
             capabilities: turn.capabilities,
             ...(turn.nativeConnector ? { nativeConnector: true } : {}),
+            ...(turn.forceTemporaryChat ? { forceTemporaryChat: true } : {}),
             ...(turn.prepareResume ? { resumeAvailable: true } : {}),
             ...(turn.retainConversation ? { retainConversation: true } : {}),
             ...(turn.requireRetainedConversation ? { requireRetainedConversation: true } : {}),

@@ -319,6 +319,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   // Tool specs surfaced by a prior tool_search (deferred tools, e.g. subagents). Codex does not
   // re-list these in `tools`, but chat models can only call listed tools — so we re-inject them.
   const loadedToolSpecs: unknown[] = [];
+  const consumedToolSearchOutputs = new Set<string>();
   // Remote compaction v2: the input tail carries `{type:"compaction_trigger"}` and Codex expects a
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
   let compactionRequest = false;
@@ -548,7 +549,12 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         pendingReasoning.length = 0;
         // Pair the tool_search call with its result so the model sees what was loaded.
         const out = item as { call_id?: string; status?: string; tools?: unknown[] };
-        const specs = Array.isArray(out.tools) ? (out.tools as Record<string, unknown>[]) : [];
+        const paired = typeof out.call_id === "string" && out.call_id.length > 0
+          && findToolById(messages, out.call_id).name === "tool_search"
+          && !consumedToolSearchOutputs.has(out.call_id);
+        if (paired) consumedToolSearchOutputs.add(out.call_id!);
+        const completed = out.status === "completed" || out.status === "success";
+        const specs = paired && completed && Array.isArray(out.tools) ? (out.tools as Record<string, unknown>[]) : [];
         loadedToolSpecs.push(...specs);
         // List the EXACT wire names the model must call (flattened for namespaced specs), matching
         // how buildTools exposes them — otherwise the model guesses wrong names (e.g. the bare namespace).
@@ -563,7 +569,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
             wireNames.push(spec.name);
           }
         }
-        const failed = typeof out.status === "string" && out.status !== "completed" && out.status !== "success";
+        const failed = !paired || !completed;
         messages.push({
           role: "toolResult", toolCallId: out.call_id ?? "", toolName: "tool_search",
           content: failed && wireNames.length === 0
@@ -584,11 +590,16 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         // tool_search_output becomes function_call_output whose output is a JSON
         // string like {"tools":[...],"status":"completed"}. Expose deferred specs
         // so chat models can call them, mirroring the native branch above.
-        if (typeof output.output === "string" && loweredToolSearchFunctionName(toolInfo.name || "")) {
+        if (typeof output.output === "string" && loweredToolSearchFunctionName(toolInfo.name || "")
+          && !consumedToolSearchOutputs.has(output.call_id)) {
           try {
             const payload: unknown = JSON.parse(output.output);
             if (payload && typeof payload === "object" && !Array.isArray(payload) && Array.isArray((payload as { tools?: unknown }).tools)) {
-              const specs = (payload as { tools: unknown[]; status?: unknown }).tools as Record<string, unknown>[];
+              const returnedSpecs = (payload as { tools: unknown[]; status?: unknown }).tools as Record<string, unknown>[];
+              const status = (payload as { status?: unknown }).status;
+              const completed = status === "completed" || status === "success";
+              const specs = completed ? returnedSpecs : [];
+              consumedToolSearchOutputs.add(output.call_id);
               loadedToolSpecs.push(...specs);
               const wireNames: string[] = [];
               for (const spec of specs) {
@@ -603,8 +614,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
                   wireNames.push(entry.name);
                 }
               }
-              const status = (payload as { status?: unknown }).status;
-              const failed = typeof status === "string" && status !== "completed" && status !== "success";
+              const failed = !completed;
               messages.push({
                 role: "toolResult", toolCallId: output.call_id,
                 toolName: toolInfo.name, toolNamespace: toolInfo.namespace,

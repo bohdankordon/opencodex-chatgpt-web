@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { namespacedToolName } from "../../types";
 import { isWindowsPipeEndpoint } from "../../config";
 import {
   CompactionTransactionStore,
@@ -64,6 +65,8 @@ interface SafeTurnControl {
 interface TurnChannel {
   traceId: string;
   externalOwner: boolean;
+  /** Provider turns hand a single intent to Codex; they never run a tool here. */
+  intentOnly: boolean;
   environment: PendingTurn;
   bindingId?: string;
   queuedCallIds: string[];
@@ -130,6 +133,7 @@ interface BrokerRequest {
   surfaceNonce?: string;
   finalAnswer?: string;
   contract?: "native" | "safe";
+  intentOnly?: boolean;
 }
 
 interface BrokerResponse {
@@ -207,7 +211,7 @@ function assertSurfaceNonce(value: unknown): asserts value is string {
 }
 
 export interface TurnBrokerOwner {
-  register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId?: string): Promise<string>;
+  register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId?: string, intentOnly?: boolean): Promise<string>;
   registerSafe(
     environment: ChatGptTurnEnvironment,
     surfaceNonce: string,
@@ -280,6 +284,7 @@ export class TurnBroker implements TurnBrokerOwner {
     traceId = "unknown",
     externalOwner = false,
     handlePrefix = "turn",
+    intentOnly = false,
   ): Promise<string> {
     await this.start();
     this.prune();
@@ -293,6 +298,7 @@ export class TurnBroker implements TurnBrokerOwner {
     const channel: TurnChannel = {
       traceId,
       externalOwner,
+      intentOnly,
       environment: {
         ...environment,
         ...(ttlMs !== undefined ? { expiresAt: Date.now() + ttlMs } : {}),
@@ -945,7 +951,7 @@ export class TurnBroker implements TurnBrokerOwner {
       if (request.traceId !== undefined && !/^[A-Za-z0-9_-]{6,128}$/.test(request.traceId)) {
         throw new Error("turn owner trace id is invalid");
       }
-      return this.register(environment, request.ttlMs, request.traceId, true).then(token => ({ token }));
+      return this.register(environment, request.ttlMs, request.traceId, true, "turn", request.intentOnly === true).then(token => ({ token }));
     }
     if (request.method === "owner_register_safe") {
       const environment = ownerEnvironment(request.environment);
@@ -1030,7 +1036,8 @@ export class TurnBroker implements TurnBrokerOwner {
         throw new Error(contract === "safe" ? "request id is required" : "turn token is required");
       }
       const channel = this.channels.get(token);
-      let activeChannel = channel && !channel.completionCommitted ? channel : undefined;
+      let activeChannel = channel && !channel.completionCommitted
+        && !(channel.intentOnly && channel.invocations.size > 0) ? channel : undefined;
       const retiredTurn = channel?.completionCommitted ? channel.traceId : this.retiredTokens.get(token);
       console.error(
         `[chatgpt-web] broker claim received (tokenChars=${token.length}, tokenHash=${handleFingerprint(token)}, valid=${Boolean(activeChannel)}`
@@ -1075,13 +1082,13 @@ export class TurnBroker implements TurnBrokerOwner {
         if (!existing || existing.token !== token || existing.channel !== activeChannel) {
           throw new Error("turn token binding state is inconsistent");
         }
-        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment };
+        return { bindingId: activeChannel.bindingId, activityId, environment: activeChannel.environment, intentOnly: activeChannel.intentOnly };
       }
       this.pending.delete(token);
       const bindingId = opaqueId("binding");
       activeChannel.bindingId = bindingId;
       this.bindings.set(bindingId, { token, channel: activeChannel });
-      return { bindingId, activityId, environment: activeChannel.environment };
+      return { bindingId, activityId, environment: activeChannel.environment, intentOnly: activeChannel.intentOnly };
     }
 
     const bindingId = request.bindingId;
@@ -1139,6 +1146,12 @@ export class TurnBroker implements TurnBrokerOwner {
 
     const wireName = request.wireName?.trim();
     if (!wireName) throw new Error("wire tool name is required");
+    if (binding.channel.intentOnly) {
+      if (binding.channel.invocations.size > 0) throw new Error("provider tool intent was already committed for this turn");
+      const declared = binding.channel.environment.tools.find(tool => namespacedToolName(tool.namespace, tool.name) === wireName);
+      if (!declared) throw new Error(`Codex tool is not available in this provider turn: ${wireName}`);
+      if ((declared.freeform === true) !== (request.freeform === true)) throw new Error(`Codex tool input kind changed for ${wireName}`);
+    }
     const callId = opaqueId("call");
     const toolRequest: BrokerToolRequest = {
       callId,
@@ -1153,6 +1166,11 @@ export class TurnBroker implements TurnBrokerOwner {
         `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
       );
       this.scheduleToolWaiters(binding.channel);
+      if (binding.channel.intentOnly) {
+        // Acknowledgement is deliberately not a tool result. The provider response ends with
+        // this call; only Codex can execute it, and its output arrives in the next request.
+        resolveInvoke({ content: [{ type: "text", text: "Tool intent handed to Codex. Stop this Web turn; the result will be supplied in a new turn." }] });
+      }
     });
   }
 
@@ -1351,12 +1369,13 @@ export class RemoteTurnBroker implements TurnBrokerOwner {
     }
   }
 
-  async register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId = "unknown"): Promise<string> {
+  async register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId = "unknown", intentOnly = false): Promise<string> {
     const response = await callTurnBroker<{ token?: unknown }>(this.socketPath, {
       method: "owner_register",
       environment,
       ...(ttlMs !== undefined ? { ttlMs } : {}),
       ...(traceId !== "unknown" ? { traceId } : {}),
+      ...(intentOnly ? { intentOnly: true } : {}),
     });
     if (typeof response.token !== "string" || !response.token.startsWith("turn_")) {
       throw new Error("DEV turn owner received an invalid broker token");

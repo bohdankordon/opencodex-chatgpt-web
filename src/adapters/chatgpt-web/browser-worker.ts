@@ -1257,6 +1257,8 @@ export interface BrowserTurn {
   modelFamily?: "5.6" | "6";
   /** Authenticated external executions always start on a fresh Temporary Chat surface. */
   forceTemporaryChat?: true;
+  /** Web connector consent for intent-only provider turns; Codex still owns execution approval. */
+  autoApproveToolCalls?: boolean;
   capabilities: ChatGptWebCapabilities;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
@@ -5282,7 +5284,7 @@ export class ChatGptBrowserWorker {
         if (mode.localTools && await resolveChatGptToolConfirmation(
           page,
           this.config.appName,
-          this.config.autoApproveToolCalls,
+          turn.autoApproveToolCalls ?? this.config.autoApproveToolCalls,
           turn.abortSignal,
           CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS,
           () => diagnostics.capture(page, "tool-confirmation-visible"),

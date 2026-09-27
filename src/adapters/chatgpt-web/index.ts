@@ -89,6 +89,40 @@ function withAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Pro
   });
 }
 
+interface ProviderIntentRound {
+  events: Promise<AdapterEvent[]>;
+  controller: AbortController;
+  observers: number;
+  committed: boolean;
+  completed: boolean;
+  createdAt: number;
+}
+
+// Exact HTTP retries (including JSON/SSE retries) must replay the same call_id, while a
+// different full-replay input gets an independent fresh Web sampling turn.
+const providerIntentRounds = new Map<string, ProviderIntentRound>();
+function providerIntentRoundKey(provider: CodexProviderConfig, parsed: CodexParsedRequest): string {
+  const raw = parsed._rawBody as Record<string, unknown> | undefined;
+  if (!raw) throw new Error("Provider intent replay requires the complete Responses request");
+  return createHash("sha256").update(JSON.stringify({
+    namespace: chatGptWebExecutionNamespace(provider),
+    home: process.env.CODEX_CHATGPT_WEB_HOME,
+    body: { ...raw, stream: false },
+  })).digest("hex");
+}
+
+function pruneProviderIntentRounds(now = Date.now()): void {
+  for (const [key, round] of providerIntentRounds) {
+    // Never evict a committed call in-process: an exact late retry must keep its call_id.
+    if (round.completed && !round.committed && now - round.createdAt > 10 * 60_000) providerIntentRounds.delete(key);
+  }
+  while (providerIntentRounds.size > 256) {
+    const removable = [...providerIntentRounds].find(([, round]) => round.completed && !round.committed)?.[0];
+    if (removable === undefined) break;
+    providerIntentRounds.delete(removable);
+  }
+}
+
 function cancellableBrowserTurn(
   run: Promise<string>,
   controller: AbortController,
@@ -410,6 +444,7 @@ export function createChatGptWebAdapter(
     turnCapabilities: ChatGptWebCapabilities,
     hooks: { onCompactionProgress?: () => void } = {},
     externalExec?: boolean,
+    providerIntent = false,
   ): ChatGptTurnRuntime => {
     const manualRequest = isChatGptWebZeroRiskBackendModel(parsed.modelId);
     if (manualRequest !== manualInteraction) {
@@ -432,6 +467,7 @@ export function createChatGptWebAdapter(
     const conversationKey = externalExec !== true
       && !parsed._compactionRequest
       && !freshConversationPerTurn
+      && !providerIntent
       && parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
       && mode.localTools
       && retainedLauncherDescriptor
@@ -694,7 +730,7 @@ export function createChatGptWebAdapter(
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
-        ...(externalExec === true ? { forceTemporaryChat: true } : {}),
+        ...(externalExec === true || providerIntent ? { forceTemporaryChat: true } : {}),
         capabilities: turnCapabilities,
         prepare: async () => ({
           ...compileChatGptWebPrompt(
@@ -738,6 +774,7 @@ export function createChatGptWebAdapter(
         environment,
         timeoutMs === undefined ? undefined : timeoutMs + 60_000,
         traceId,
+        providerIntent,
       );
       activeToken = turnToken;
       try {
@@ -766,6 +803,8 @@ export function createChatGptWebAdapter(
       modelId: parsed.modelId,
       reasoning: parsed.options.reasoning,
       ...(parsed._chatgptModelFamily ? { modelFamily: parsed._chatgptModelFamily } : {}),
+      ...(providerIntent ? { forceTemporaryChat: true } : {}),
+      ...(providerIntent ? { autoApproveToolCalls: true } : {}),
       capabilities: turnCapabilities,
       prepare: () => prepareWith(checkpointInput.parsed),
       ...(resumeInput ? { prepareResume: () => prepareWith(resumeInput) } : {}),
@@ -889,6 +928,88 @@ export function createChatGptWebAdapter(
             );
             throw error;
           }
+        }
+        if (parsed._externalProviderTrusted === true) {
+          pruneProviderIntentRounds();
+          const key = providerIntentRoundKey(provider, parsed);
+          let round = providerIntentRounds.get(key);
+          if (!round) {
+            const controller = new AbortController();
+            round = { events: Promise.resolve([]), controller, observers: 0, committed: false, completed: false, createdAt: Date.now() };
+            const owner = round;
+            owner.events = Promise.resolve().then(async () => {
+              if (controller.signal.aborted) throw abortError(controller.signal);
+              const events: AdapterEvent[] = [];
+              const buffer = (event: AdapterEvent) => events.push(event);
+              const traceId = chatGptWebTraceId(provider, parsed);
+              const runtime = startRuntime(parsed, environment, traceId, turnCapabilities, {}, false, true);
+              const waiting = new AbortController();
+              const onAbort = () => waiting.abort();
+              controller.signal.addEventListener("abort", onAbort, { once: true });
+              let token: string | undefined;
+              try {
+                const browser = runtime.browser.then(
+                  answer => ({ kind: "answer" as const, answer }),
+                  error => ({ kind: "error" as const, error }),
+                );
+                if (runtime.mode === "tools") {
+                  token = await withAbort(runtime.token, controller.signal);
+                  const tools = broker.nextToolBatch(token, waiting.signal).then(requests => ({ kind: "tools" as const, requests }));
+                  const outcome = await withAbort(Promise.race([browser, tools]), controller.signal);
+                  if (outcome.kind === "tools") {
+                    owner.committed = true;
+                    if (outcome.requests.length !== 1) throw new Error("Provider sampling requires exactly one committed tool intent");
+                    validateBatchTools(parsed, outcome.requests);
+                    // Retire this Web generation before Codex can execute the completed call.
+                    runtime.cancel();
+                    await runtime.physicalSettlement;
+                    const reasoning = runtime.trace.drain().map(event => event.text);
+                    emitToolBatch(outcome.requests,
+                      estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outcome.requests }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments),
+                      buffer);
+                  } else {
+                    if (outcome.kind === "error") throw outcome.error;
+                    emitTraceEvents(runtime.trace.drain(), buffer);
+                    emitTextDeltas(runtime.text.drain(), buffer);
+                    if (runtime.text.value() !== outcome.answer) throw new Error("ChatGPT browser Markdown stream did not reproduce the completed answer");
+                    structuredOutputValidator?.(outcome.answer);
+                    emitBrowserCompletion({ type: "final", answer: outcome.answer },
+                      estimateChatGptWebUsage(currentUsageInput(parsed), { answer: outcome.answer, reasoning: [] }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments), buffer);
+                  }
+                } else {
+                  const outcome = await withAbort(browser, controller.signal);
+                  if (outcome.kind === "error") throw outcome.error;
+                  emitTraceEvents(runtime.trace.drain(), buffer);
+                  emitTextDeltas(runtime.text.drain(), buffer);
+                  if (runtime.text.value() !== outcome.answer) throw new Error("ChatGPT browser Markdown stream did not reproduce the completed answer");
+                  structuredOutputValidator?.(outcome.answer);
+                  emitBrowserCompletion({ type: "final", answer: outcome.answer },
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { answer: outcome.answer, reasoning: [] }, turnCapabilities, experimentalBiggerContext, experimentalSkillAttachments), buffer);
+                }
+                return events;
+              } finally {
+                waiting.abort();
+                controller.signal.removeEventListener("abort", onAbort);
+                runtime.cancel();
+                await runtime.physicalSettlement;
+                if (token) await Promise.resolve(broker.revoke(token)).catch(() => {});
+              }
+            });
+            providerIntentRounds.set(key, owner);
+            void owner.events.then(
+              () => { owner.completed = true; },
+              () => { owner.completed = true; if (!owner.committed && providerIntentRounds.get(key) === owner) providerIntentRounds.delete(key); },
+            );
+            round = owner;
+          }
+          round.observers += 1;
+          try {
+            replayEvents(await withAbort(round.events, incoming.abortSignal), emit);
+          } finally {
+            round.observers -= 1;
+            if (round.observers === 0 && incoming.abortSignal?.aborted && !round.committed && !round.completed) round.controller.abort();
+          }
+          return;
         }
         if (parsed._compactionRequest && externalTurn === undefined) {
           const structuredCompactionRequired = parsed.modelId !== CHATGPT_WEB_LUNA_MODEL_ID
