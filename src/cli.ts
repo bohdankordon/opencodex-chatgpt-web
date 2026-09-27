@@ -62,6 +62,7 @@ Usage:
   codex-chatgpt-web dev chat NAME [--model MODEL] [MESSAGE]
   codex-chatgpt-web dev list
   codex-chatgpt-web serve
+  codex-chatgpt-web provider-token <status|rotate --yes>
   codex-chatgpt-web mcp [--broker-socket PATH]
   codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns>
   codex-chatgpt-web tunnel <status|start|restart|stop|key-import>
@@ -572,6 +573,32 @@ async function openCommand(args: string[]): Promise<void> {
   }
 }
 
+async function providerTokenCommand(args: string[]): Promise<void> {
+  const action = args.shift() ?? "status";
+  if (action === "status") {
+    assertNoArgs(args);
+    const config = loadConfig();
+    const { existsSync } = await import("node:fs");
+    const present = existsSync(config.providerTokenFile);
+    stdout.write(`OpenCodex provider secret file: ${config.providerTokenFile}\n`);
+    stdout.write(`Present: ${present ? "yes" : "no"}\n`);
+    stdout.write("The secret itself is never displayed. Configure OpenCodex with this secret as the provider apiKey.\n");
+    return;
+  }
+  if (action === "rotate") {
+    const yes = takeFlag(args, "--yes");
+    assertNoArgs(args);
+    if (!yes) throw new Error("provider-token rotate requires --yes to confirm; update the OpenCodex provider apiKey afterwards");
+    const config = loadConfig();
+    const { rotateOpencodexProviderTokenFile } = await import("./opencodex-provider-auth");
+    rotateOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+    stdout.write(`Rotated OpenCodex provider secret at ${config.providerTokenFile}\n`);
+    stdout.write("Update the OpenCodex provider apiKey to the new secret, then restart OpenCodex and sync.\n");
+    return;
+  }
+  throw new Error("Choose one of: status, rotate --yes");
+}
+
 async function uninstallCommand(args: string[]): Promise<void> {
   const yes = takeFlag(args, "--yes");
   const keepData = takeFlag(args, "--keep-data");
@@ -674,6 +701,7 @@ async function main(): Promise<void> {
   }
   else if (command === "tunnel") await tunnelCommand(args);
   else if (command === "open") await openCommand(args);
+  else if (command === "provider-token") await providerTokenCommand(args);
   else if (command === "uninstall") await uninstallCommand(args);
   else throw new Error(`Unknown command: ${command}\n\n${HELP}`);
 }

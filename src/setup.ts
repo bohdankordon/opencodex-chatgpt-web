@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import type { AppConfig, BrowserInteractionMode, IntegrationMode, RuntimeMode, SubagentProtocol } from "./config";
+import { ensureOpencodexProviderTokenFile } from "./opencodex-provider-auth";
 import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
@@ -181,6 +182,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
+    providerTokenFile: before.providerTokenFile,
     runtimeCommand: before.runtimeCommand,
     tunnel: before.tunnel,
     automaticTunnel: before.automaticTunnel,
@@ -213,6 +215,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
+    providerTokenFile: after.providerTokenFile,
     runtimeCommand: after.runtimeCommand,
     tunnel: after.tunnel,
     automaticTunnel: after.automaticTunnel,
@@ -545,6 +548,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   }
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
+  // S4B: ensure the private OpenCodex provider secret exists once when absent.
+  // Never overwrites a valid secret; fails closed on collision with controlToken.
+  // No secret is logged. The file path itself is part of config for review.
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
   const beforeService = getServiceStatus();
   if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
     if (!existing) {

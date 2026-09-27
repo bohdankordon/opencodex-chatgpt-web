@@ -137,6 +137,10 @@ function normalizedToolNamespace(value: unknown): string | undefined {
     : undefined;
 }
 
+function loweredToolSearchFunctionName(name: string): boolean {
+  return name === "tool_search" || name === "opencodex_tool_search" || /^opencodex_tool_search_\d+$/.test(name);
+}
+
 function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
   if (!tools) return undefined;
   const out: CodexTool[] = [];
@@ -170,7 +174,21 @@ function buildTools(tools: unknown[] | undefined): CodexTool[] | undefined {
   };
   for (const t of tools) {
     if (!isObj(t)) continue;
-    if (t.type === "function" && typeof t.name === "string") {
+    if (t.type === "function" && typeof t.name === "string" && loweredToolSearchFunctionName(t.name)) {
+      out.push({
+        name: t.name,
+        description: (t.description as string) ?? "Search for additional tools.",
+        parameters: (isObj(t.parameters) ? t.parameters : {
+          type: "object",
+          properties: {
+            query: { type: "string", description: "Search query." },
+            limit: { type: "number", description: "Max tools." },
+          },
+          required: ["query"],
+        }) as Record<string, unknown>,
+        toolSearch: true,
+      });
+    } else if (t.type === "function" && typeof t.name === "string") {
       pushFn(t);
     } else if (t.type === "namespace" && Array.isArray(t.tools)) {
       // Responses Lite groups ordinary native functions and the native freeform `exec` tool under
@@ -562,6 +580,47 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         pendingReasoning.length = 0;
         const output = item as { call_id: string; output?: string | unknown[] };
         const toolInfo = findToolById(messages, output.call_id);
+        // Provider-side lowered tool_search replay (OpenCodex 2.67): a native
+        // tool_search_output becomes function_call_output whose output is a JSON
+        // string like {"tools":[...],"status":"completed"}. Expose deferred specs
+        // so chat models can call them, mirroring the native branch above.
+        if (typeof output.output === "string" && loweredToolSearchFunctionName(toolInfo.name || "")) {
+          try {
+            const payload: unknown = JSON.parse(output.output);
+            if (payload && typeof payload === "object" && !Array.isArray(payload) && Array.isArray((payload as { tools?: unknown }).tools)) {
+              const specs = (payload as { tools: unknown[]; status?: unknown }).tools as Record<string, unknown>[];
+              loadedToolSpecs.push(...specs);
+              const wireNames: string[] = [];
+              for (const spec of specs) {
+                if (!spec || typeof spec !== "object" || Array.isArray(spec)) continue;
+                const entry = spec as { type?: unknown; name?: unknown; tools?: unknown };
+                if (entry.type === "namespace" && Array.isArray(entry.tools)) {
+                  const namespace = normalizedToolNamespace(entry.name);
+                  for (const inner of entry.tools as Record<string, unknown>[]) {
+                    if (inner && typeof inner.name === "string") wireNames.push(namespacedToolName(namespace, inner.name));
+                  }
+                } else if (typeof entry.name === "string") {
+                  wireNames.push(entry.name);
+                }
+              }
+              const status = (payload as { status?: unknown }).status;
+              const failed = typeof status === "string" && status !== "completed" && status !== "success";
+              messages.push({
+                role: "toolResult", toolCallId: output.call_id,
+                toolName: toolInfo.name, toolNamespace: toolInfo.namespace,
+                content: failed && wireNames.length === 0
+                  ? "Tool search failed (status: " + String(status) + ")."
+                  : wireNames.length
+                    ? "Tool search loaded these tools. Call one by its EXACT name: " + wireNames.join(", ") + "."
+                    : "Tool search returned no tools.",
+                isError: failed && wireNames.length === 0, timestamp: now,
+              });
+              continue;
+            }
+          } catch {
+            // Not a tool-search JSON payload; fall through to generic handling.
+          }
+        }
         messages.push({
           role: "toolResult", toolCallId: output.call_id,
           toolName: toolInfo.name, toolNamespace: toolInfo.namespace,

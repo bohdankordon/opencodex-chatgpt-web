@@ -8,6 +8,10 @@ import {
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
 } from "./chatgpt-web-models";
 import { validateExternalClients, type ExternalClientRecord } from "./external-client";
+import {
+  getDefaultOpencodexProviderTokenFile,
+  OPENCODEX_PROVIDER_TOKEN_FILE_NAME,
+} from "./opencodex-provider-auth";
 import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
 
@@ -133,6 +137,15 @@ export interface AppConfig {
   autoApproveToolCalls: boolean;
   controlToken: string;
   runtimeCommand: string[];
+  /**
+   * Private local OpenCodex provider secret file referenced by configuration.
+   * The file holds exactly one high-entropy Bearer secret for the OpenCodex
+   * provider path (GET /v1/models, POST /v1/responses). It is distinct from
+   * controlToken and from generic externalClients credentials. Older
+   * installations without this field default to the app-home file without
+   * rewriting anything on disk; setup/serve generates it once when absent.
+   */
+  providerTokenFile: string;
   /**
    * Credentials admitted through the authenticated-external boundary. Stored configuration may
    * omit the field entirely; the in-memory shape is always the validated list.
@@ -268,6 +281,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
+    providerTokenFile: getDefaultOpencodexProviderTokenFile(home),
     externalClients: [],
   };
 }
@@ -487,6 +501,22 @@ function parseConfig(value: unknown, path: string): AppConfig {
   for (const key of requiredStrings) {
     if (typeof parsed[key] !== "string" || !(parsed[key] as string).trim()) throw new Error(`Missing ${key} in ${path}`);
   }
+  // Guarded migration for the S4B provider boundary: installations written before the
+  // provider secret existed have no providerTokenFile and stay valid. Default it to the
+  // file next to the loaded config without touching disk; generation happens in
+  // setup/serve, never during config load. An explicit value must be absolute.
+  const rawProviderTokenFile = (value as Record<string, unknown>).providerTokenFile;
+  let providerTokenFile: string;
+  if (rawProviderTokenFile === undefined) {
+    providerTokenFile = join(dirname(path), OPENCODEX_PROVIDER_TOKEN_FILE_NAME);
+  } else {
+    if (typeof rawProviderTokenFile !== "string" || !rawProviderTokenFile.trim()) {
+      throw new Error(`Invalid providerTokenFile in ${path}`);
+    }
+    const expanded = expandUserPath(rawProviderTokenFile.trim());
+    if (!isAbsolute(expanded)) throw new Error(`providerTokenFile must be absolute in ${path}`);
+    providerTokenFile = resolve(expanded);
+  }
   if (parsed.appName!.length > 80) throw new Error(`appName is too long in ${path}`);
   const automaticAppName = parsed.automaticAppName
     ?? (browserInteractionMode === "automatic" ? parsed.appName : CHATGPT_CONNECTOR_NAME);
@@ -647,6 +677,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
     useSavedChats,
     zeroRiskProEnabled,
     integrationMode: resolvedIntegrationMode,
+    providerTokenFile,
     externalClients,
   } as AppConfig;
 }

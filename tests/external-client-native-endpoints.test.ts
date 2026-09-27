@@ -6,6 +6,7 @@ import type { IncomingMeta, ProviderAdapter } from "../src/adapters/base";
 import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 import { chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { defaultConfig } from "../src/config";
+import { ensureOpencodexProviderTokenFile, readOpencodexProviderTokenFile } from "../src/opencodex-provider-auth";
 import { EXTERNAL_CLIENT_ID_HEADER, generateExternalClientToken } from "../src/external-client";
 import { compactRequest, startServer } from "../src/server";
 
@@ -20,9 +21,19 @@ const HEADER = EXTERNAL_CLIENT_ID_HEADER;
 const AUTH_FAILURE_BODY = JSON.stringify({
   error: { message: "External client authentication failed", type: "authentication_error", code: "invalid_api_key" },
 });
+const PROVIDER_AUTH_FAILURE_BODY = JSON.stringify({
+  error: { message: "OpenCodex provider authentication failed", type: "authentication_error", code: "invalid_api_key" },
+});
 const COMPACT_UNSUPPORTED_BODY = JSON.stringify({
   error: {
     message: "Authenticated external-client compaction is not supported",
+    type: "unsupported_operation",
+    code: "unsupported_operation",
+  },
+});
+const PROVIDER_COMPACT_UNSUPPORTED_BODY = JSON.stringify({
+  error: {
+    message: "OpenCodex compaction uses POST /v1/responses; this endpoint is not part of the OpenCodex provider contract",
     type: "unsupported_operation",
     code: "unsupported_operation",
   },
@@ -231,9 +242,13 @@ test("compact classifies the dedicated header before promotion and native identi
 });
 
 test("authenticated external compact gets one unsupported answer and binds no native identity", async () => {
+  // S4B: provider-authenticated /compact answers 501 with the provider message,
+  // whatever the body contains; no identity binds, no browser starts.
   isolatedEnvironment();
-  const token = generateExternalClientToken();
-  const config = withExternalClient(externalProviderConfig(), token);
+  const config = externalProviderConfig();
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const providerToken = readOpencodexProviderTokenFile(config.providerTokenFile);
+  const providerAuth = (extra: Array<[string, string]> = []): Array<[string, string]> => [["authorization", "Bearer " + providerToken], ...extra];
   chatGptTurnSessions.clear();
   const bound: Array<{ threadId: string; turnId: string }> = [];
   let adapterStarts = 0;
@@ -253,7 +268,7 @@ test("authenticated external compact gets one unsupported answer and binds no na
   const metadataVariants: Array<string | undefined> = [SPOOFED_METADATA, "{not json", undefined];
   for (const body of bodies) {
     for (const metadata of metadataVariants) {
-      const headers = clientHeaders(token, metadata === undefined ? [] : [[METADATA_HEADER, metadata]]);
+      const headers = providerAuth(metadata === undefined ? [] : [[METADATA_HEADER, metadata]]);
       const response = await compactRequest(
         inProcessRequest("/v1/responses/compact", body, headers),
         config,
@@ -261,7 +276,7 @@ test("authenticated external compact gets one unsupported answer and binds no na
         { onTurnIdentity: identity => bound.push(identity) },
       );
       expect([JSON.stringify(body), metadata ?? "none", response.status, await response.text()])
-        .toEqual([JSON.stringify(body), metadata ?? "none", 501, COMPACT_UNSUPPORTED_BODY]);
+        .toEqual([JSON.stringify(body), metadata ?? "none", 501, PROVIDER_COMPACT_UNSUPPORTED_BODY]);
     }
   }
   expect(bound).toEqual([]);
@@ -294,24 +309,17 @@ test("Direct compact rejects the dedicated header before any native work", async
 });
 
 test("external compact wrong credentials never disclose model or metadata state", async () => {
+  // S4B: wrong/missing provider Bearer shares one provider 401, no disclosure.
   isolatedEnvironment();
-  const config = withExternalClient(externalProviderConfig(), generateExternalClientToken());
+  const config = externalProviderConfig();
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
   const bodies: string[] = [];
   for (const model of ["gpt-5.6-sol", "chatgpt-web/not-a-route", "chatgpt-web/luna", "chatgpt-web/medium"]) {
     for (const metadata of [SPOOFED_METADATA, "{not json", undefined]) {
-      const headers: Array<[string, string]> = [
-        [HEADER, "hermes-local"],
-        ["authorization", "Bearer " + "W".repeat(43)],
-        ...(metadata === undefined ? [] : [[METADATA_HEADER, metadata]] as Array<[string, string]>),
-      ];
-      const response = await compactRequest(
-        inProcessRequest("/v1/responses/compact", { model, input: [] }, headers),
-        config,
-        () => { throw new Error("the browser adapter must not start"); },
-      );
+      const headers: Array<[string, string]> = [["authorization", "Bearer " + "W".repeat(43)], ...(metadata === undefined ? [] : [[METADATA_HEADER, metadata]] as Array<[string, string]>)];
+      const response = await compactRequest(inProcessRequest("/v1/responses/compact", { model, input: [] }, headers), config, () => { throw new Error("no start"); });
       const text = await response.text();
-      expect([model, metadata ?? "none", response.status, text])
-        .toEqual([model, metadata ?? "none", 401, AUTH_FAILURE_BODY]);
+      expect([model, metadata ?? "none", response.status, text]).toEqual([model, metadata ?? "none", 401, PROVIDER_AUTH_FAILURE_BODY]);
       bodies.push(text);
     }
   }
@@ -320,24 +328,14 @@ test("external compact wrong credentials never disclose model or metadata state"
 
 test("the real compact route never binds spoofed identity for external traffic", async () => {
   isolatedEnvironment();
-  const token = generateExternalClientToken();
-  const config = withExternalClient(externalProviderConfig(), token);
+  const config = externalProviderConfig();
   await withServer(config, async ({ port, upstream, adapterStarts }) => {
-    const good = await post(
-      port,
-      "/v1/responses/compact",
-      { model: "chatgpt-web/medium", input: [] },
-      clientHeaders(token, [[METADATA_HEADER, SPOOFED_METADATA]]),
-    );
-    expect([good.status, await good.text()]).toEqual([501, COMPACT_UNSUPPORTED_BODY]);
-
-    const wrong = await post(
-      port,
-      "/v1/responses/compact",
-      { model: "chatgpt-web/medium", input: [] },
-      [[HEADER, "hermes-local"], ["authorization", "Bearer " + "W".repeat(43)], [METADATA_HEADER, SPOOFED_METADATA]],
-    );
-    expect([wrong.status, await wrong.text()]).toEqual([401, AUTH_FAILURE_BODY]);
+    const providerToken = readOpencodexProviderTokenFile(config.providerTokenFile);
+    const auth: Array<[string, string]> = [["authorization", "Bearer " + providerToken]];
+    const good = await post(port, "/v1/responses/compact", { model: "chatgpt-web/medium", input: [] }, [...auth, [METADATA_HEADER, SPOOFED_METADATA]]);
+    expect([good.status, await good.text()]).toEqual([501, PROVIDER_COMPACT_UNSUPPORTED_BODY]);
+    const wrong = await post(port, "/v1/responses/compact", { model: "chatgpt-web/medium", input: [] }, [["authorization", "Bearer " + "W".repeat(43)], [METADATA_HEADER, SPOOFED_METADATA]]);
+    expect([wrong.status, await wrong.text()]).toEqual([401, PROVIDER_AUTH_FAILURE_BODY]);
     expect([upstream.length, adapterStarts()]).toEqual([0, 0]);
   });
 });
@@ -363,38 +361,33 @@ test("Direct search and image endpoints reject the dedicated header before upstr
 });
 
 test("external-provider search and image endpoints authenticate before their unsupported answer", async () => {
+  // S4B: provider Bearer required; wrong shares one provider 401, valid reaches 501
+  // with the provider unsupported message (not the old external-client message).
   isolatedEnvironment();
-  const token = generateExternalClientToken();
-  const config = withExternalClient(externalProviderConfig(), token);
+  const config = externalProviderConfig();
   await withServer(config, async ({ port, upstream }) => {
-    const paths: Array<[string, string]> = [
-      ["/v1/alpha/search", SEARCH_UNSUPPORTED_BODY],
-      ["/v1/images/generations", IMAGES_UNSUPPORTED_BODY],
-      ["/v1/images/edits", IMAGES_UNSUPPORTED_BODY],
-    ];
-    for (const [path, body] of paths) {
-      const wrong = await post(
-        port,
-        path,
-        { model: "gpt-5.6-sol" },
-        [[HEADER, "hermes-local"], ["authorization", "Bearer " + "W".repeat(43)]],
-      );
-      expect([path, "wrong", wrong.status, await wrong.text()])
-        .toEqual([path, "wrong", 401, AUTH_FAILURE_BODY]);
-
-      const good = await post(port, path, { model: "gpt-5.6-sol" }, clientHeaders(token));
-      expect([path, "good", good.status, await good.text()]).toEqual([path, "good", 501, body]);
+    const providerToken = readOpencodexProviderTokenFile(config.providerTokenFile);
+    const goodAuth: Array<[string, string]> = [["authorization", "Bearer " + providerToken]];
+    const expected: Record<string, string> = {
+      "/v1/alpha/search": JSON.stringify({ error: { message: "Native search is not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }),
+      "/v1/images/generations": JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }),
+      "/v1/images/edits": JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }),
+    };
+    for (const path of Object.keys(expected)) {
+      const wrong = await post(port, path, { model: "gpt-5.6-sol" }, [["authorization", "Bearer " + "W".repeat(43)]]);
+      expect([path, "wrong", wrong.status, await wrong.text()]).toEqual([path, "wrong", 401, PROVIDER_AUTH_FAILURE_BODY]);
+      const good = await post(port, path, { model: "gpt-5.6-sol" }, goodAuth);
+      expect([path, "good", good.status, await good.text()]).toEqual([path, "good", 501, expected[path]]);
     }
     expect(upstream).toHaveLength(0);
   });
 });
 
 test("header-absent legacy behavior on the corrected endpoints is unchanged", async () => {
+  // S4B: Direct without header still uses native stub; provider without Bearer is
+  // 401 provider (not legacy 501/400); provider /compact is always 501.
   isolatedEnvironment();
-  const token = generateExternalClientToken();
-  const external = withExternalClient(externalProviderConfig(), token);
-
-  // Direct search and images still use the injected native stub when no dedicated header is sent.
+  const external = externalProviderConfig();
   await withServer(directConfig(), async ({ port, upstream }) => {
     const nativeAuthorization: Array<[string, string]> = [["authorization", "Bearer codex-oauth-token"]];
     const search = await post(port, "/v1/alpha/search", { query: "x" }, nativeAuthorization);
@@ -403,51 +396,16 @@ test("header-absent legacy behavior on the corrected endpoints is unchanged", as
     expect(images.status).toBe(200);
     expect(upstream).toHaveLength(2);
   });
-
-  // External-provider search and images keep their existing unsupported answer without the header.
   await withServer(external, async ({ port, upstream }) => {
-    for (const path of ["/v1/alpha/search", "/v1/images/generations", "/v1/images/edits"]) {
+    for (const path of ["/v1/alpha/search", "/v1/images/generations", "/v1/images/edits", "/v1/responses/compact"]) {
       const response = await post(port, path, { model: "gpt-5.6-sol" });
-      expect([path, response.status]).toEqual([path, 501]);
+      expect([path, response.status, await response.text()]).toEqual([path, 401, PROVIDER_AUTH_FAILURE_BODY]);
     }
     expect(upstream).toHaveLength(0);
   });
-
-  // External-provider compact keeps its native-metadata contract without the header.
-  const missingMetadata = await compactRequest(
-    inProcessRequest(
-      "/v1/responses/compact",
-      { model: "chatgpt-web/medium", input: [] },
-      [["authorization", "Bearer codex-oauth-token"]],
-    ),
-    external,
-    () => { throw new Error("the browser adapter must not start"); },
-  );
-  expect([missingMetadata.status, JSON.parse(await missingMetadata.text()).error.message])
-    .toEqual([400, METADATA_ERROR_MESSAGE]);
-
-  // ...and a header-absent compact with valid native metadata still enters the legacy path: the
-  // injected adapter factory is reached, which can only happen after the external gate is skipped.
-  // (The full legacy compaction turn stays covered by the existing external-provider suite.)
-  let adapterCalls = 0;
-  let legacyThrew = false;
-  const metadata = JSON.stringify({ thread_id: "thread_legacy", turn_id: "turn_legacy" });
-  try {
-    const legacy = await compactRequest(
-      inProcessRequest(
-        "/v1/responses/compact",
-        { model: "chatgpt-web/medium", input: [] },
-        [["authorization", "Bearer codex-oauth-token"], [METADATA_HEADER, metadata]],
-      ),
-      external,
-      () => {
-        adapterCalls += 1;
-        throw new Error("legacy compact path reached");
-      },
-    );
-    expect(legacy.status).not.toBe(401);
-  } catch {
-    legacyThrew = true;
-  }
-  expect([adapterCalls, legacyThrew]).toEqual([1, true]);
+  ensureOpencodexProviderTokenFile(external.providerTokenFile, external.controlToken);
+  const providerToken = readOpencodexProviderTokenFile(external.providerTokenFile);
+  const auth: Array<[string, string]> = [["authorization", "Bearer " + providerToken]];
+  const missing = await compactRequest(inProcessRequest("/v1/responses/compact", { model: "chatgpt-web/medium", input: [] }, auth), external, () => { throw new Error("no start"); });
+  expect(missing.status).toBe(501);
 });

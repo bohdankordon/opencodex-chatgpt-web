@@ -22,6 +22,18 @@ import type { AppConfig } from "./config";
 import { isExternalProviderMode, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import {
+  dummyProviderTokenCompare,
+  ensureOpencodexProviderTokenFile,
+  opencodexProviderAuthFailure,
+  opencodexProviderUnsupportedModel,
+  opencodexProviderUnsupportedRequest,
+  OPENCODEX_PROVIDER_COMPACT_ENDPOINT_MESSAGE,
+  OPENCODEX_PROVIDER_PREVIOUS_RESPONSE_MESSAGE,
+  parseProviderBearerToken,
+  readOpencodexProviderTokenFile,
+  verifyOpencodexProviderToken,
+} from "./opencodex-provider-auth";
+import {
   dummyTimingSafeCompare,
   findExternalClient,
   parseBearerToken,
@@ -419,15 +431,11 @@ export async function modelsRequest(
   onFailure?: (failure: ModelCatalogFailure) => void,
 ): Promise<Response> {
   if (isExternalProviderMode(config)) {
-    // Catalog presentation only. Any dedicated client header selects the external-client
-    // presentation, and its validity is deliberately not consulted: model discovery is not an
-    // authorization decision, so nothing here reads externalClients, verifies a token, or looks
-    // at Authorization.
-    const externalClientHeader = readExternalClientHeader(req.headers);
-    const catalog = buildExternalProviderModelCatalog(
-      config,
-      externalClientHeader.present ? "external-client" : "legacy",
-    );
+    // S4B OpenCodex provider boundary: Bearer auth BEFORE catalog work. Ignores
+    // the generic external-client header; never reads externalClients. Web-only.
+    const authFailure = requireOpencodexProviderAuth(req, config);
+    if (authFailure) return authFailure;
+    const catalog = buildExternalProviderModelCatalog(config, "legacy");
     const body = JSON.stringify(catalog);
     return new Response(body, {
       status: 200,
@@ -568,6 +576,40 @@ const EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE = "Authenticated external-clien
 /** The single response construction path shared by every external authentication failure. */
 function externalClientAuthFailure(): Response {
   return formatErrorResponse(401, "authentication_error", EXTERNAL_CLIENT_AUTH_FAILURE_MESSAGE);
+}
+
+/**
+ * Dedicated OpenCodex provider authentication primitive (S4B).
+ *
+ * Independent from generic external-client identity. Verifies a single high-entropy
+ * local provider secret via constant-time Bearer comparison. Missing, malformed, and
+ * wrong credentials all fail with the same 401 class. Must run BEFORE any model
+ * discovery, browser work, or request parsing. Never logs the secret.
+ *
+ * Returns undefined when authenticated, otherwise the failure Response to return.
+ * A missing/unreadable/invalid server secret is a 500 (clear server misconfiguration),
+ * distinct from a 401 for client credentials.
+ */
+function requireOpencodexProviderAuth(req: Request, config: AppConfig): Response | undefined {
+  let expected: string;
+  try {
+    expected = readOpencodexProviderTokenFile(config.providerTokenFile);
+  } catch {
+    return formatErrorResponse(
+      500,
+      "server_error",
+      "OpenCodex provider secret is not configured correctly",
+    );
+  }
+  const presented = parseProviderBearerToken(req.headers.get("authorization"));
+  if (presented === undefined) {
+    dummyProviderTokenCompare("");
+    return opencodexProviderAuthFailure();
+  }
+  if (!verifyOpencodexProviderToken(expected, presented)) {
+    return opencodexProviderAuthFailure();
+  }
+  return undefined;
 }
 
 /**
@@ -861,12 +903,191 @@ async function externalClientRouteAdmission(
   return externalClientReadOnlyResponse(req, config, authority, raw, parsed, route, adapterFactory, options);
 }
 
+function hasOpencodexPreviousResponseId(raw: unknown): boolean {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const value = (raw as { previous_response_id?: unknown }).previous_response_id;
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+}
+
+/**
+ * S4B OpenCodex provider admission and execution.
+ *
+ * Runs only after provider Bearer auth. Accepts the captured 2.67 family:
+ * normal full replay, Codex tool declarations, tool_search declaration,
+ * function_call replay, function_call_output replay, tool_search_call replay,
+ * tool_search_output replay (including lowered function_call forms), and
+ * compaction via ordinary POST /v1/responses. Tool-bearing requests are ACCEPTED
+ * (Codex routinely declares tools even for plain-text turns); S4C will redesign
+ * the tool-intent handoff, not S4B. Previous_response_id is rejected (full replay
+ * only). No native fallback, no silent default, no closest model.
+ */
+async function opencodexProviderResponse(
+  req: Request,
+  config: AppConfig,
+  adapterFactory: ChatGptWebAdapterFactory,
+  options: ResponseRequestOptions,
+): Promise<Response> {
+  let raw: unknown;
+  try {
+    raw = await readJsonRequestBody(req);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : "Request body must be valid JSON");
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    raw = applyCodexTurnMetadataHeader(raw as Record<string, unknown>, req);
+  }
+  const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as { model?: unknown }).model
+    : undefined;
+  if (typeof requestedModel !== "string" || !isChatGptWebModelSlug(requestedModel)) {
+    return opencodexProviderUnsupportedModel(requestedModel);
+  }
+  if (hasOpencodexPreviousResponseId(raw)) {
+    return opencodexProviderUnsupportedRequest(OPENCODEX_PROVIDER_PREVIOUS_RESPONSE_MESSAGE);
+  }
+  let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
+  try {
+    nativeIdentity = extractCodexTurnIdentityFromBody(raw);
+    if (nativeIdentity.threadId && nativeIdentity.turnId) {
+      options.onTurnIdentity?.({ threadId: nativeIdentity.threadId, turnId: nativeIdentity.turnId });
+    }
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  const metadataError = externalProviderTurnMetadataError(config, requestedModel, nativeIdentity);
+  if (metadataError) return metadataError;
+  let parsed: CodexParsedRequest;
+  try {
+    parsed = parseRequest(raw);
+    parsed._externalProviderTrusted = true;
+    const wireEffort = (raw as { reasoning?: { effort?: unknown } }).reasoning?.effort;
+    if (typeof wireEffort === "string" && parsed.options.reasoning === undefined) parsed.options.reasoning = wireEffort;
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  let route: ChatGptWebModelRoute;
+  try {
+    route = routeChatGptWebRequest(parsed, config);
+  } catch {
+    return opencodexProviderUnsupportedModel(requestedModel);
+  }
+  // S4B provider is automatic browser inference only. Manual Zero Risk routes
+  // require the launcher UI and are never served on this path.
+  if (route.interactionMode !== "automatic") {
+    return opencodexProviderUnsupportedModel(requestedModel);
+  }
+  // Preserve fixed-effort bindings for legacy routes (no supportedCodexEfforts list).
+  // Legacy fixed routes (no supportedCodexEfforts list) accept any known effort and
+  // execute with the route's fixed binding (captured high+medium turns prove this).
+  // Only an unknown effort string is rejected before browser submission.
+  const wireEffortForFixed = (raw as { reasoning?: { effort?: unknown } }).reasoning?.effort;
+  if (!route.supportedCodexEfforts && typeof wireEffortForFixed === "string" && !["low", "medium", "high", "xhigh", "max", "ultra"].includes(wireEffortForFixed)) {
+    return opencodexProviderUnsupportedModel(requestedModel);
+  }
+  try {
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (identity.threadId && identity.turnId) {
+      options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
+    }
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  if (parsed._opaqueMultiAgentV2Payload) {
+    return formatErrorResponse(400, "invalid_request_error", "ChatGPT Web cannot read this encrypted cross-backend subagent payload. Start a new Compatibility V1 task.");
+  }
+  const compaction = parsed._compactionRequest === true;
+  const compactionItem = compaction && parsed._compactionResponseFormat !== "message";
+  const rememberCompletedResponse = (response: Record<string, unknown>): void => {
+    if (!compaction) return;
+    if (response.status !== "completed") return;
+    const identity = extractChatGptTurnIdentity(parsed);
+    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output)) return;
+    const items = response.output.filter(item => item?.type === (compactionItem ? "compaction" : "message"));
+    if (items.length !== 1 || (compactionItem && response.output.length !== 1)) return;
+    const item = items[0];
+    const summary = compactionItem
+      ? (typeof item?.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null)
+      : (item?.role === "assistant" && Array.isArray(item.content)
+        ? item.content.filter((part: { type?: string; text?: unknown }) => part.type === "output_text" && typeof part.text === "string").map((part: { text: string }) => part.text).join("")
+        : null);
+    if (!summary) return;
+    const source = extractChatGptCompactionSourceRevision(parsed);
+    const body = parsed._rawBody as { input?: unknown[] };
+    const v1Source = extractChatGptCompactionSourceRevision({ ...parsed, _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) } });
+    rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
+  };
+  if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
+    return formatErrorResponse(400, "invalid_request_error", "ChatGPT Web Luna uses a rolling checkpoint; separate Codex compaction is disabled for this route.");
+  }
+  if (compaction) {
+    delete parsed.context.tools;
+    delete parsed.options.toolChoice;
+    delete parsed.options.parallelToolCalls;
+    parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
+  }
+  const provider = providerConfig(config);
+  let traceId: string | undefined;
+  try {
+    traceId = chatGptWebTraceId(provider, parsed);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === CHATGPT_TURN_REVISION_CONFLICT_MESSAGE) {
+      return formatErrorResponse(400, "invalid_request_error", message);
+    }
+    if (!message.includes("requires native Codex turn_id metadata") && !message.includes("requires a current-turn user message")) throw error;
+  }
+  const cancelledError = traceId ? chatGptTurnSessions.cancelledError(traceId) : undefined;
+  if (cancelledError) {
+    return new Response(JSON.stringify({ error: { type: "client_closed_request", code: "client_cancelled", message: cancelledError.message } }), { status: 400, headers: { "content-type": "application/json" } });
+  }
+  const adapter = adapterFactory(provider);
+  const queue = new AsyncEventQueue<AdapterEvent>();
+  const abort = new AbortController();
+  if (req.signal.aborted) abort.abort();
+  else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
+  const run = async () => {
+    try {
+      await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: abort.signal }, event => { options.onAdapterEvent?.(event); queue.push(event); });
+    } catch (error) {
+      const event: AdapterEvent = { type: "error", message: error instanceof Error ? error.message : String(error) };
+      options.onAdapterEvent?.(event);
+      queue.push(event);
+    } finally {
+      queue.close();
+    }
+  };
+  const maps = toolBridgeMaps(parsed);
+  const responseModel = route.slug;
+  if (parsed.stream) {
+    void run();
+    const stream = bridgeToResponsesSSE(queue, responseModel, maps.toolNsMap, maps.freeformToolNames, maps.toolSearchToolNames, () => abort.abort(), 2_000, { hideThinkingSummary: parsed.options.hideThinkingSummary, ...(provider.chatgptWeb?.stallTimeoutSec !== undefined ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec } : {}), ...(compactionItem ? { compaction: true } : {}), onCompletedResponse: rememberCompletedResponse });
+    return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" } });
+  }
+  await run();
+  const events = await queue.collect();
+  const json = buildResponseJSON(events, responseModel, { hideThinkingSummary: parsed.options.hideThinkingSummary, toolNsMap: maps.toolNsMap, freeformToolNames: maps.freeformToolNames, toolSearchToolNames: maps.toolSearchToolNames, ...(compactionItem ? { compaction: true } : {}) });
+  rememberCompletedResponse(json);
+  return Response.json(json);
+}
+
 export async function responseRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: ResponseRequestOptions = {},
 ): Promise<Response> {
+  // S4B OpenCodex provider boundary: Bearer auth BEFORE body parsing, model
+  // discovery, or browser work. The generic external-client header is ignored on
+  // this path; OpenCodex owns provider configuration, this fork only verifies
+  // its own provider secret.
+  if (isExternalProviderMode(config)) {
+    const authFailure = requireOpencodexProviderAuth(req, config);
+    if (authFailure) return authFailure;
+    return opencodexProviderResponse(req, config, adapterFactory, options);
+  }
   const nativeRequest = req.clone();
   let raw: unknown;
   try {
@@ -1107,6 +1328,14 @@ export async function compactRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: Pick<ResponseRequestOptions, "onTurnIdentity"> = {},
 ): Promise<Response> {
+  // S4B: OpenCodex compaction travels via ordinary POST /v1/responses, never via
+  // this legacy endpoint. Authenticate the provider BEFORE body parsing, then
+  // answer unsupported so callers cannot depend on /compact on this path.
+  if (isExternalProviderMode(config)) {
+    const authFailure = requireOpencodexProviderAuth(req, config);
+    if (authFailure) return authFailure;
+    return new Response(JSON.stringify({ error: { message: OPENCODEX_PROVIDER_COMPACT_ENDPOINT_MESSAGE, type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
+  }
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
   try {
@@ -1229,6 +1458,9 @@ export function startServer(
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
+  }
+  if (isExternalProviderMode(config)) {
+    ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
   }
   const startedAt = Date.now();
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
@@ -1510,15 +1742,17 @@ export function startServer(
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
-        // Dedicated external-client traffic never enters a native passthrough boundary: Direct mode
-        // fails closed, and external-provider authenticates before the unsupported answer.
+        // S4B: provider path requires Bearer auth before the unsupported answer;
+        // Direct keeps the legacy external-client fail-closed gate.
+        if (isExternalProviderMode(config)) {
+          const authFailure = requireOpencodexProviderAuth(req, config);
+          if (authFailure) return authFailure;
+          return new Response(JSON.stringify({ error: { message: "Native search is not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
+        }
         const externalSearch = authenticateExternalClientRequest(req, config);
         if (externalSearch.kind === "rejected") return externalSearch.response;
         if (externalSearch.kind === "authenticated") {
           return externalClientUnsupportedResponse(EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE);
-        }
-        if (isExternalProviderMode(config)) {
-          return formatErrorResponse(501, "unsupported_operation", "Native search is not provided by codex-chatgpt-web in external-provider mode");
         }
         return httpTurns.track(
           signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),
@@ -1530,15 +1764,17 @@ export function startServer(
       if (req.method === "POST"
         && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits")) {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        if (isExternalProviderMode(config)) {
+          const authFailure = requireOpencodexProviderAuth(req, config);
+          if (authFailure) return authFailure;
+          return new Response(JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
+        }
         // Same trust-domain gate as search: no image request may carry an external credential or
         // the dedicated client header into the native Codex boundary.
         const externalImages = authenticateExternalClientRequest(req, config);
         if (externalImages.kind === "rejected") return externalImages.response;
         if (externalImages.kind === "authenticated") {
           return externalClientUnsupportedResponse(EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE);
-        }
-        if (isExternalProviderMode(config)) {
-          return formatErrorResponse(501, "unsupported_operation", "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode");
         }
         const endpoint: NativeImageEndpoint = url.pathname === "/v1/images/generations"
           ? "images/generations"

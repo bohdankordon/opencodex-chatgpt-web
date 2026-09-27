@@ -1,0 +1,89 @@
+{
+  "_provenance": "CAPTURED + SOURCE (OpenCodex 2.67 lowering per src/responses/tool-search-compat.ts and custom-tool-compat.ts; values synthetic)",
+  "_note": "Provider-side lowered forms: tool_search declaration becomes function, tool_search_call becomes function_call with JSON-string arguments, tool_search_output becomes function_call_output with JSON-string output containing tools. Custom apply_patch becomes function with input param, custom_tool_call becomes function_call with {input}. All must be accepted by the provider boundary; JSON-string tool-search output must expose deferred specs.",
+  "declarations_provider_lowered": [
+    {
+      "type": "function",
+      "name": "exec_command",
+      "description": "Run a shell command.",
+      "parameters": {
+        "type": "object"
+      }
+    },
+    {
+      "type": "function",
+      "name": "apply_patch",
+      "description": "Apply a patch envelope.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "input"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "tool_search",
+      "description": "Search for additional tools.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    {
+      "type": "function",
+      "name": "clock__sleep",
+      "description": "Sleep.",
+      "parameters": {
+        "type": "object"
+      }
+    }
+  ],
+  "tool_search_lowered_round": [
+    {
+      "type": "function_call",
+      "id": "fc_s4a_01",
+      "call_id": "call_s4a_search_01",
+      "name": "tool_search",
+      "arguments": "{\"query\":\"subagent spawn\",\"limit\":8}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_s4a_search_01",
+      "output": "{\"tools\":[{\"type\":\"namespace\",\"name\":\"subagents\",\"description\":\"Subagents.\",\"tools\":[{\"type\":\"function\",\"name\":\"spawn_worker\",\"description\":\"Spawn a worker.\",\"parameters\":{\"type\":\"object\"}}]}],\"status\":\"completed\"}"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_s4a_spawn_01",
+      "name": "subagents__spawn_worker",
+      "arguments": "{\"task\":\"Summarize.\"}"
+    }
+  ],
+  "custom_lowered_round": [
+    {
+      "type": "function_call",
+      "id": "fc_s4a_patch_01",
+      "call_id": "call_s4a_patch_01",
+      "name": "apply_patch",
+      "arguments": "{\"input\":\"*** Begin Patch\\n*** Add File: synthetic.txt\\n+hello\\n*** End Patch\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_s4a_patch_01",
+      "output": "OK"
+    }
+  ]
+}

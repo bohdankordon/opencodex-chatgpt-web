@@ -80,20 +80,23 @@ test("external-provider Full setup report includes both routing and connector gu
 });
 
 test("external-provider model lists do not call native Codex and omit unavailable models", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { ensureOpencodexProviderTokenFile } = await import("../src/opencodex-provider-auth");
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-pc-"));
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
   config.proAvailable = false;
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const headers = new Headers(); headers.set("authorization", "Bearer " + token);
   let upstreamCalls = 0;
-  const response = await modelsRequest(
-    new Request("http://127.0.0.1:17841/v1/models"),
-    config,
-    async () => {
-      upstreamCalls += 1;
-      throw new Error("native Codex must not be contacted");
-    },
-  );
+  const response = await modelsRequest(new Request("http://127.0.0.1:17841/v1/models", { headers }), config, async () => { upstreamCalls += 1; throw new Error("native"); });
   expect(upstreamCalls).toBe(0);
   expect(response.status).toBe(200);
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
   const body = await response.json() as { data: Array<{ id: string; capabilities?: string[] }> };
   expect(body.data.map(model => model.id)).toEqual([
     "chatgpt-web/gpt-5.6-sol-instant",
@@ -136,71 +139,52 @@ test("external-provider catalog groups account-supported effort without advertis
 });
 
 test("external-provider Responses reject unknown models instead of native fallback", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { ensureOpencodexProviderTokenFile } = await import("../src/opencodex-provider-auth");
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-unk-"));
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
-  const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
-  }), config, () => {
-    throw new Error("adapter must not start");
-  });
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const headers = new Headers({ "content-type": "application/json" }); headers.set("authorization", "Bearer " + token);
+  const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", { method: "POST", headers, body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }) }), config, () => { throw new Error("adapter must not start"); });
   expect(response.status).toBe(400);
-  const body = await response.json() as { error: { message: string } };
+  const body = await response.json() as { error: { message: string; code?: string } };
   expect(body.error.message).toContain("not provided by codex-chatgpt-web");
+  expect(body.error.code).toBe("unsupported_model");
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
+  rmSync(appHome, { recursive: true, force: true });
 });
 
 test("external-provider compact keeps canonical header metadata authoritative and rejects native models", async () => {
+  // S4B: OpenCodex compaction uses ordinary POST /v1/responses, never the legacy
+  // /responses/compact endpoint. Provider-authenticated /compact answers 501
+  // without binding identity or starting the browser; missing Bearer is 401.
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { ensureOpencodexProviderTokenFile } = await import("../src/opencodex-provider-auth");
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-cpt-"));
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("full");
   config.integrationMode = "external-provider";
-  const native = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-codex-turn-metadata": JSON.stringify({ thread_id: "thread_a", turn_id: "turn_a" }),
-    },
-    body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
-  }), config);
-  expect(native.status).toBe(400);
-
-  const canonicalMetadata = { thread_id: "thread_web", turn_id: "turn_web" };
-  const staleBodyMetadata = { thread_id: "stale_thread", turn_id: "stale_turn" };
-  const web = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-codex-turn-metadata": JSON.stringify(canonicalMetadata),
-    },
-    body: JSON.stringify({
-      model: "chatgpt-web/high",
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify(staleBodyMetadata),
-      },
-      input: [
-        {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "Compact this" }],
-          internal_chat_message_metadata_passthrough: { turn_id: "turn_web" },
-        },
-      ],
-    }),
-  }), config, () => ({
-    name: "test-web-compactor",
-    async runTurn(parsed, incoming, emit) {
-      expect(incoming.headers.get("x-codex-turn-metadata")).toContain("thread_web");
-      expect(parsed._compactionRequest).toBe(true);
-      expect((parsed._rawBody as {
-        client_metadata?: Record<string, unknown>;
-      }).client_metadata?.["x-codex-turn-metadata"]).toBe(JSON.stringify(canonicalMetadata));
-      emit({ type: "text_delta", text: "Summary", phase: "final_answer" });
-      emit({
-        type: "done",
-        stopReason: "stop",
-        endTurn: true,
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, estimated: true },
-      });
-    },
-  }));
-  expect(web.status).toBe(200);
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const auth = () => { const h = new Headers({ "content-type": "application/json" }); h.set("authorization", "Bearer " + token); return h; };
+  let starts = 0;
+  const factory = () => ({ name: "no", async runTurn() { starts += 1; throw new Error("must not run"); } });
+  const noAuth = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }) }), config, factory);
+  expect(noAuth.status).toBe(401);
+  for (const model of ["gpt-5.6-sol", "chatgpt-web/gpt-5.6-sol"]) {
+    const res = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", { method: "POST", headers: auth(), body: JSON.stringify({ model, input: [] }) }), config, factory);
+    expect([model, res.status]).toEqual([model, 501]);
+    const body = await res.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("unsupported_operation");
+  }
+  expect(starts).toBe(0);
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
+  rmSync(appHome, { recursive: true, force: true });
 });

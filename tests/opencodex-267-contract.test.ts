@@ -9,6 +9,7 @@ import {
 } from "../src/adapters/chatgpt-web/environment";
 import { bridgeToResponsesSSE } from "../src/bridge";
 import { defaultConfig } from "../src/config";
+import { ensureOpencodexProviderTokenFile } from "../src/opencodex-provider-auth";
 import {
   COMPACT_PROMPT,
   SUMMARY_PREFIX,
@@ -166,13 +167,20 @@ test("2.67 routed summarizer returns assistant text over HTTP", async () => {
   const body = withoutUnderscore(fixture.routed_summarizer) as Record<string, unknown>;
   (body as Record<string, unknown>).model = "chatgpt-web/high";
   (body as Record<string, unknown>).stream = false;
-  // The routed summarizer arrives fully stripped of item provenance; only the
-  // external-provider trust binding lets the bridge complete it, as in production.
+  // The routed summarizer arrives fully stripped; the S4B provider Bearer gate plus
+  // the external-provider trust binding lets the bridge complete it, as in production.
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-267-"));
+  tempRoots.push(appHome);
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const headers = new Headers({ "content-type": "application/json" });
+  headers.set("authorization", "Bearer " + token);
   const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   }), config, () => ({
     name: "test-web-compactor",
@@ -181,6 +189,7 @@ test("2.67 routed summarizer returns assistant text over HTTP", async () => {
       emit({ type: "done", stopReason: "stop", endTurn: true });
     },
   }));
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
   expect(response.status).toBe(200);
   const payload = await response.json() as { output: Array<{ type: string; role: string; content: Array<{ type: string; text: string }> }> };
   expect(payload.output).toHaveLength(1);
@@ -255,8 +264,14 @@ test("2.67 call IDs survive replay; custom calls keep raw input; denial stays te
 test("2.67 stripped post-compaction continuation authorizes", async () => {
   const summary = "Synthetic handoff summary for continuation.";
   const thread = "thread_s4a_cont_01";
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-267c-"));
+  tempRoots.push(appHome);
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const authHeaders = () => { const h = new Headers({ "content-type": "application/json" }); h.set("authorization", "Bearer " + token); return h; };
   const root = process.cwd().replace(/\\/g, "/");
   const envText = `<environment_context>\n  <cwd>${root}</cwd>\n  <shell>powershell</shell>\n  <filesystem><workspace_roots><root>${root}</root></workspace_roots><permission_profile type=\"disabled\"><file_system type=\"unrestricted\" /></permission_profile></filesystem>\n</environment_context>`;
   const history = [
@@ -267,7 +282,7 @@ test("2.67 stripped post-compaction continuation authorizes", async () => {
   const send = (body: unknown, factory: Parameters<typeof responseRequest>[2]) =>
     responseRequest(new Request("http://127.0.0.1/v1/responses", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify(body),
     }), config, factory);
   const summarizer = await send({
@@ -299,6 +314,7 @@ test("2.67 stripped post-compaction continuation authorizes", async () => {
   }));
   expect(continuation.status).toBe(200);
   expect(started).toBe(true);
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
 });
 
 test("2.67 metadata envelopes carry the captured compaction object", () => {

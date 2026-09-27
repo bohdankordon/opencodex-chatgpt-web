@@ -32,6 +32,25 @@ installation is still restored).
 - ChatGPT browser login and account capability detection
 - Optional Full-mode broker, MCP tunnel, and tool approvals
 
+## Provider authentication (S4B)
+
+The OpenCodex provider path uses a dedicated high-entropy Bearer secret, distinct
+from the launcher/control token and from legacy `externalClients` credentials.
+
+- Secret file: `<app-home>/opencodex-provider-token` (referenced by
+  `providerTokenFile` in `config.json`). Generated once when absent with atomic
+  `0600` creation; never overwritten when valid; never logged or exposed via
+  `/healthz`; fails closed when unreadable. Rotate explicitly with
+  `codex-chatgpt-web provider-token rotate --yes`, then update OpenCodex.
+- Endpoints: `GET /healthz` needs no secret and reveals none; `GET /v1/models`
+  and `POST /v1/responses` require `Authorization: Bearer <provider-secret>` with
+  constant-time comparison. Missing/malformed/wrong share one `401` class and are
+  rejected before model discovery, browser work, or request parsing.
+- OpenCodex owns its provider configuration. This fork never writes
+  `$OPENCODEX_HOME/config.json`; it only shows/generates registration info.
+  Configure the provider with the secret as `apiKey` (see below) and restart
+  OpenCodex so the running process picks it up.
+
 In external-provider mode, the core CLI/runtime does **not** create, modify, delete, or restore
 Codex `openai_base_url`, `model_provider`, OpenCodex config, or OpenCodex model catalogs.
 
@@ -110,20 +129,21 @@ normalizes both to the same Responses endpoint.
 Register the provider with:
 
 ```bash
-ocx provider add chatgpt-web \
-  --adapter openai-responses \
-  --base-url http://127.0.0.1:17841/v1 \
-  --allow-private-network
+codex-chatgpt-web provider-token status
+# Copy the printed file path, read the secret privately, and configure OpenCodex with it as apiKey.
+# Example (do not paste the secret into shell history where unnecessary):
+# ocx provider add chatgpt-web --adapter openai-responses --base-url http://127.0.0.1:17841/v1 --allow-private-network --api-key "$(cat <app-home>/opencodex-provider-token)"
 ```
 
 On `provider add`, `--allow-private-network` is a bare boolean flag (there is no
 `--allow-private-network on` spelling), and there is no `--live-models` flag: absent
 `liveModels` already means live model discovery is enabled, so once this bridge is running
-OpenCodex can read its `/v1/models` catalog. The `on|off` spellings
-(`--allow-private-network <on|off>`, `--live-models <on|off>`) belong to
-`ocx provider edit`. Flag spellings are version-sensitive and describe OpenCodex 2.58; recheck
-them when moving to a newer OpenCodex. The bridge itself does not require an API key;
-ChatGPT authentication stays in the browser session owned by this process.
+OpenCodex can read its `/v1/models` catalog when it presents the provider secret.
+The `on|off` spellings (`--allow-private-network <on|off>`, `--live-models <on|off>`)
+belong to `ocx provider edit`. Flag spellings are version-sensitive and describe
+OpenCodex 2.67; recheck them when moving to a newer OpenCodex. The provider secret
+is the loopback Bearer for `/v1/*`; ChatGPT authentication itself stays in the
+browser session owned by this process.
 
 `ocx provider add` persists the provider to the OpenCodex configuration but does not adopt it
 into an already-running OpenCodex process. After registering, restart OpenCodex (`ocx restart`)
@@ -140,7 +160,8 @@ provider object is:
     "chatgpt-web": {
       "adapter": "openai-responses",
       "baseUrl": "http://127.0.0.1:17841/v1",
-      "allowPrivateNetwork": true
+      "allowPrivateNetwork": true,
+      "apiKey": "<contents of <app-home>/opencodex-provider-token>"
     }
   }
 }

@@ -37,6 +37,16 @@ usernames, home paths, keys, tokens, or installation/session/thread/turn IDs.
    post-compaction turn replaying the stored compaction item verbatim.
 5. `tools.json` (CAPTURED + SOURCE): declaration lowering, tool_search discovery
    round, function/custom call-output replay, and a conservatively represented denial.
+6. `lowered-replay.json` (CAPTURED + SOURCE): provider-side LOWERED replay after
+   OpenCodex 2.67 compat rewrites. `tool_search` declaration arrives as
+   `{type:"function", name:"tool_search"}` (or the `opencodex_tool_search[_N]`
+   alias on collision); `tool_search_call` arrives as `function_call` with
+   JSON-string arguments; `tool_search_output` arrives as `function_call_output`
+   whose output is a JSON string `{"tools":[...],"status":...}` that exposes
+   deferred specs (for example `subagents__spawn_worker`). Lowered
+   `custom_tool_call` arrives as `function_call` with `{"input":...}` (shown for
+   `apply_patch`). The bridge accepts all lowered forms; JSON-string tool-search
+   output re-injects deferred tools under exact wire names.
 6. `metadata.json` (CAPTURED): client turn-metadata envelopes for turn, compaction,
    and continuation. Values synthetic; key sets and the compaction object are observed.
 7. `sse-text-turn.json` (CAPTURED): the event sequence a loopback text turn must emit.
@@ -56,3 +66,10 @@ usernames, home paths, keys, tokens, or installation/session/thread/turn IDs.
    in `tools.json` and asserted in tests, not hidden).
 * Native `implementation: responses` (pre-turn text form) remains accepted alongside
    the captured routed `responses_compaction_v2` marker; both use strategy `memento`.
+* `web_search.external_web_access` stripping is capability-gated in OpenCodex 2.67,
+  not an unconditional transform. OpenCodex removes it only when the destination
+  capability denies OpenAI web-search fields (`supportsOpenAiWebSearchToolFields`
+  === false; see OpenCodex `src/adapters/openai-responses/request-strips.ts` and
+  `web-search.ts`). `provider-first-turn.json` captures the stripped shape for a
+  destination without that capability; the bridge accepts both shapes (with and
+  without `external_web_access`) and never requires the stripped form.

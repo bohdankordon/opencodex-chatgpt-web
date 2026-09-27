@@ -8,6 +8,7 @@ import {
   extractChatGptTurnUserRevision,
 } from "../src/adapters/chatgpt-web/environment";
 import { defaultConfig } from "../src/config";
+import { ensureOpencodexProviderTokenFile } from "../src/opencodex-provider-auth";
 import { parseRequest } from "../src/responses/parser";
 import { compactRequest, modelsRequest, responseRequest } from "../src/server";
 
@@ -63,6 +64,10 @@ test("OpenCodex openai-responses URL construction does not duplicate /v1", () =>
   expect(providerUrl("http://127.0.0.1:17841/v1/")).toBe("http://127.0.0.1:17841/v1/responses");
   expect(providerUrl("http://127.0.0.1:17841")).toBe("http://127.0.0.1:17841/v1/responses");
   expect(providerUrl("http://127.0.0.1:17841/v1", "/responses")).toBe("http://127.0.0.1:17841/v1/responses");
+  // The legacy canonical compact endpoint is a separate path, never the OpenCodex
+  // provider compaction route (which uses ordinary /v1/responses). URL construction
+  // must not duplicate /v1 there either.
+  expect(providerUrl("http://127.0.0.1:17841/v1", "/responses/compact")).toBe("http://127.0.0.1:17841/v1/responses/compact");
 });
 
 test("OpenCodex 2.67 store:false sanitization preserves current-turn authority in client_metadata", () => {
@@ -97,12 +102,19 @@ test("external-provider refuses stripped turns when OpenCodex native metadata is
   const raw = withoutUnderscore(load("provider-first-turn.json")) as Record<string, unknown>;
   const { body } = withRealRoot(raw);
   delete (body as Record<string, unknown>).client_metadata;
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-prov-"));
+  tempRoots.push(appHome);
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const headers = new Headers({ "content-type": "application/json" });
+  headers.set("authorization", "Bearer " + token);
   let adapterStarted = false;
   const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: JSON.stringify(body),
   }), config, () => {
     adapterStarted = true;
@@ -111,15 +123,22 @@ test("external-provider refuses stripped turns when OpenCodex native metadata is
   expect(adapterStarted).toBe(false);
   expect(response.status).toBe(400);
   const payload = await response.json() as { error?: { message?: string } };
-  expect(payload.error?.message).toContain("native Codex turn metadata");
+  expect(payload.error?.message).toBe("External-provider ChatGPT Web requests require native Codex turn metadata in client_metadata");
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
 });
 
 test("OpenCodex-shaped HTTP requests keep compact metadata and reject unknown models", async () => {
+  const appHome = mkdtempSync(join(tmpdir(), "s4b-shaped-"));
+  tempRoots.push(appHome);
+  const prevHome = process.env.CODEX_CHATGPT_WEB_HOME;
+  process.env.CODEX_CHATGPT_WEB_HOME = appHome;
   const config = defaultConfig("browser-only");
   config.integrationMode = "external-provider";
+  const { token } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const authHeaders = () => { const h = new Headers({ "content-type": "application/json" }); h.set("authorization", "Bearer " + token); return h; };
   let nativeCalls = 0;
   const models = await modelsRequest(
-    new Request("http://127.0.0.1:17841/v1/models"),
+    new Request("http://127.0.0.1:17841/v1/models", { headers: authHeaders() }),
     config,
     async () => {
       nativeCalls += 1;
@@ -132,48 +151,22 @@ test("OpenCodex-shaped HTTP requests keep compact metadata and reject unknown mo
   expect(catalog.data.every(model => model.id.startsWith("chatgpt-web/"))).toBe(true);
   const unknown = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authHeaders(),
     body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
   }), config);
   expect(unknown.status).toBe(400);
-  const metadata = (load("metadata.json") as Record<string, Record<string, unknown>>).continuation;
-  const compactMetadata = {
-    request_kind: "compaction",
-    thread_id: metadata.thread_id,
-    turn_id: metadata.turn_id,
-  };
-  const root = resolve(process.cwd());
+  const unknownBody = await unknown.json() as { error?: { message?: string; code?: string } };
+  expect(unknownBody.error?.code).toBe("unsupported_model");
+  expect(unknownBody.error?.message).toBe("Model gpt-5.6-sol is not provided by codex-chatgpt-web");
+  // S4B: OpenCodex compaction uses ordinary /v1/responses, never /responses/compact.
+  // The legacy compact endpoint answers 501 for provider-authenticated callers.
   const compact = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "chatgpt-web/high",
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify(compactMetadata),
-      },
-      input: [
-        {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "Compact" }],
-        },
-      ],
-    }),
-  }), config, () => ({
-    name: "test-web",
-    async runTurn(parsed, _incoming, emit) {
-      expect((parsed._rawBody as Record<string, unknown>).client_metadata).toEqual({
-        "x-codex-turn-metadata": JSON.stringify(compactMetadata),
-      });
-      expect(root.length).toBeGreaterThan(0);
-      emit({ type: "text_delta", text: "ok", phase: "final_answer" });
-      emit({
-        type: "done",
-        stopReason: "stop",
-        endTurn: true,
-        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2, estimated: true },
-      });
-    },
-  }));
-  expect(compact.status).toBe(200);
+    headers: authHeaders(),
+    body: JSON.stringify({ model: "chatgpt-web/gpt-5.6-sol", input: [] }),
+  }), config, () => ({ name: "no", async runTurn() { throw new Error("must not run"); } }));
+  expect(compact.status).toBe(501);
+  const compactBody = await compact.json() as { error?: { message?: string; code?: string } };
+  expect(compactBody.error?.code).toBe("unsupported_operation");
+  if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
 });

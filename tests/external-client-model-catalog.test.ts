@@ -13,6 +13,7 @@ import {
   type ChatGptWebModelRoute,
 } from "../src/chatgpt-web-models";
 import { defaultConfig } from "../src/config";
+import { ensureOpencodexProviderTokenFile } from "../src/opencodex-provider-auth";
 import * as externalClientModule from "../src/external-client";
 import { EXTERNAL_CLIENT_ID_HEADER, generateExternalClientToken } from "../src/external-client";
 import { buildExternalProviderModelCatalog } from "../src/model-catalog";
@@ -276,81 +277,107 @@ function catalogUrl(port: number): string {
 }
 
 test("header presence - not header validity - selects the external-provider catalog profile", async () => {
+  // S4B: the OpenCodex provider path requires Bearer auth; the generic
+  // external-client header is ignored. Without Bearer every variant shares one
+  // 401; with Bearer every variant shares one Web-only catalog and never
+  // contacts native Codex.
   isolatedEnvironment();
   const config = externalProviderConfig();
-  const token = generateExternalClientToken();
-  config.externalClients = [{ id: "hermes-local", token }];
+  const { token: providerToken } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const providerAuth: HeadersInit = [["authorization", "Bearer " + providerToken]];
   await withServer(config, async (port, upstream) => {
     const legacy = await fetch(catalogUrl(port));
-    const legacyBody = await legacy.text();
-    expect(legacy.status).toBe(200);
-
-    const variants: Array<[string, HeadersInit]> = [
-      ["valid", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]],
-      ["invalid", [[EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]],
-      ["empty", [[EXTERNAL_CLIENT_ID_HEADER, ""]]],
-      ["repeated", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"], [EXTERNAL_CLIENT_ID_HEADER, "hermes-2"]]],
-      ["malformed", [[EXTERNAL_CLIENT_ID_HEADER, "not a client id"]]],
+    expect(legacy.status).toBe(401);
+    const unauthVariants: Array<[string, HeadersInit]> = [
+      ["no-auth", []],
+      ["valid-header-no-bearer", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]],
+      ["invalid-header-no-bearer", [[EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]],
+      ["wrong-bearer", [["authorization", "Bearer " + "W".repeat(43)]]],
+    ];
+    const unauthBodies = new Set<string>();
+    for (const [label, headers] of unauthVariants) {
+      const response = await fetch(catalogUrl(port), { headers });
+      expect([label, response.status]).toEqual([label, 401]);
+      unauthBodies.add(await response.text());
+    }
+    expect(unauthBodies.size).toBe(1);
+    const authVariants: Array<[string, HeadersInit]> = [
+      ["bearer-only", providerAuth],
+      ["bearer-valid-header", [...(providerAuth as Array<[string, string]>), [EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]],
+      ["bearer-invalid-header", [...(providerAuth as Array<[string, string]>), [EXTERNAL_CLIENT_ID_HEADER, "Hermes-Local"]]],
     ];
     const bodies: string[] = [];
-    for (const [label, headers] of variants) {
+    for (const [label, headers] of authVariants) {
       const response = await fetch(catalogUrl(port), { headers });
       expect([label, response.status]).toEqual([label, 200]);
       bodies.push(await response.text());
     }
     for (const body of bodies) {
-      expect(body).not.toBe(legacyBody);
+      expect(body).toBe(bodies[0]);
       expect(JSON.parse(body).data.map((row: { id: string }) => row.id))
         .toEqual(["chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol"]);
-      expect(JSON.parse(body).data.every((row: { supports_compact: boolean }) => row.supports_compact === false)).toBe(true);
+      expect(JSON.parse(body).data.every((m: { id: string }) => m.id.startsWith("chatgpt-web/"))).toBe(true);
     }
-    // The external-provider catalog never contacts native Codex, whatever the header says.
     expect(upstream).toHaveLength(0);
   });
 });
 
 test("a Luna-only account shows a different external-provider catalog once the header is present", async () => {
+  // S4B: provider catalog is Web-only for the account (Luna rows for Luna-only).
+  // Bearer required; the generic header is ignored and never empties the catalog.
   isolatedEnvironment();
   const config = { ...externalProviderConfig(), solAvailable: false };
+  const { token: providerToken } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const providerAuth: HeadersInit = [["authorization", "Bearer " + providerToken]];
   await withServer(config, async port => {
-    const legacy = await fetch(catalogUrl(port));
-    const legacyBody = await legacy.text();
-    expect(JSON.parse(legacyBody).data.map((row: { id: string }) => row.id))
+    const unauth = await fetch(catalogUrl(port));
+    expect(unauth.status).toBe(401);
+    const authed = await fetch(catalogUrl(port), { headers: providerAuth });
+    expect(authed.status).toBe(200);
+    expect(JSON.parse(await authed.text()).data.map((row: { id: string }) => row.id))
       .toEqual(["chatgpt-web/gpt-5.6-luna"]);
-
-    const withHeader = await fetch(catalogUrl(port), {
-      headers: [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]],
-    });
-    const headerBody = await withHeader.text();
+    const withHeader = await fetch(catalogUrl(port), { headers: [...(providerAuth as Array<[string, string]>), [EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]] });
     expect(withHeader.status).toBe(200);
-    expect(JSON.parse(headerBody).data).toEqual([]);
-    expect(headerBody).not.toBe(legacyBody);
-    // Different body, different entity tag; identical body above kept its tag unchanged.
-    expect(withHeader.headers.get("etag")).not.toBe(legacy.headers.get("etag"));
+    expect(JSON.parse(await withHeader.text()).data.map((row: { id: string }) => row.id))
+      .toEqual(["chatgpt-web/gpt-5.6-luna"]);
   });
 });
 
 test("catalog profile selection ignores Authorization and leaks no credential material", async () => {
+  // S4B: provider Bearer is required; wrong/missing share one 401, valid shares
+  // one Web-only catalog, header ignored, no secret leakage, no native upstream.
   isolatedEnvironment();
   const config = externalProviderConfig();
-  const token = generateExternalClientToken();
-  config.externalClients = [{ id: "hermes-local", token }];
+  const { token: providerToken } = ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const wrong = providerToken.endsWith("A") ? providerToken.slice(0, -1) + "B" : providerToken.slice(0, -1) + "A";
   await withServer(config, async (port, upstream) => {
-    const headers: Array<[string, HeadersInit]> = [
-      ["no authorization", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]],
-      ["wrong bearer", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"], ["authorization", "Bearer not-the-token"]]],
-      ["plausible bearer", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"], ["authorization", "Bearer " + token]]],
-      ["empty bearer", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"], ["authorization", "Bearer "]]],
+    const bad: Array<[string, HeadersInit]> = [
+      ["no authorization", []],
+      ["header-only", [[EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]],
+      ["wrong bearer", [["authorization", "Bearer " + wrong]]],
+      ["empty bearer", [["authorization", "Bearer "]]],
+    ];
+    const badBodies = new Set<string>();
+    for (const [label, requestHeaders] of bad) {
+      const response = await fetch(catalogUrl(port), { headers: requestHeaders });
+      expect([label, response.status]).toEqual([label, 401]);
+      badBodies.add(await response.text());
+    }
+    expect(badBodies.size).toBe(1);
+    const good: Array<[string, HeadersInit]> = [
+      ["bearer", [["authorization", "Bearer " + providerToken]]],
+      ["bearer-header", [["authorization", "Bearer " + providerToken], [EXTERNAL_CLIENT_ID_HEADER, "hermes-local"]]],
     ];
     const bodies: string[] = [];
-    for (const [label, requestHeaders] of headers) {
+    for (const [label, requestHeaders] of good) {
       const response = await fetch(catalogUrl(port), { headers: requestHeaders });
       expect([label, response.status]).toEqual([label, 200]);
       bodies.push(await response.text());
     }
+    expect(bodies[0]).toBe(bodies[1]);
     for (const body of bodies) {
-      expect(body).toBe(bodies[0]!);
-      expect(body).not.toContain(token);
+      expect(body).not.toContain(providerToken);
+      expect(body).not.toContain(wrong);
       expect(body).not.toContain("hermes-local");
       expect(body).not.toContain(config.controlToken);
       expect(body).not.toContain("externalClients");
@@ -484,11 +511,12 @@ test("the dedicated header enters external admission instead of reaching the nat
       body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
     });
     // Phase D: the dedicated header enters the external-client admission surface, so an
-    // unconfigured credential is rejected flatly instead of reaching the native path.
+    // S4B: the OpenCodex provider path requires Bearer; the generic header alone
+    // is ignored and rejected with the provider 401, never reaching native.
     expect(response.status).toBe(401);
     const body = await response.json() as { error: { message: string; type: string; code: string } };
     expect(body.error).toEqual({
-      message: "External client authentication failed",
+      message: "OpenCodex provider authentication failed",
       type: "authentication_error",
       code: "invalid_api_key",
     });
