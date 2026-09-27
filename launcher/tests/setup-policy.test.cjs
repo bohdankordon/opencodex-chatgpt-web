@@ -18,6 +18,7 @@ test("operation set is closed and rejects arbitrary strings", () => {
   assert.deepEqual([...SETUP_OPERATIONS].sort(), [
     "bigger-context",
     "browser-interaction-mode",
+    "connector-name",
     "fresh-conversation-per-turn",
     "runtime-upgrade",
     "setup-core",
@@ -45,6 +46,7 @@ test("direct production policy preserves the exact replace-route matrix", () => 
     "use-saved-chats": true,
     "zero-risk-pro": true,
     "browser-interaction-mode": true,
+    "connector-name": true,
     "runtime-upgrade": false,
   };
   assert.deepEqual({ ...DIRECT_REPLACE_BY_OPERATION }, expected);

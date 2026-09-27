@@ -28,6 +28,7 @@ const SETUP_OPERATIONS = Object.freeze([
   "use-saved-chats",
   "zero-risk-pro",
   "browser-interaction-mode",
+  "connector-name",
   "runtime-upgrade",
 ]);
 
@@ -44,6 +45,7 @@ const DIRECT_REPLACE_BY_OPERATION = Object.freeze({
   "use-saved-chats": true,
   "zero-risk-pro": true,
   "browser-interaction-mode": true,
+  "connector-name": true,
   "runtime-upgrade": false,
 });
 

@@ -46,6 +46,7 @@ import { getTunnelServiceStatus, installTunnelService, restartTunnelService, sto
 import { VERSION } from "./version";
 
 export interface SetupOptions {
+  connectorNameSuffix?: string;
   mode: RuntimeMode;
   integrationMode?: IntegrationMode;
   browserInteractionMode?: BrowserInteractionMode;
@@ -288,6 +289,8 @@ function baseConfig(
   Object.assign(config, resolveInteractionConnectorIdentities(
     config.browserInteractionMode,
     profile,
+    existing,
+    options.connectorNameSuffix,
   ));
   if (options.subagentProtocol) config.subagentProtocol = options.subagentProtocol;
   config.releaseVersion = VERSION;
