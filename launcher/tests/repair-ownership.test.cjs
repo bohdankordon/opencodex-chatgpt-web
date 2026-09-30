@@ -44,12 +44,15 @@ function ownershipPair(args) {
   return out;
 }
 
-test("G4.1 Direct existing repair uses Direct policy", async () => {
+// S4D OpenCodex-only: a legacy Direct install repairs through the provider
+// policy with zero replace and bridge-only scope.
+test("G4.1 legacy Direct existing repair uses provider policy", async () => {
   const fixture = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "direct" });
   await fixture.host.setupCore();
-  assert.deepEqual(ownershipPair(fixture.invocation().args), ["--integration-mode", "direct", "--replace-codex-route"]);
-  assert.equal(fixture.invocation().policy.integrationMode, "direct");
-  assert.equal(fixture.invocation().policy.checkpointScope, "direct-integration");
+  assert.deepEqual(ownershipPair(fixture.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+  assert.equal(fixture.invocation().policy.integrationMode, "external-provider");
+  assert.equal(fixture.invocation().policy.checkpointScope, "bridge-only");
 });
 
 test("G4.2-4 External existing repair uses External policy with zero replace", async () => {
@@ -60,25 +63,31 @@ test("G4.2-4 External existing repair uses External policy with zero replace", a
   assert.equal(fixture.invocation().policy.checkpointScope, "bridge-only");
 });
 
-test("G4.5 Direct repair retains expected replace behavior", async () => {
+// S4D: no repair path may replace the Codex route. Legacy direct input
+// normalizes to the provider policy for core, MCP, and upgrade operations.
+test("G4.5 repair never replaces the Codex route for any operation or mode", async () => {
   const core = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "direct" });
   await core.host.setupCore();
-  assert.equal(core.invocation().args.includes("--replace-codex-route"), true);
+  assert.equal(core.invocation().args.includes("--replace-codex-route"), false);
   const mcp = simpleHost({ mode: "full", browserHost: "launcher", integrationMode: "direct", automaticTunnel: { tunnelId: "tunnel_0123456789abcdef0123456789abcdef", runtimeKeyFile: "/tmp/k", profileDir: "/tmp", profileName: "p" } });
   mcp.host.mcpCredentialsConfigured = () => true;
   await mcp.host.setupMcp({ interactionMode: "automatic" });
-  assert.equal(mcp.invocation().args.includes("--replace-codex-route"), true);
-  const directUpgradePolicy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "runtime-upgrade", profile: "production" });
-  assert.equal(directUpgradePolicy.checkpointScope, "direct-integration");
-  assert.equal(directUpgradePolicy.replaceCodexRoute, false);
-  assert.deepEqual(directUpgradePolicy.integrationArgs, ["--integration-mode", "direct"]);
+  assert.equal(mcp.invocation().args.includes("--replace-codex-route"), false);
+  const legacyUpgradePolicy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "runtime-upgrade", profile: "production" });
+  assert.equal(legacyUpgradePolicy.checkpointScope, "bridge-only");
+  assert.equal(legacyUpgradePolicy.replaceCodexRoute, false);
+  assert.deepEqual(legacyUpgradePolicy.integrationArgs, ["--integration-mode", "external-provider"]);
 });
 
-test("G4.6 renderer mismatch cannot migrate repair ownership", async () => {
+// S4D: renderer requested modes are accepted and ignored; repair always
+// follows canonical provider ownership.
+test("G4.6 renderer request cannot change repair ownership", async () => {
   const ext = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
-  await assert.rejects(ext.host.setupCore({ integrationMode: "direct" }), /CLI-only|mismatch/);
+  await ext.host.setupCore({ integrationMode: "direct" });
+  assert.deepEqual(ownershipPair(ext.invocation().args), ["--integration-mode", "external-provider"]);
   const dir = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "direct" });
-  await assert.rejects(dir.host.setupCore({ integrationMode: "external-provider" }), /CLI-only|mismatch/);
+  await dir.host.setupCore({ integrationMode: "external-provider" });
+  assert.deepEqual(ownershipPair(dir.invocation().args), ["--integration-mode", "external-provider"]);
 });
 
 test("G4.7 damaged config cannot become Direct repair", async () => {
@@ -90,14 +99,15 @@ test("G4.7 damaged config cannot become Direct repair", async () => {
 });
 
 test("G4.8 process owner does not select repair routing policy", async () => {
-  const directPolicy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
-  assert.equal(directPolicy.checkpointScope, "direct-integration");
+  const legacyPolicy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.equal(legacyPolicy.integrationMode, "external-provider");
+  assert.equal(legacyPolicy.checkpointScope, "bridge-only");
   const externalPolicy = buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-core", profile: "production" });
   assert.equal(externalPolicy.checkpointScope, "bridge-only");
   const directHost = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "direct" });
   directHost.host.runtimeConfigSnapshot = () => ({ configured: true, owner: "external", mode: "browser-only", serialized: "s", config: { mode: "browser-only" } });
   await directHost.host.setupCore();
-  assert.equal(directHost.invocation().policy.checkpointScope, "direct-integration");
+  assert.equal(directHost.invocation().policy.checkpointScope, "bridge-only");
   const externalHost = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
   externalHost.host.runtimeConfigSnapshot = () => ({ configured: true, owner: "launcher", mode: "browser-only", serialized: "s", config: { mode: "browser-only" } });
   await externalHost.host.setupCore({ integrationMode: "external-provider" });
@@ -244,7 +254,9 @@ test("G4.15-18 External failed repair via real path preserves route files", asyn
   } finally { fixture.cleanup(); }
 });
 
-test("G4.19 Direct failed repair retains Direct rollback", async () => {
+// S4D: failed repair rolls back bridge-only. The bridge config is restored
+// while Codex routing files are left untouched (launcher never owns them).
+test("G4.19 failed repair rolls back bridge-only and leaves routing files alone", async () => {
   const initial = { mode: "browser-only", browserHost: "launcher" };
   const fixture = realHost(initial);
   const codexConfig = path.join(fixture.codexHome, "config.toml");
@@ -261,9 +273,9 @@ test("G4.19 Direct failed repair retains Direct rollback", async () => {
   };
   try {
     await assert.rejects(fixture.host.setupCore(), /synthetic Direct repair failure/);
-    assert.equal(scope, "direct-integration");
+    assert.equal(scope, "bridge-only");
     assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
-    assert.equal(fs.readFileSync(codexConfig, "utf8"), "direct-route-before\n");
+    assert.equal(fs.readFileSync(codexConfig, "utf8"), "mutated-direct-route\n");
   } finally { fixture.cleanup(); }
 });
 
@@ -369,27 +381,37 @@ test("G4.21 External repair with Direct health fails with zero explicit route co
   assert.equal(out.calls.stateUpdates.length, 0);
 });
 
-test("G4.22 Direct repair with External health fails with zero explicit route commands", async () => {
+// S4D: a legacy Direct config paired with provider health agrees after
+// normalization, so repair succeeds as provider with zero route commands. A
+// bridge that still reports "direct" is a wrong-owner bridge (see G4.21).
+test("G4.22 legacy Direct repair with provider health succeeds with zero explicit route commands", async () => {
   const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: externalHealth() });
-  assert.match(String(out.error && out.error.message), /ownership mismatch/i);
+  assert.equal(out.error, undefined);
+  assert.equal(out.result.ok, true);
+  assert.equal(out.result.restartRequired, false);
   assert.equal(out.calls.routes, 0);
-  assert.equal(out.calls.stateUpdates.length, 0);
+  const patch = out.calls.stateUpdates[0];
+  assert.equal(patch.coreSetupComplete, true);
+  assert.equal(patch.codexCatalogVerified, true);
+  assert.equal(patch.codexRestartRequired, false);
 });
 
 test("G4.23-24 wrong routing_owner or provider URL fails", async () => {
   const badOwner = await runRepairCore({ preConfig: EXTERNAL_CONFIG, health: externalHealth({ routing_owner: "codex-chatgpt-web" }) });
   assert.match(String(badOwner.error && badOwner.error.message), /routing owner/i);
   assert.equal(badOwner.calls.stateUpdates.length, 0);
-  const badUrl = await runRepairCore({ preConfig: DIRECT_CONFIG, health: directHealth({ provider_base_url: "http://127.0.0.1:9999/v1" }) });
+  const badUrl = await runRepairCore({ preConfig: EXTERNAL_CONFIG, health: externalHealth({ provider_base_url: "http://127.0.0.1:9999/v1" }) });
   assert.match(String(badUrl.error && badUrl.error.message), /provider URL/i);
   assert.equal(badUrl.calls.stateUpdates.length, 0);
 });
 
-test("G4.25 External-to-Direct drift during repair fails with zero explicit route commands", async () => {
+// S4D: raw mode drift during repair normalizes to identical provider
+// ownership, so repair succeeds with zero explicit route commands.
+test("G4.25 raw External-to-Direct drift during repair keeps provider ownership", async () => {
   const out = await runRepairCore({ preConfig: EXTERNAL_CONFIG, health: externalHealth(), mutateDuringSetup: ({ setConfig }) => setConfig(DIRECT_CONFIG) });
-  assert.match(String(out.error && out.error.message), /changed while preparing|mismatch/i);
+  assert.equal(out.error, undefined);
+  assert.equal(out.result.ok, true);
   assert.equal(out.calls.routes, 0);
-  assert.equal(out.calls.stateUpdates.length, 0);
 });
 
 test("G4.26 Direct-to-External drift during repair fails with zero explicit route commands", async () => {
@@ -413,14 +435,14 @@ test("G4.28 configured-to-damaged during repair fails closed", async () => {
   assert.equal(out.calls.stateUpdates.length, 0);
 });
 
-test("G4.40 Direct repair state preserves existing guidance", async () => {
+// S4D: a bridge that still reports "direct" is a wrong-owner bridge under
+// canonical provider ownership, so legacy Direct repair with direct health
+// fails closed with zero route commands and no state updates.
+test("G4.40 legacy Direct repair with direct health fails closed", async () => {
   const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: directHealth() });
-  assert.equal(out.error, undefined);
-  assert.equal(out.result.restartRequired, true);
-  const patch = out.calls.stateUpdates[0];
-  assert.equal(patch.coreSetupComplete, true);
-  assert.equal(patch.codexCatalogVerified, false);
-  assert.equal(patch.codexRestartRequired, true);
+  assert.match(String(out.error && out.error.message), /ownership mismatch/i);
+  assert.equal(out.calls.routes, 0);
+  assert.equal(out.calls.stateUpdates.length, 0);
 });
 
 function upgradePatchHelper() {
@@ -433,16 +455,19 @@ function upgradePatchHelper() {
   return context.__upgrade;
 }
 
-test("G4.29 Direct managed update keeps Direct policy and restart", async () => {
+// S4D: legacy direct upgrade input normalizes to the provider policy, and
+// upgrade completion for a provider upgrade carries no restart signal.
+test("G4.29 legacy direct managed update normalizes to provider policy with no restart", async () => {
   const policy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "runtime-upgrade", profile: "production" });
-  assert.equal(policy.checkpointScope, "direct-integration");
+  assert.equal(policy.integrationMode, "external-provider");
+  assert.equal(policy.checkpointScope, "bridge-only");
   assert.equal(policy.replaceCodexRoute, false);
-  assert.deepEqual(policy.integrationArgs, ["--integration-mode", "direct"]);
+  assert.deepEqual(policy.integrationArgs, ["--integration-mode", "external-provider"]);
   const { buildUpgradeCompletionPatch } = upgradePatchHelper();
-  const patch = buildUpgradeCompletionPatch({ upgrade: { integrationMode: "direct", mode: "browser-only" }, snapshotConfig: {} });
+  const patch = buildUpgradeCompletionPatch({ upgrade: { integrationMode: "external-provider", mode: "browser-only" }, snapshotConfig: {} });
   assert.equal(patch.coreSetupComplete, true);
-  assert.equal(patch.codexCatalogVerified, false);
-  assert.equal(patch.codexRestartRequired, true);
+  assert.equal("codexRestartRequired" in patch, false);
+  assert.equal("codexCatalogVerified" in patch, false);
 });
 
 test("G4.30 External managed update is bridge-only with no restart", async () => {
@@ -532,7 +557,9 @@ test("G4.33-35 update performs no provider action and keeps continuity", async (
   assert.doesNotThrow(() => assertOwnershipContinuity({ before, after, action: "runtime-startup" }));
   const supDirect = { readSetupConfig: () => DIRECT_CONFIG };
   const afterDirect = resolveOwnershipContext({ supervisor: supDirect, action: "x" }).expectation;
-  assert.throws(() => assertOwnershipContinuity({ before, after: afterDirect, action: "runtime-startup" }), /changed while preparing/);
+  // S4D: raw Direct drift normalizes to identical provider ownership, so
+  // continuity passes instead of rejecting.
+  assert.doesNotThrow(() => assertOwnershipContinuity({ before, after: afterDirect, action: "runtime-startup" }));
 });
 
 test("G4 absent journal stays absent through External repair rollback", async () => {
@@ -568,7 +595,10 @@ function directRouteFiles(fixture) {
   };
 }
 
-test("G4.BLOCKER Direct health failure inside transaction restores route files", async () => {
+// S4D: the transactional hook still fails closed on health mismatch, but the
+// checkpoint is bridge-only: bridge config rolls back while Codex routing
+// files are left untouched.
+test("G4.BLOCKER health failure inside transaction rolls back bridge-only", async () => {
   const initial = { mode: "browser-only", browserHost: "launcher", host: "127.0.0.1", port: 17841, integrationMode: "direct" };
   const fixture = realHost(initial);
   const files = directRouteFiles(fixture);
@@ -601,17 +631,20 @@ test("G4.BLOCKER Direct health failure inside transaction restores route files",
   };
   try {
     await assert.rejects(fixture.host.setupCore({}, undefined, hook), /ownership mismatch/i);
-    assert.equal(scope, "direct-integration");
-    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), original.codexConfig);
-    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), original.modelsCache);
-    assert.equal(fs.readFileSync(files.journal, "utf8"), original.journal);
-    assert.equal(fs.readFileSync(files.recovery, "utf8"), original.recovery);
+    assert.equal(scope, "bridge-only");
+    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), "MUTATED-direct-route\n");
+    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), "MUTATED-cache\n");
+    assert.equal(fs.readFileSync(files.journal, "utf8"), "MUTATED-journal\n");
+    assert.equal(fs.readFileSync(files.recovery, "utf8"), "MUTATED-recovery\n");
     assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
     assert.equal(routes, 0);
   } finally { fixture.cleanup(); }
 });
 
-test("G4.BLOCKER Direct ownership drift inside transaction restores route files", async () => {
+// S4D: raw ownership drift inside the transaction normalizes to identical
+// provider ownership, so the hook passes and success keeps the mutation
+// (bridge-only scope never rolls back Codex routing files).
+test("G4.BLOCKER raw ownership drift inside transaction normalizes and commits", async () => {
   const initial = { mode: "browser-only", browserHost: "launcher", integrationMode: "direct" };
   const fixture = realHost(initial);
   const files = directRouteFiles(fixture);
@@ -619,7 +652,6 @@ test("G4.BLOCKER Direct ownership drift inside transaction restores route files"
   fs.writeFileSync(files.codexConfig, original.codexConfig);
   fs.writeFileSync(files.modelsCache, original.modelsCache);
   fs.writeFileSync(files.journal, original.journal);
-  const bridgeBefore = fs.readFileSync(fixture.configPath, "utf8");
   const pre = fixture.host.validateSetupOwnership(undefined, undefined, "setup-core");
   let scope;
   const origCapture = fixture.host.captureSetupCheckpoint.bind(fixture.host);
@@ -638,12 +670,11 @@ test("G4.BLOCKER Direct ownership drift inside transaction restores route files"
   };
   const hook = async () => { fixture.host.assertOwnershipExpectationCurrent(pre.expectation, "setup-core"); };
   try {
-    await assert.rejects(fixture.host.setupCore({}, undefined, hook), /changed while preparing/i);
-    assert.equal(scope, "direct-integration");
-    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), original.codexConfig);
-    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), original.modelsCache);
-    assert.equal(fs.readFileSync(files.journal, "utf8"), original.journal);
-    assert.equal(fs.readFileSync(fixture.configPath, "utf8"), bridgeBefore);
+    await fixture.host.setupCore({}, undefined, hook);
+    assert.equal(scope, "bridge-only");
+    assert.equal(fs.readFileSync(files.codexConfig, "utf8"), "MUTATED-direct-route\n");
+    assert.equal(fs.readFileSync(files.modelsCache, "utf8"), "MUTATED-cache\n");
+    assert.equal(fs.readFileSync(files.journal, "utf8"), "MUTATED-journal\n");
     assert.equal(routes, 0);
   } finally { fixture.cleanup(); }
 });
@@ -707,6 +738,7 @@ test("G4.BLOCKER transaction commit point: success keeps mutation, hook failure 
   const failFiles = directRouteFiles(failFixture);
   fs.writeFileSync(failFiles.codexConfig, "ORIGINAL\n");
   fs.writeFileSync(failFiles.journal, "ORIGINAL-journal\n");
+  const failBridgeBefore = fs.readFileSync(failFixture.configPath, "utf8");
   failFixture.host.run = async (name, args) => {
     if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
     fs.writeFileSync(failFiles.codexConfig, "MUTATED\n");
@@ -715,8 +747,11 @@ test("G4.BLOCKER transaction commit point: success keeps mutation, hook failure 
   };
   try {
     await assert.rejects(failFixture.host.setupCore({}, undefined, async () => { throw new Error("synthetic hook failure"); }), /synthetic hook failure/);
-    assert.equal(fs.readFileSync(failFiles.codexConfig, "utf8"), "ORIGINAL\n");
-    assert.equal(fs.readFileSync(failFiles.journal, "utf8"), "ORIGINAL-journal\n");
+    // S4D bridge-only rollback: bridge config is restored while Codex routing
+    // files keep the in-transaction mutation (launcher never owns them).
+    assert.equal(fs.readFileSync(failFiles.codexConfig, "utf8"), "MUTATED\n");
+    assert.equal(fs.readFileSync(failFiles.journal, "utf8"), "MUTATED-journal\n");
+    assert.equal(fs.readFileSync(failFixture.configPath, "utf8"), failBridgeBefore);
   } finally { failFixture.cleanup(); }
 });
 
@@ -831,8 +866,9 @@ test("G4 setupCore receives the transactional validator hook", async () => {
   const fixture = simpleHost({ mode: "browser-only", browserHost: "launcher", integrationMode: "direct" });
   await fixture.host.setupCore({}, undefined, async () => {});
   assert.equal(typeof fixture.invocation().policy, "object");
-  const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: directHealth() });
+  // S4D: legacy Direct config repairs through the provider path, so provider
+  // health validates the transactional hook cleanly.
+  const out = await runRepairCore({ preConfig: DIRECT_CONFIG, health: externalHealth() });
   assert.equal(out.error, undefined);
   assert.equal(out.calls.hookWired, true);
 });
-

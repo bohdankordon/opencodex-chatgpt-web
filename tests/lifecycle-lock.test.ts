@@ -194,9 +194,11 @@ test("different homes do not block each other", async () => {
 test("concurrent route mutation cannot enter while the lock is held, then proceeds after release", async () => {
   const fx = fixture();
   await startHolder(fx);
+  // S4D OpenCodex-only: route connect/disconnect are retired and never take the lock.
+  // They fail with the retired message even while the lock is held.
   const route = await runCli(["route", "connect"], cliEnv(fx));
   expect(route.exitCode).toBe(1);
-  expect(route.stderr).toContain("Another codex-chatgpt-web lifecycle operation is active");
+  expect(route.stderr).toContain("route connect is retired");
   // Read-only status never takes the lock, so it still answers while held.
   const status = await runCli(["route", "status"], cliEnv(fx));
   expect(status.exitCode).toBe(0);
@@ -210,34 +212,13 @@ test("concurrent route mutation cannot enter while the lock is held, then procee
   expect(after.stdout).toContain("CONTENDER_ACQUIRED");
 });
 
-test("expected-external uninstall aborts before deleting a fresh direct install", async () => {
+// S4D OpenCodex-only: integration mode is accepted and ignored; only installation
+// kind is ownership authority. Uninstall never touches Codex routing files.
+test("expected-mode uninstall ignores legacy mode and removes only app data", async () => {
   const fx = fixture();
-  const before = writeAppConfig(fx.appHome);
-  writeFileSync(join(fx.appHome, "sentinel.txt"), "do-not-delete\n");
+  writeAppConfig(fx.appHome);
   const codexConfig = join(fx.codexHome, "config.toml");
-  writeFileSync(codexConfig, "fresh-direct-route\n");
-  const result = await runCli([
-    "uninstall",
-    "--yes",
-    "--expected-installation-kind",
-    "configured",
-    "--expected-integration-mode",
-    "external-provider",
-  ], cliEnv(fx));
-  expect(result.exitCode).toBe(1);
-  expect(result.stderr).toMatch(/expected configured external-provider but found configured direct/);
-  expect(readFileSync(join(fx.appHome, "config.json"), "utf8")).toBe(before);
-  expect(existsSync(join(fx.appHome, "sentinel.txt"))).toBe(true);
-  expect(readFileSync(codexConfig, "utf8")).toBe("fresh-direct-route\n");
-});
-
-test("expected-direct uninstall aborts before touching a fresh external install", async () => {
-  const fx = fixture();
-  const before = writeAppConfig(fx.appHome, { integrationMode: "external-provider" });
-  const codexConfig = join(fx.codexHome, "config.toml");
-  const modelsCache = join(fx.codexHome, "models_cache.json");
-  writeFileSync(codexConfig, "router-owned route\n");
-  writeFileSync(modelsCache, '{"router":true}\n');
+  writeFileSync(codexConfig, "legacy-route-sentinel\n");
   const result = await runCli([
     "uninstall",
     "--yes",
@@ -246,11 +227,9 @@ test("expected-direct uninstall aborts before touching a fresh external install"
     "--expected-integration-mode",
     "direct",
   ], cliEnv(fx));
-  expect(result.exitCode).toBe(1);
-  expect(result.stderr).toMatch(/expected configured direct but found configured external-provider/);
-  expect(readFileSync(join(fx.appHome, "config.json"), "utf8")).toBe(before);
-  expect(readFileSync(codexConfig, "utf8")).toBe("router-owned route\n");
-  expect(readFileSync(modelsCache, "utf8")).toBe('{"router":true}\n');
+  expect(result.exitCode).toBe(0);
+  expect(existsSync(fx.appHome)).toBe(false);
+  expect(readFileSync(codexConfig, "utf8")).toBe("legacy-route-sentinel\n");
 });
 
 test("expected-missing uninstall refuses to delete a configured install", async () => {
@@ -258,7 +237,7 @@ test("expected-missing uninstall refuses to delete a configured install", async 
   const before = writeAppConfig(fx.appHome);
   const result = await runCli(["uninstall", "--yes", "--expected-installation-kind", "missing"], cliEnv(fx));
   expect(result.exitCode).toBe(1);
-  expect(result.stderr).toMatch(/expected missing but found configured direct/);
+  expect(result.stderr).toMatch(/expected missing but found configured opencodex-only/);
   expect(readFileSync(join(fx.appHome, "config.json"), "utf8")).toBe(before);
 });
 
@@ -273,7 +252,7 @@ test("expected-configured uninstall refuses an actually-missing install", async 
     "direct",
   ], cliEnv(fx));
   expect(result.exitCode).toBe(1);
-  expect(result.stderr).toMatch(/expected configured direct but found missing/);
+  expect(result.stderr).toMatch(/expected configured opencodex-only but found missing/);
   expect(existsSync(join(fx.appHome, "config.json"))).toBe(false);
 });
 
@@ -353,9 +332,6 @@ test("malformed expected ownership rejects before any mutation", async () => {
   const before = writeAppConfig(fx.appHome);
   const cases: string[][] = [
     ["--expected-installation-kind", "bogus"],
-    ["--expected-integration-mode", "direct"],
-    ["--expected-installation-kind", "configured"],
-    ["--expected-installation-kind", "missing", "--expected-integration-mode", "direct"],
     ["--expected-installation-kind", "configured", "--expected-integration-mode", "bogus"],
   ];
   for (const extra of cases) {
@@ -367,13 +343,16 @@ test("malformed expected ownership rejects before any mutation", async () => {
   expect(kind.stderr).toContain("--expected-installation-kind must be configured or missing");
   const modeOnly = await runCli(["uninstall", "--yes", "--expected-integration-mode", "direct"], cliEnv(fx));
   expect(modeOnly.stderr).toContain("--expected-installation-kind must be configured or missing");
-  const needMode = await runCli(["uninstall", "--yes", "--expected-installation-kind", "configured"], cliEnv(fx));
-  expect(needMode.stderr).toContain("--expected-integration-mode is required");
-  const noMode = await runCli(
+  // S4D: integration mode is optional and ignored; kind alone is authority.
+  // A configured kind with no mode now proceeds (covered elsewhere); a missing kind
+  // with a legacy mode still fails on kind mismatch, not on mode accompaniment.
+  const kindMismatch = await runCli(
     ["uninstall", "--yes", "--expected-installation-kind", "missing", "--expected-integration-mode", "direct"],
     cliEnv(fx),
   );
-  expect(noMode.stderr).toContain("cannot accompany");
+  expect(kindMismatch.exitCode).toBe(1);
+  expect(kindMismatch.stderr).toMatch(/expected missing but found configured opencodex-only/);
+  expect(readFileSync(join(fx.appHome, "config.json"), "utf8")).toBe(before);
 });
 
 test("expected-ownership parsing and matching are allowlisted and exact", () => {
@@ -390,37 +369,28 @@ test("expected-ownership parsing and matching are allowlisted and exact", () => 
   expect(() => parseExpectedLifecycleOwnership({ kind: "bogus" })).toThrow(
     "--expected-installation-kind must be configured or missing",
   );
-  expect(() => parseExpectedLifecycleOwnership({ kind: "configured" })).toThrow(
-    "--expected-integration-mode is required",
-  );
-  const directConfig = defaultConfig("browser-only");
-  const externalConfig = { ...defaultConfig("browser-only"), integrationMode: "external-provider" as const };
+  // S4D: mode is accepted and ignored; kind alone matches.
+  expect(parseExpectedLifecycleOwnership({ kind: "configured" })).toEqual({ kind: "configured" });
+  const anyConfig = defaultConfig("browser-only");
   assertLifecycleOwnershipMatch(
     { kind: "configured", integrationMode: "direct" },
-    { kind: "configured", integrationMode: "direct", config: directConfig },
+    { kind: "configured", integrationMode: "external-provider", config: anyConfig },
     "uninstall",
   );
   expect(() =>
     assertLifecycleOwnershipMatch(
-      { kind: "configured", integrationMode: "direct" },
-      { kind: "configured", integrationMode: "external-provider", config: externalConfig },
-      "uninstall",
-    ),
-  ).toThrow("expected configured direct but found configured external-provider");
-  expect(() =>
-    assertLifecycleOwnershipMatch(
       { kind: "missing" },
-      { kind: "configured", integrationMode: "direct", config: directConfig },
+      { kind: "configured", integrationMode: "external-provider", config: anyConfig },
       "uninstall",
     ),
-  ).toThrow("expected missing but found configured direct");
+  ).toThrow("expected missing but found configured opencodex-only");
   expect(() =>
     assertLifecycleOwnershipMatch(
-      { kind: "configured", integrationMode: "direct" },
+      { kind: "configured" },
       { kind: "missing" },
       "uninstall",
     ),
-  ).toThrow("expected configured direct but found missing");
+  ).toThrow("expected configured opencodex-only but found missing");
 });
 
 test("actual ownership reads canonical state and fails closed on damage", () => {
@@ -429,7 +399,7 @@ test("actual ownership reads canonical state and fails closed on damage", () => 
   writeAppConfig(fx.appHome);
   expect(readActualLifecycleOwnership()).toEqual({
     kind: "configured",
-    integrationMode: "direct",
+    integrationMode: "external-provider",
     config: expect.anything(),
   });
   writeAppConfig(fx.appHome, { integrationMode: "external-provider" });

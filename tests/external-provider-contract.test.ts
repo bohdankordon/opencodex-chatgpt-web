@@ -19,14 +19,14 @@ function isolatedHome(): string {
   return root;
 }
 
-test("legacy configs without integrationMode keep direct ownership", () => {
+test("legacy configs without integrationMode keep provider ownership", () => {
   const root = isolatedHome();
   try {
     const legacy = { ...defaultConfig("browser-only") } as Record<string, unknown>;
     delete legacy.integrationMode;
     writeFileSync(join(root, "config.json"), `${JSON.stringify(legacy)}\n`);
-    expect(loadConfig().integrationMode).toBe("direct");
-    expect(loadConfigForSetup().integrationMode).toBe("direct");
+    expect(loadConfig().integrationMode).toBe("external-provider");
+    expect(loadConfigForSetup().integrationMode).toBe("external-provider");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -115,16 +115,17 @@ function removeFixture(options) {
   };
 }
 
-test("G5.1 Direct Remove runs core uninstall with route verification", async () => {
+// S4D OpenCodex-only: a legacy Direct config removes through the provider
+// path. The destructive child carries provider ownership and issues zero
+// route commands; the signed-in profile area is untouched.
+test("G5.1 legacy Direct Remove uninstalls as provider with zero route commands", async () => {
   const fixture = removeFixture({ config: DIRECT_CONFIG });
   try {
     await fixture.host.uninstallIntegration();
-    // The destructive child carries the Launcher-proved Direct expectation;
-    // core revalidates these flags under the shared lifecycle lock.
     assert.deepEqual(fixture.spawns, [
-      "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct",
-      "route status",
+      "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode external-provider",
     ]);
+    assert.equal(fixture.routeSpawns().length, 0);
     assert.equal(fs.existsSync(fixture.configPath), false);
     assert.equal(fs.readFileSync(fixture.sentinel, "utf8"), "signed-in-session");
   } finally { fixture.cleanup(); }
@@ -188,22 +189,29 @@ test("G5 missing Remove spawns kind-only expected ownership", async () => {
   } finally { fixture.cleanup(); }
 });
 
-test("G5.3 renderer Direct cannot override canonical External", async () => {
+// S4D: renderer requested modes are accepted and ignored. Canonical provider
+// ownership always wins; removal proceeds with provider flags.
+test("G5.3 renderer Direct request is ignored under canonical provider ownership", async () => {
   const fixture = removeFixture({ config: EXTERNAL_CONFIG });
   try {
-    await assert.rejects(fixture.host.uninstallIntegration({ integrationMode: "direct" }), /CLI-only|mismatch/);
-    assert.equal(fixture.spawns.length, 0);
-    assert.equal(fixture.events.filter((e) => e === "supervisor-stop").length, 0);
-    assert.equal(fs.existsSync(fixture.configPath), true);
+    await fixture.host.uninstallIntegration({ integrationMode: "direct" });
+    assert.deepEqual(fixture.spawns, [
+      "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode external-provider",
+    ]);
+    assert.equal(fixture.routeSpawns().length, 0);
+    assert.equal(fs.existsSync(fixture.configPath), false);
   } finally { fixture.cleanup(); }
 });
 
-test("G5.4 renderer External cannot override canonical Direct", async () => {
+test("G5.4 legacy Direct canonical removes as provider regardless of renderer request", async () => {
   const fixture = removeFixture({ config: DIRECT_CONFIG });
   try {
-    await assert.rejects(fixture.host.uninstallIntegration({ integrationMode: "external-provider" }), /CLI-only|mismatch/);
-    assert.equal(fixture.spawns.length, 0);
-    assert.equal(fs.existsSync(fixture.configPath), true);
+    await fixture.host.uninstallIntegration({ integrationMode: "external-provider" });
+    assert.deepEqual(fixture.spawns, [
+      "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode external-provider",
+    ]);
+    assert.equal(fixture.routeSpawns().length, 0);
+    assert.equal(fs.existsSync(fixture.configPath), false);
   } finally { fixture.cleanup(); }
 });
 
@@ -219,15 +227,10 @@ test("G5.5 damaged config fails before destructive mutation", async () => {
 
 test("G5.6 process owner does not choose routing removal policy", async () => {
   const directExternal = removeFixture({ config: DIRECT_CONFIG, owner: "external", stopFails: "stop failed" });
-  directExternal.host.run = async (name, args) => {
-    const action = args.join(" ");
-    directExternal.spawns.push(action);
-    if (action === "route status") return { stdout: JSON.stringify({ installed: false, active: false, errors: [] }) };
-    throw new Error(`Unexpected command: ${action}`);
-  };
   try {
-    await assert.rejects(directExternal.host.uninstallIntegration(), /cleanup did not complete/);
-    assert.ok(directExternal.spawns.includes("route status"));
+    await assert.rejects(directExternal.host.uninstallIntegration(), /stop failed/);
+    assert.equal(directExternal.routeSpawns().length, 0);
+    assert.ok(!directExternal.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
   } finally { directExternal.cleanup(); }
   const externalLauncher = removeFixture({ config: EXTERNAL_CONFIG, owner: "launcher", stopFails: "stop failed" });
   try {
@@ -289,29 +292,19 @@ test("G5.14-15 Direct uninstall follows core journal semantics", async () => {
   } finally { fixture.cleanup(); }
 });
 
-test("G5.16 Direct stop failure keeps bridge, restores route, keeps error", async () => {
+// S4D: a stop failure keeps the bridge, performs zero route compensation,
+// and keeps the original error.
+test("G5.16 stop failure keeps bridge, performs no route compensation, keeps error", async () => {
   const fixture = removeFixture({ config: DIRECT_CONFIG, stopFails: "probe timeout" });
   const rp = fixture.routePaths();
   fs.writeFileSync(rp.codexConfig, "bridge-active-route\n");
-  let uninstallSpawned = false;
-  let routeActive = true;
-  fixture.host.run = async (name, args) => {
-    const action = args.join(" ");
-    if (action.startsWith("uninstall --yes --launcher-control")) uninstallSpawned = true;
-    fixture.spawns.push(action);
-    fixture.events.push(action);
-    if (action === "route status") return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
-    if (action === "route disconnect") {
-      routeActive = false;
-      return { stdout: JSON.stringify({ changed: true, active: false }) };
-    }
-    throw new Error(`Unexpected command: ${action}`);
-  };
   try {
-    await assert.rejects(fixture.host.uninstallIntegration(), /cleanup did not complete/);
-    assert.equal(uninstallSpawned, false);
+    await assert.rejects(fixture.host.uninstallIntegration(), /probe timeout/);
+    assert.ok(!fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
+    assert.equal(fixture.routeSpawns().length, 0);
     assert.equal(fs.existsSync(fixture.configPath), true);
-    assert.deepEqual(fixture.events.slice(0, 4), ["supervisor-stop", "route status", "route disconnect", "route status"]);
+    assert.deepEqual(fixture.events, ["supervisor-stop"]);
+    assert.equal(fs.readFileSync(rp.codexConfig, "utf8"), "bridge-active-route\n");
   } finally { fixture.cleanup(); }
 });
 
@@ -346,23 +339,28 @@ test("G5.23 External cleanup failure performs no Direct compensation", async () 
   } finally { fixture.cleanup(); }
 });
 
-test("G5.26 Direct-to-External drift aborts before core uninstall", async () => {
-  const fixture = removeFixture({ setupReads: [DIRECT_CONFIG, EXTERNAL_CONFIG], writeConfig: false });
+// S4D: raw mode drift across Remove normalizes to identical provider
+// ownership, so removal succeeds with zero route calls and leaves Codex
+// routing files byte-identical.
+test("G5.26 raw Direct-to-External drift removes as provider with zero route calls", async () => {
+  // Scripted reads model the drift pair across the pre-uninstall window and
+  // canonical absence afterwards (core uninstall deletes the bridge config).
+  const fixture = removeFixture({ setupReads: [DIRECT_CONFIG, EXTERNAL_CONFIG, EXTERNAL_CONFIG, EXTERNAL_CONFIG, null], writeConfig: false });
   const rp = fixture.routePaths();
-  fs.writeFileSync(rp.codexConfig, "bridge-active-route\n");
+  fs.writeFileSync(rp.codexConfig, "bridge-active-route\n", "utf8");
   try {
-    await assert.rejects(fixture.host.uninstallIntegration(), /changed while preparing/);
-    assert.ok(!fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
+    await fixture.host.uninstallIntegration();
+    assert.ok(fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
     assert.equal(fixture.routeSpawns().length, 0);
     assert.equal(fs.readFileSync(rp.codexConfig, "utf8"), "bridge-active-route\n");
   } finally { fixture.cleanup(); }
 });
 
-test("G5.27 External-to-Direct drift aborts bridge deletion", async () => {
-  const fixture = removeFixture({ setupReads: [EXTERNAL_CONFIG, DIRECT_CONFIG], writeConfig: false });
+test("G5.27 raw External-to-Direct drift removes as provider with zero route calls", async () => {
+  const fixture = removeFixture({ setupReads: [EXTERNAL_CONFIG, DIRECT_CONFIG, DIRECT_CONFIG, DIRECT_CONFIG, null], writeConfig: false });
   try {
-    await assert.rejects(fixture.host.uninstallIntegration({ integrationMode: "external-provider" }), /changed while preparing|mismatch/);
-    assert.ok(!fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
+    await fixture.host.uninstallIntegration({ integrationMode: "external-provider" });
+    assert.ok(fixture.spawns.some((a) => a.startsWith("uninstall --yes --launcher-control")));
     assert.equal(fixture.routeSpawns().length, 0);
   } finally { fixture.cleanup(); }
 });
@@ -380,27 +378,16 @@ test("G5.28-29 missing and damaged drift fail closed", async () => {
   } finally { damaged.cleanup(); }
 });
 
-test("G5.31-32 Direct ordering: route cleanup failure precedes any bridge deletion", async () => {
+// S4D: an uninstall failure performs no route compensation and leaves the
+// bridge config in place with zero route commands issued.
+test("G5.31-32 uninstall failure performs no route compensation", async () => {
   const fixture = removeFixture({ config: DIRECT_CONFIG, uninstallFails: "route cleanup failed" });
-  let routeActive = true;
-  fixture.host.run = async (name, args) => {
-    const action = args.join(" ");
-    fixture.spawns.push(action);
-    fixture.events.push(action);
-    if (action.startsWith("uninstall --yes --launcher-control")) throw new Error("route cleanup failed");
-    if (action === "route status") return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
-    if (action === "route disconnect") {
-      routeActive = false;
-      return { stdout: JSON.stringify({ changed: true, active: false }) };
-    }
-    throw new Error(`Unexpected command: ${action}`);
-  };
   try {
     await assert.rejects(fixture.host.uninstallIntegration(), /route cleanup failed/);
     assert.equal(fs.existsSync(fixture.configPath), true);
     const uninstallIndex = fixture.events.findIndex((e) => e.startsWith("uninstall --yes --launcher-control"));
-    const restoreIndex = fixture.events.indexOf("route disconnect");
-    assert.ok(uninstallIndex >= 0 && restoreIndex > uninstallIndex);
+    assert.ok(uninstallIndex >= 0);
+    assert.equal(fixture.routeSpawns().length, 0);
   } finally { fixture.cleanup(); }
 });
 
@@ -499,13 +486,15 @@ async function runRemoveIpc({ config, uninstallBehavior }) {
   return { result, error, calls };
 }
 
-test("G5 Direct Remove state requires Codex restart; External must not", async () => {
+// S4D: removal never touches Codex routing, so no removal may require a
+// Codex restart regardless of the legacy canonical mode.
+test("G5 Remove state never requires Codex restart", async () => {
   const direct = await runRemoveIpc({ config: DIRECT_CONFIG });
   assert.equal(direct.error, undefined);
   assert.equal(direct.result.cancelled, false);
   assert.equal(direct.calls.stateUpdates.length, 1);
   assert.equal(direct.calls.stateUpdates[0].coreSetupComplete, false);
-  assert.equal(direct.calls.stateUpdates[0].codexRestartRequired, true);
+  assert.equal(direct.calls.stateUpdates[0].codexRestartRequired, false);
   assert.equal(direct.calls.descriptorWrites, 1);
   const external = await runRemoveIpc({ config: EXTERNAL_CONFIG });
   assert.equal(external.error, undefined);
@@ -521,4 +510,3 @@ test("G5 Remove failure marks no success state", async () => {
   assert.equal(out.calls.stateUpdates.length, 0);
   assert.equal(out.calls.descriptorWrites, 1);
 });
-

@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -8,8 +8,26 @@ import { runStructuredCompactionOnce } from "../src/adapters/chatgpt-web/compact
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, closeTurnBrokers, RemoteTurnBroker, TurnBroker } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig, providerConfig } from "../src/config";
+import { ensureOpencodexProviderTokenFile, readOpencodexProviderTokenFile } from "../src/opencodex-provider-auth";
 import { parseRequest } from "../src/responses/parser";
-import { compactRequest, HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer } from "../src/server";
+import { compactRequest, HttpTurnCounter, responseRequest as respond, routeChatGptWebRequest, startServer } from "../src/server";
+import { isolateTestAppHome, restoreTestAppHome } from "./helpers/isolated-app-home";
+
+// S4D area C: startServer ensures the provider-token file on startup; keep it under
+// an isolated temp home so test runs never create or touch the real user app home.
+isolateTestAppHome("s4d-server-lifecycle-");
+afterAll(() => restoreTestAppHome());
+
+// S4D OpenCodex-only: every Responses request requires provider Bearer auth.
+const responseRequest: typeof respond = (request, config, factory, options) => {
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  if (!request.headers.get("authorization")) {
+    const headers = new Headers(request.headers);
+    headers.set("authorization", "Bearer " + readOpencodexProviderTokenFile(config.providerTokenFile));
+    request = new Request(request, { headers });
+  }
+  return respond(request, config, factory, options);
+};
 
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
@@ -208,69 +226,6 @@ test("HTTP turn tracking releases a stream requested by an already disconnected 
   expect(response.body).toBeNull();
 });
 
-test("a real HTTP peer disconnect releases a streaming turn", async () => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
-  let source!: ReadableStreamDefaultController<Uint8Array>;
-  let sourceCancelled = false;
-  let markSourceReady!: () => void;
-  const sourceReady = new Promise<void>(resolve => { markSourceReady = resolve; });
-  const server = startServer(config, {
-    fetchUpstream: async () => new Response(new ReadableStream<Uint8Array>({
-      start(controller) {
-        source = controller;
-        markSourceReady();
-      },
-      cancel() {
-        sourceCancelled = true;
-      },
-    })),
-  });
-  const port = server.port;
-  if (port === undefined) throw new Error("test server did not bind a TCP port");
-  const endpoint = `http://127.0.0.1:${port}`;
-  const socket = createConnection({ host: "127.0.0.1", port });
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      socket.once("connect", resolve);
-      socket.once("error", reject);
-    });
-    const body = JSON.stringify({ query: "disconnect lifecycle proof" });
-    socket.write([
-      "POST /v1/alpha/search HTTP/1.1",
-      "Host: 127.0.0.1",
-      "Authorization: Bearer test-codex-session",
-      "Content-Type: application/json",
-      `Content-Length: ${Buffer.byteLength(body)}`,
-      "Connection: keep-alive",
-      "",
-      body,
-    ].join("\r\n"));
-    await sourceReady;
-    source.enqueue(new TextEncoder().encode("stream-open"));
-    await new Promise<void>((resolve, reject) => {
-      socket.once("data", () => resolve());
-      socket.once("error", reject);
-    });
-
-    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({ active_http_turns: 1 });
-    socket.destroy();
-
-    const deadline = Date.now() + 1_000;
-    let activeHttpTurns = 1;
-    while (Date.now() < deadline && activeHttpTurns !== 0) {
-      const health = await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number };
-      activeHttpTurns = health.active_http_turns;
-      if (activeHttpTurns !== 0) await Bun.sleep(10);
-    }
-    expect(activeHttpTurns).toBe(0);
-    expect(sourceCancelled).toBe(true);
-  } finally {
-    socket.destroy();
-    await server.stop(true);
-  }
-});
-
 test("HTTP turn cancellation aborts the tracked request and waits for lifecycle release", async () => {
   const turns = new HttpTurnCounter();
   let observedAbort = false;
@@ -338,48 +293,6 @@ test("native Codex interrupt remains authoritative when it arrives before HTTP i
   await waitForTurnCount(turns, 0);
 });
 
-test("native passthrough response and compaction requests expose their exact interrupt identity", async () => {
-  const config = defaultConfig("browser-only");
-  const responseIdentity = { threadId: "thread_native_response", turnId: "turn_native_response" };
-  let boundResponseIdentity: typeof responseIdentity | undefined;
-  const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-5.6-sol",
-      client_metadata: {
-        "x-codex-turn-metadata": JSON.stringify({
-          thread_id: responseIdentity.threadId,
-          turn_id: responseIdentity.turnId,
-        }),
-      },
-      input: [],
-    }),
-  }), config, undefined, {
-    onTurnIdentity: identity => { boundResponseIdentity = identity; },
-  });
-  expect(boundResponseIdentity).toEqual(responseIdentity);
-  expect(response.status).toBe(502);
-
-  const compactIdentity = { threadId: "thread_native_compact", turnId: "turn_native_compact" };
-  let boundCompactIdentity: typeof compactIdentity | undefined;
-  const compact = await compactRequest(new Request("http://127.0.0.1/v1/responses/compact", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-codex-turn-metadata": JSON.stringify({
-        thread_id: compactIdentity.threadId,
-        turn_id: compactIdentity.turnId,
-      }),
-    },
-    body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
-  }), config, undefined, {
-    onTurnIdentity: identity => { boundCompactIdentity = identity; },
-  });
-  expect(boundCompactIdentity).toEqual(compactIdentity);
-  expect(compact.status).toBe(502);
-});
-
 test("authenticated Interrupt hook endpoint releases the exact routed Web turn", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const threadId = "thread_interrupt_hook";
@@ -414,7 +327,13 @@ test("authenticated Interrupt hook endpoint releases the exact routed Web turn",
   const endpoint = `http://127.0.0.1:${server.port}`;
   const response = fetch(`${endpoint}/v1/responses`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: (() => {
+      ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+      return {
+        "content-type": "application/json",
+        authorization: "Bearer " + readOpencodexProviderTokenFile(config.providerTokenFile),
+      };
+    })(),
     body: JSON.stringify({
       model: "chatgpt-web/high",
       stream: true,
@@ -458,65 +377,6 @@ test("authenticated Interrupt hook endpoint releases the exact routed Web turn",
     await response;
   } finally {
     chatGptTurnSessions.clear();
-    await server.stop(true);
-  }
-});
-
-test("authenticated Interrupt hook endpoint also releases the exact native compaction request", async () => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
-  const threadId = "thread_interrupt_compact";
-  const turnId = "turn_interrupt_compact";
-  let adapterAborted = false;
-  const server = startServer(config, {
-    adapterFactory: () => ({
-      name: "interrupt-compact-test",
-      runTurn: (_parsed, incoming) => new Promise<void>((_resolve, reject) => {
-        incoming.abortSignal!.addEventListener("abort", () => {
-          adapterAborted = true;
-          reject(incoming.abortSignal!.reason);
-        }, { once: true });
-      }),
-    }),
-  });
-  const endpoint = `http://127.0.0.1:${server.port}`;
-  const compactResponse = fetch(`${endpoint}/v1/responses/compact`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-codex-turn-metadata": JSON.stringify({ thread_id: threadId, turn_id: turnId }),
-    },
-    body: JSON.stringify({
-      model: "chatgpt-web/high",
-      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "compact me" }] }],
-    }),
-  });
-
-  try {
-    const deadline = Date.now() + 1_000;
-    let activeHttpTurns = 0;
-    while (Date.now() < deadline && activeHttpTurns !== 1) {
-      activeHttpTurns = (await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number }).active_http_turns;
-      if (activeHttpTurns !== 1) await Bun.sleep(5);
-    }
-    expect(activeHttpTurns).toBe(1);
-
-    const interrupted = await fetch(`${endpoint}/admin/interrupt-turn`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${config.controlToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ threadId, turnId }),
-    });
-    expect(interrupted.status).toBe(200);
-    expect(await interrupted.json()).toMatchObject({
-      status: "ok",
-      cancelled_http_turns: 1,
-      cancelled_browser_turns: 0,
-    });
-    expect(adapterAborted).toBeTrue();
-    await compactResponse;
-  } finally {
     await server.stop(true);
   }
 });
@@ -969,57 +829,6 @@ test("a restart recovery turn without a new user instruction fails terminally in
   expect(adapterConstructions).toBe(0);
 });
 
-test.each(["alpha/search", "images/generations"])("authenticated lifecycle control aborts active %s before acknowledging cancellation", async path => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
-  let upstreamAbortObserved = false;
-  const server = startServer(config, {
-    fetchUpstream: request => new Promise<Response>((_resolve, reject) => {
-      request.signal.addEventListener("abort", () => {
-        upstreamAbortObserved = true;
-        reject(request.signal.reason);
-      }, { once: true });
-    }),
-  });
-  const endpoint = `http://127.0.0.1:${server.port}`;
-  const activeRequest = fetch(`${endpoint}/v1/${path}`, {
-    method: "POST",
-    headers: {
-      authorization: "Bearer test-codex-session",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(path === "alpha/search"
-      ? { query: "retained turn" }
-      : { model: "gpt-image-1", prompt: "A blue square" }),
-  }).catch(() => null);
-
-  try {
-    const deadline = Date.now() + 1_000;
-    let activeHttpTurns = 0;
-    while (Date.now() < deadline && activeHttpTurns !== 1) {
-      const health = await (await fetch(`${endpoint}/healthz`)).json() as { active_http_turns: number };
-      activeHttpTurns = health.active_http_turns;
-      if (activeHttpTurns !== 1) await Bun.sleep(5);
-    }
-    expect(activeHttpTurns).toBe(1);
-
-    const cancelled = await fetch(`${endpoint}/admin/cancel-turns`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${config.controlToken}` },
-    });
-    expect(cancelled.status).toBe(200);
-    expect(await cancelled.json()).toMatchObject({
-      status: "ok",
-      cancelled_http_turns: 1,
-      active_http_turns: 0,
-      active_browser_turns: 0,
-    });
-    expect(upstreamAbortObserved).toBe(true);
-    await activeRequest;
-  } finally {
-    await server.stop(true);
-  }
-});
-
 test("a full-mode runtime exposes its broker endpoint before any turn registers", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-serve-"));
   // The endpoint is a Unix socket on POSIX and a named pipe on Windows, so liveness is proven by
@@ -1121,143 +930,6 @@ test("a drained runtime rejects new model-catalog work before shutdown", async (
   }
 });
 
-test("health proves that Codex received a successful augmented model catalog", async () => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
-  const server = startServer(config, {
-    fetchUpstream: async () => Response.json({
-      models: [{
-        slug: "gpt-5.6-sol",
-        display_name: "5.6 Sol",
-        visibility: "list",
-        supported_in_api: true,
-        supported_reasoning_levels: [],
-        tool_mode: "code_mode_only",
-      }],
-    }),
-  });
-  const endpoint = `http://127.0.0.1:${server.port}`;
-  try {
-    expect(await (await fetch(`${endpoint}/healthz`)).json()).toMatchObject({
-      successful_model_catalog_requests: 0,
-      last_successful_model_catalog_request_at: null,
-    });
-
-    const models = await fetch(`${endpoint}/v1/models`, {
-      headers: { authorization: "Bearer test-codex-session" },
-    });
-    expect(models.status).toBe(200);
-
-    const health = await (await fetch(`${endpoint}/healthz`)).json() as Record<string, unknown>;
-    expect(health.successful_model_catalog_requests).toBe(1);
-    expect(typeof health.last_successful_model_catalog_request_at).toBe("string");
-  } finally {
-    await server.stop(true);
-  }
-});
-
-test("server exposes authenticated standalone Web Search on the routed v1 base URL", async () => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
-  let upstreamRequest: Request | undefined;
-  const server = startServer(config, {
-    fetchUpstream: async request => {
-      upstreamRequest = request;
-      return Response.json({ results: ["native-search-result"] });
-    },
-  });
-  const endpoint = `http://127.0.0.1:${server.port}`;
-  try {
-    const response = await fetch(`${endpoint}/v1/alpha/search`, {
-      method: "POST",
-      headers: {
-        authorization: "Bearer test-codex-session",
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ query: "bridge route" }),
-    });
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ results: ["native-search-result"] });
-    expect(upstreamRequest!.url).toBe("https://chatgpt.com/backend-api/codex/alpha/search");
-    expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer test-codex-session");
-    expect(await upstreamRequest!.json()).toEqual({ query: "bridge route" });
-  } finally {
-    await server.stop(true);
-  }
-});
-
-test("standalone native image generation and edits preserve their upstream protocol", async () => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
-  const requests: Request[] = [];
-  const reply = '{ "created": 1778832973, "data": [{ "b64_json": "native-image-bytes" }] }';
-  const denied = '{ "error": { "code": "rate_limit_exceeded", "message": "Image allowance reached" } }';
-  const upstreamServer = Bun.serve({
-    port: 0,
-    fetch: request => {
-      const edit = new URL(request.url).pathname.endsWith("/edits");
-      return new Response(Bun.gzipSync(edit ? denied : reply), {
-        status: edit ? 429 : 200,
-        headers: {
-          "content-type": "application/json", "content-encoding": "gzip",
-          "x-codex-imagegen-request-id": "native-image-request",
-        },
-      });
-    },
-  });
-  const server = startServer(config, {
-    fetchUpstream: async request => {
-      requests.push(request);
-      const path = new URL(request.url).pathname;
-      return fetch(new Request(`http://127.0.0.1:${upstreamServer.port}${path}`, request.clone()));
-    },
-  });
-  const endpoint = `http://127.0.0.1:${server.port}`;
-  try {
-    for (const operation of ["generations", "edits"] as const) {
-      const body = operation === "generations"
-        ? '{ "model": "gpt-image-1", "prompt": "A blue square", "n": 1 }'
-        : '{ "model": "gpt-image-1", "prompt": "Make it green", "images": [{ "image_url": "data:image/png;base64,AAAA" }] }';
-      const response = await fetch(`${endpoint}/v1/images/${operation}?fixture=1`, {
-        method: "POST",
-        headers: {
-          authorization: "Bearer test-codex-session",
-          "content-type": "application/json",
-          "chatgpt-account-id": "test-account",
-          "x-codex-image-turn-id": "native-image-turn",
-        },
-        body,
-      });
-      expect(response.status).toBe(operation === "generations" ? 200 : 429);
-      expect(await response.text()).toBe(operation === "generations" ? reply : denied);
-      expect(response.headers.get("content-encoding")).toBeNull();
-      expect(response.headers.get("x-codex-imagegen-request-id")).toBe("native-image-request");
-      const upstream = requests.at(-1)!;
-      expect(upstream.url).toBe(`https://chatgpt.com/backend-api/codex/images/${operation}?fixture=1`);
-      expect(upstream.method).toBe("POST");
-      expect(upstream.redirect).toBe("manual");
-      expect(upstream.headers.get("authorization")).toBe("Bearer test-codex-session");
-      expect(upstream.headers.get("chatgpt-account-id")).toBe("test-account");
-      expect(upstream.headers.get("x-codex-image-turn-id")).toBe("native-image-turn");
-      expect(upstream.headers.get("host")).toBeNull();
-      expect(await upstream.text()).toBe(body);
-    }
-    expect(requests).toHaveLength(2);
-    const unauthorized = await fetch(`${endpoint}/v1/images/generations`, { method: "POST", body: "{}" });
-    expect(unauthorized.status).toBe(401);
-    expect(requests).toHaveLength(2);
-    await fetch(`${endpoint}/admin/drain`, {
-      method: "POST", headers: { authorization: `Bearer ${config.controlToken}` },
-    });
-    const drained = await fetch(`${endpoint}/v1/images/edits`, {
-      method: "POST", headers: { authorization: "Bearer test-codex-session" }, body: "{}",
-    });
-    expect(drained.status).toBe(503);
-    expect(requests).toHaveLength(2);
-  } finally {
-    await server.stop(true);
-    await upstreamServer.stop(true);
-  }
-});
-
 test("authenticated shutdown requires a verified idle drain", async () => {
   const config = { ...defaultConfig("browser-only"), port: 0 };
   const server = startServer(config);
@@ -1306,44 +978,6 @@ test("authenticated shutdown requires a verified idle drain", async () => {
       }
     }
     expect(stopped).toBe(true);
-  } finally {
-    await server.stop(true);
-  }
-});
-
-test("model catalog health distinguishes no request, transport failure, upstream denial, and recovery without secrets", async () => {
-  let outcome: "transport" | "denied" | "invalid" | "ready" = "transport";
-  const server = startServer({ ...defaultConfig("browser-only"), port: 0 }, {
-    fetchUpstream: async () => {
-      if (outcome === "transport") throw Object.assign(new Error("private proxy credentials and host"), { code: "UnsupportedProxyProtocol" });
-      if (outcome === "denied") return new Response("private upstream account detail", { status: 403 });
-      if (outcome === "invalid") return Response.json({ models: [] });
-      return Response.json({ models: [{ slug: "native", visibility: "list", supported_reasoning_levels: [] }] });
-    },
-  });
-  const base = `http://127.0.0.1:${server.port}`;
-  const health = async () => await (await fetch(`${base}/healthz`)).json() as Record<string, any>;
-  try {
-    expect(await health()).toMatchObject({ model_catalog_requests: 0, last_model_catalog_result: null });
-    const unauthenticated = await fetch(`${base}/v1/models`);
-    expect(unauthenticated.status).toBe(502);
-    await unauthenticated.text();
-    expect((await health()).last_model_catalog_result.failure.stage).toBe("request");
-    for (const [next, status, stage] of [
-      ["transport", 502, "transport"], ["denied", 403, "upstream"], ["invalid", 502, "catalog"], ["ready", 200, undefined],
-    ] as const) {
-      outcome = next;
-      const response = await fetch(`${base}/v1/models`, { headers: { authorization: "Bearer private-session-token" } });
-      expect(response.status).toBe(status);
-      await response.text();
-      const snapshot = await health();
-      expect(snapshot.last_model_catalog_result).toMatchObject({ status });
-      expect(snapshot.last_model_catalog_result.failure?.stage).toBe(stage);
-      if (next === "transport") expect(snapshot.last_model_catalog_result.failure.code).toBe("UnsupportedProxyProtocol");
-      expect(JSON.stringify(snapshot)).not.toContain("private");
-      expect(snapshot.successful_model_catalog_requests).toBe(next === "ready" ? 1 : 0);
-    }
-    expect((await health()).model_catalog_requests).toBe(5);
   } finally {
     await server.stop(true);
   }

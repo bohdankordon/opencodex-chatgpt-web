@@ -94,7 +94,8 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
         useSavedChats: true,
         connectorNameSuffix: "Work",
       });
-      expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
+      // S4D OpenCodex-only: setup never installs Codex routing; only app config is saved.
+      expect(calls).toEqual(["save"]);
       expect(saved?.tunnel?.alias).toBe(`codex-chatgpt-web${development ? "-dev" : ""}${interaction === "manual" ? "-zero-risk" : ""}`);
       expect(result.tunnelReady).not.toBe(true);
       expect(result.connectorSetupRequired).toBe(true);

@@ -16,7 +16,7 @@ import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
 
 export type RuntimeMode = "browser-only" | "full";
-/** Who owns the Codex connection route. This is independent from RuntimeMode/tool execution. */
+/** S4D: product is OpenCodex-only. IntegrationMode is a deprecated migration-only alias; production never branches on it. */
 export type IntegrationMode = "direct" | "external-provider";
 export type BrowserHostMode = "managed-chrome" | "launcher";
 export type BrowserInteractionMode = "automatic" | "manual";
@@ -107,7 +107,7 @@ export interface AppConfig {
   purpose?: "dev-harness";
   releaseVersion: string;
   mode: RuntimeMode;
-  /** `direct` may edit Codex routing; `external-provider` is a provider behind another router. */
+  /** S4D: OpenCodex-only product. Deprecated fixed value; production never branches on it. Old "direct" configs migrate to "external-provider" on load/save without requiring manual edits. */
   integrationMode: IntegrationMode;
   subagentProtocol: SubagentProtocol;
   host: "127.0.0.1";
@@ -256,7 +256,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     version: 3,
     releaseVersion: VERSION,
     mode,
-    integrationMode: "direct",
+    integrationMode: "external-provider",
     subagentProtocol: "compatibility-v1",
     host: "127.0.0.1",
     port: 17841,
@@ -420,12 +420,9 @@ export function loadConfigForSetup(): AppConfig {
     raw.version = 3;
     raw.browserHost = "managed-chrome";
   }
-  // Version 3 configurations predate explicit integration ownership. Keep the old direct
-  // behavior, while preserving an explicitly persisted external-provider intent when present.
-  const legacyIntegrationMode = raw.codexIntegrationMode;
-  if (raw.integrationMode === undefined && legacyIntegrationMode !== undefined) {
-    raw.integrationMode = legacyIntegrationMode;
-  }
+  // S4D: OpenCodex-only product. Old integrationMode/codexIntegrationMode values are
+  // accepted and ignored; parseConfig normalizes them to external-provider without
+  // requiring manual edits. No copying is needed here.
   const interactionMode = raw.browserInteractionMode ?? "automatic";
   const automaticName = raw.automaticAppName
     ?? (interactionMode === "automatic" ? raw.appName : CHATGPT_CONNECTOR_NAME);
@@ -455,20 +452,13 @@ function parseConfig(value: unknown, path: string): AppConfig {
     }
     return candidate;
   };
-  const integrationMode = validateIntegrationMode(rawIntegrationMode, "integrationMode");
-  const legacyMode = validateIntegrationMode(legacyIntegrationMode, "codexIntegrationMode");
-  let resolvedIntegrationMode: IntegrationMode;
-  if (integrationMode && legacyMode && integrationMode !== legacyMode) {
-    // An explicit external-provider intent must never be silently demoted to direct, even when
-    // a second alias disagrees. Fail closed on the more conservative ownership.
-    if (integrationMode === "external-provider" || legacyMode === "external-provider") {
-      resolvedIntegrationMode = "external-provider";
-    } else {
-      throw new Error(`Conflicting integrationMode and codexIntegrationMode in ${path}`);
-    }
-  } else {
-    resolvedIntegrationMode = integrationMode ?? legacyMode ?? "direct";
-  }
+  // S4D migration: validate old values but always normalize to the single
+  // OpenCodex-only mode. "direct" is accepted for backwards compatibility and
+  // treated as "external-provider"; conflicting aliases no longer fail because
+  // neither can re-enable Direct routing.
+  validateIntegrationMode(rawIntegrationMode, "integrationMode");
+  validateIntegrationMode(legacyIntegrationMode, "codexIntegrationMode");
+  const resolvedIntegrationMode: IntegrationMode = "external-provider";
   const subagentProtocol = parsed.subagentProtocol ?? "compatibility-v1";
   if (subagentProtocol !== "compatibility-v1" && subagentProtocol !== "native") {
     throw new Error(`Invalid subagentProtocol in ${path}`);
@@ -682,7 +672,7 @@ function parseConfig(value: unknown, path: string): AppConfig {
   } as AppConfig;
 }
 
-/** Resolve integration ownership for partially migrated launcher/runtime values. */
+/** S4D migration-only: validate old routing fields but always normalize to the single OpenCodex-only mode. */
 export function resolveIntegrationMode(
   value: { integrationMode?: unknown; codexIntegrationMode?: unknown } | null | undefined,
 ): IntegrationMode {
@@ -697,34 +687,40 @@ export function resolveIntegrationMode(
   if (legacy !== undefined && !valid(legacy)) {
     throw new Error("Invalid codexIntegrationMode; expected direct or external-provider");
   }
-  if (valid(primary) && valid(legacy) && primary !== legacy) {
-    if (primary === "external-provider" || legacy === "external-provider") return "external-provider";
-    throw new Error("Conflicting integrationMode and codexIntegrationMode");
-  }
-  return (valid(primary) ? primary : valid(legacy) ? legacy : "direct");
+  return "external-provider";
 }
 
+/**
+ * S4D deprecated: product is always OpenCodex-only, so this always returns true
+ * for valid inputs. Kept for migration-only callers; production must not branch on it.
+ */
 export function isExternalProviderMode(
-  value: Pick<AppConfig, "integrationMode"> | { integrationMode?: unknown; codexIntegrationMode?: unknown } | null | undefined,
+  _value: Pick<AppConfig, "integrationMode"> | { integrationMode?: unknown; codexIntegrationMode?: unknown } | null | undefined,
 ): boolean {
-  return resolveIntegrationMode(value) === "external-provider";
+  // Validate old values without preserving dual-mode semantics.
+  resolveIntegrationMode(_value);
+  return true;
 }
 
-/** Read only routing ownership so mutation guards do not depend on unrelated runtime config validity. */
+/** S4D migration-only: always reports the single OpenCodex-only mode after validating old fields. */
 export function readPersistedIntegrationMode(): IntegrationMode {
   const path = getConfigPath();
-  if (!existsSync(path)) return "direct";
+  if (!existsSync(path)) return "external-provider";
   const raw = JSON.parse(stripUtf8Bom(readFileSync(path, "utf8")));
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`Invalid configuration object in ${path}`);
   }
-  return resolveIntegrationMode(raw as { integrationMode?: unknown; codexIntegrationMode?: unknown });
+  resolveIntegrationMode(raw as { integrationMode?: unknown; codexIntegrationMode?: unknown });
+  return "external-provider";
 }
 
 export function saveConfig(config: AppConfig): void {
   const path = getConfigPath();
   const original = existsSync(path) ? readFileSync(path, "utf8") : "";
-  atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(config, null, 2)}\n`, original));
+  // S4D: never perpetuate the legacy alias; always persist the single OpenCodex-only mode.
+  const { codexIntegrationMode: _dropped, ...rest } = config as unknown as Record<string, unknown>;
+  const normalized = { ...rest, integrationMode: "external-provider" } as AppConfig;
+  atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(normalized, null, 2)}\n`, original));
 }
 
 export function providerConfig(config: AppConfig): CodexProviderConfig {

@@ -12,6 +12,11 @@ const port = Number(process.env.S4C_PROVIDER_PORT || "17914");
 if (!descriptor || !isAbsolute(descriptor) || !brokerSocketPath || !Number.isInteger(port) || port < 1024 || port > 65535) {
   throw new Error("S4C E2E requires a launcher descriptor, broker socket, and valid port");
 }
+// S4D area C: never resolve the app home (provider-token file) to the real user
+// home. E2E startup must export an isolated TEMP CODEX_CHATGPT_WEB_HOME.
+if (!process.env.CODEX_CHATGPT_WEB_HOME || !isAbsolute(process.env.CODEX_CHATGPT_WEB_HOME)) {
+  throw new Error("S4C E2E requires an isolated TEMP CODEX_CHATGPT_WEB_HOME");
+}
 const config = defaultConfig("full");
 config.integrationMode = "external-provider";
 config.browserHost = "launcher";

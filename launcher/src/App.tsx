@@ -21,7 +21,6 @@ import type {
   BrowserState,
   DoctorReport,
   Language,
-  LauncherIntegrationMode,
   LauncherSnapshot,
   LauncherState,
   LogRecord,
@@ -1166,8 +1165,9 @@ function SetupSurface({
   // upgrade state migration, CLI-created installs, or stale launcher state.
   // The always-Direct DEV profile never shows it. Canonical G1 config
   // remains authoritative.
-  const isNewInstall = snapshot.integrationInstallationState === "missing";
-  const [routingChoice, setRoutingChoice] = useState<LauncherIntegrationMode>("direct");
+  // S4D OpenCodex-only: no routing choice. The product always registers as an
+  // OpenCodex provider; OpenCodex owns Codex routing. The legacy Direct vs
+  // external-provider picker is retired.
   const busy = localBusy
     || operation?.status === "running"
     || (!manualInteraction && (
@@ -1198,15 +1198,9 @@ function SetupSurface({
     updateState(await api!.snapshot());
   });
   const install = () => run(async () => {
-    // Canonical first-install ownership intent only. A genuinely missing
-    // installation may request Direct (default) or External; a configured or
-    // damaged install reinstalls with no requested mode so the canonical G1
-    // config stays authoritative. No GUI migration.
-    if (!devProfile && isNewInstall) {
-      await api!.setupCore({ integrationMode: routingChoice });
-    } else {
-      await api!.setupCore();
-    }
+    // S4D OpenCodex-only: always install as an OpenCodex provider; never pass a
+    // routing choice. Canonical config stays authoritative; no GUI migration.
+    await api!.setupCore();
     updateState(await api!.snapshot());
   });
   const setZeroRiskPro = (enabled: boolean) => run(async () => {
@@ -1245,33 +1239,7 @@ function SetupSurface({
             title={copy.stepSmoke}
           />
         </> : null}
-        {!devProfile && isNewInstall ? (
-          <div className="routing-picker" role="radiogroup" aria-label={copy.routingTitle}>
-            <span className="routing-picker-label">{copy.routingTitle}</span>
-            <button
-              aria-checked={routingChoice === "direct"}
-              className={`routing-option${routingChoice === "direct" ? " is-active" : ""}`}
-              disabled={busy}
-              onClick={() => setRoutingChoice("direct")}
-              role="radio"
-              type="button"
-            >
-              <strong>{copy.routingDirect}</strong>
-              <small>{copy.routingDirectBody}</small>
-            </button>
-            <button
-              aria-checked={routingChoice === "external-provider"}
-              className={`routing-option${routingChoice === "external-provider" ? " is-active" : ""}`}
-              disabled={busy}
-              onClick={() => setRoutingChoice("external-provider")}
-              role="radio"
-              type="button"
-            >
-              <strong>{copy.routingExternal}</strong>
-              <small>{copy.routingExternalBody}</small>
-            </button>
-          </div>
-        ) : null}
+        {/* S4D OpenCodex-only: routing picker retired. New installs always register as an OpenCodex provider. */}
         <SetupRow
           action={snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall

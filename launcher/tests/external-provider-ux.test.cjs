@@ -48,27 +48,24 @@ function loadNativeCopy() {
   );
   return Function(`${copySource}\nreturn { NATIVE_COPY, nativeCopyFor };`)();
 }
-// FINAL-A 17: first-install ownership intent (renderer source audits).
+// S4D OpenCodex-only: routing picker retired (renderer source audits).
 
-test("FINAL-A new install defaults to Direct", () => {
-  assert.match(appSource, /useState<LauncherIntegrationMode>\("direct"\)/);
+test("S4D new install has no Direct default and no routing choice", () => {
+  assert.ok(!appSource.includes("setRoutingChoice"), "routing choice setter must be retired");
+  assert.ok(!appSource.includes("useState<LauncherIntegrationMode>"), "routing choice state must be retired");
 });
 
-test("FINAL-A new install can select External provider", () => {
-  assert.match(appSource, /role="radiogroup" aria-label=\{copy\.routingTitle\}/);
-  assert.match(appSource, /copy\.routingDirectBody/);
-  assert.match(appSource, /copy\.routingExternalBody/);
-  assert.match(appSource, /onClick=\{\(\) => setRoutingChoice\("direct"\)\}/);
-  assert.match(appSource, /onClick=\{\(\) => setRoutingChoice\("external-provider"\)\}/);
+test("S4D renderer has no routing picker surface", () => {
+  assert.ok(!appSource.includes("routing-picker"), "picker markup must be retired");
+  assert.ok(!appSource.includes("copy.routingTitle"), "picker wiring must be retired");
+  assert.ok(!appSource.includes("setRoutingChoice"), "picker handlers must be retired");
+  assert.ok(!appSource.includes("isNewInstall"), "first-install gate must be retired");
 });
 
-test("ownership selector is first-install only, never a migration surface", () => {
-  // Supplemental source audit: canonical installation state gates the picker,
-  // never readiness bookkeeping. Behavioral proof lives in the classification
-  // matrix below (configured/damaged + coreSetupComplete=false hides it).
-  assert.match(appSource, /snapshot\.integrationInstallationState === "missing"/);
-  assert.ok(!appSource.match(/const isNewInstall = snapshot\.state\.coreSetupComplete/), "readiness must not decide installation existence");
-  assert.match(appSource, /\{!devProfile && isNewInstall \? \(/);
+test("S4D no ownership selector or ownership input anywhere in the renderer", () => {
+  assert.ok(!appSource.includes("routingChoice"), "no routing choice in any surface");
+  assert.ok(!appSource.includes("integrationMode: routingChoice"), "no ownership input in any surface");
+  assert.match(appSource, /await api!\.setupCore\(\);/);
   const settingsStart = appSource.indexOf("function SettingsSurface(");
   assert.ok(settingsStart > 0, "Settings surface must exist");
   const settingsSource = appSource.slice(settingsStart);
@@ -216,10 +213,12 @@ test("FINAL-A configured External reinstall preserves canonical ownership", asyn
   assert.equal(result.restartRequired, false);
 });
 
-test("FINAL-A canonical config remains authority with CLI-only migration", () => {
+// S4D: canonical config remains authority; requested modes are accepted and
+// ignored, and no ownership migration exists in any direction.
+test("S4D canonical config remains authority with no ownership migration", () => {
   assert.match(electronMain, /resolveSetupOwnership\(extractRequestedIntegrationMode\(input\), "setup-core"\)/);
   const modeSource = fs.readFileSync(path.join(launcherRoot, "electron", "integration-mode.cjs"), "utf8");
-  assert.match(modeSource, /ownership migration is CLI-only/);
+  assert.match(modeSource, /no ownership migration exists/);
 });
 function runReadyState({ integrationMode, bridgeRouteChanged, mode }) {
   const source = sliceMainFunction(
@@ -438,11 +437,13 @@ function extractBalancedBlock(source, openIndex) {
   throw new Error("Unbalanced block while reading App.tsx");
 }
 
-// The shipped picker gate expression, executed against a snapshot fixture.
+// S4D OpenCodex-only: the routing picker is retired, so no picker gate
+// exists in App.tsx. The helper proves the retirement and reports the picker
+// as never visible for any snapshot fixture.
 function rendererPickerGate() {
-  const match = appSource.match(/const isNewInstall = ([^;]+);/);
-  if (!match) throw new Error("App.tsx is missing the canonical isNewInstall gate");
-  return Function("snapshot", `return (${match[1]});`);
+  assert.ok(!appSource.includes("isNewInstall"), "picker gate must be retired");
+  assert.ok(!appSource.includes("routingChoice"), "routing choice must be retired");
+  return () => false;
 }
 
 // A shipped async renderer flow, executed against mocked props and a mocked
@@ -578,29 +579,28 @@ function loadSnapshotHandler(canonical) {
   return handlers["launcher:snapshot"];
 }
 
-test("genuinely new install classifies missing and offers Direct by default", async () => {
+test("S4D genuinely new install classifies missing with no picker and no mode intent", async () => {
   const direct = await rendererSetupRequest({ canonicalConfig: null, routingChoice: "direct" });
   assert.equal(direct.installationState, "missing");
-  assert.equal(direct.pickerVisible, true);
-  assert.deepEqual(direct.setupCalls, [[{ integrationMode: "direct" }]]);
+  assert.equal(direct.pickerVisible, false);
+  assert.deepEqual(direct.setupCalls, [[]]);
   const external = await rendererSetupRequest({ canonicalConfig: null, routingChoice: "external-provider" });
-  assert.equal(external.pickerVisible, true);
-  assert.deepEqual(external.setupCalls, [[{ integrationMode: "external-provider" }]]);
+  assert.equal(external.pickerVisible, false);
+  assert.deepEqual(external.setupCalls, [[]]);
 });
 
-test("the picker gate reads canonical state only, never readiness bookkeeping", () => {
+test("S4D retired picker gate never shows for any snapshot", () => {
   const gate = rendererPickerGate();
-  // The old gate (coreSetupComplete !== true) showed the picker in every
-  // configured case below, which is exactly the false migration surface.
-  assert.equal(gate({ integrationInstallationState: "missing", state: { coreSetupComplete: false } }), true);
-  assert.equal(gate({ integrationInstallationState: "missing", state: { coreSetupComplete: true } }), true);
+  // S4D: the picker is retired, so no snapshot fixture may show it.
+  assert.equal(gate({ integrationInstallationState: "missing", state: { coreSetupComplete: false } }), false);
+  assert.equal(gate({ integrationInstallationState: "missing", state: { coreSetupComplete: true } }), false);
   assert.equal(gate({ integrationInstallationState: "configured", state: { coreSetupComplete: false } }), false);
   assert.equal(gate({ integrationInstallationState: "configured", state: { coreSetupComplete: true } }), false);
   assert.equal(gate({ integrationInstallationState: "damaged", state: { coreSetupComplete: false } }), false);
   assert.equal(gate({ integrationInstallationState: "damaged", state: { coreSetupComplete: true } }), false);
 });
 
-test("configured Direct with false readiness hides the picker and reinstalls with no mode", async () => {
+test("S4D configured Direct with false readiness reinstalls with no mode and no picker", async () => {
   const result = await rendererSetupRequest({
     canonicalConfig: { mode: "full", integrationMode: "direct" },
     routingChoice: "external-provider",
@@ -610,7 +610,7 @@ test("configured Direct with false readiness hides the picker and reinstalls wit
   assert.deepEqual(result.setupCalls, [[]]);
 });
 
-test("configured External with false readiness hides the picker and reinstalls with no mode", async () => {
+test("S4D configured External with false readiness reinstalls with no mode and no picker", async () => {
   const result = await rendererSetupRequest({
     canonicalConfig: { mode: "full", integrationMode: "external-provider" },
     routingChoice: "direct",
@@ -620,7 +620,7 @@ test("configured External with false readiness hides the picker and reinstalls w
   assert.deepEqual(result.setupCalls, [[]]);
 });
 
-test("CLI-created installs with absent Launcher state classify configured and hide the picker", async () => {
+test("S4D CLI-created installs with absent Launcher state classify configured with no intent", async () => {
   const fixtures = [
     ["External", { mode: "browser-only", integrationMode: "external-provider" }],
     ["Direct", { mode: "full", integrationMode: "direct" }],
@@ -635,7 +635,7 @@ test("CLI-created installs with absent Launcher state classify configured and hi
   }
 });
 
-test("failure and reset style readiness never reopens first-install ownership intent", async () => {
+test("S4D failure and reset style readiness never shows a picker", async () => {
   const canonicalConfig = { mode: "full", integrationMode: "direct" };
   const supervisor = { readSetupConfig: () => canonicalConfig };
   const readinessStates = [
@@ -655,7 +655,7 @@ test("failure and reset style readiness never reopens first-install ownership in
   }
 });
 
-test("DEV profile never sends first-install ownership intent", async () => {
+test("S4D DEV profile never sends ownership intent", async () => {
   const result = await rendererSetupRequest({
     canonicalConfig: null,
     routingChoice: "external-provider",
@@ -665,7 +665,7 @@ test("DEV profile never sends first-install ownership intent", async () => {
   assert.deepEqual(result.setupCalls, [[]]);
 });
 
-test("damaged canonical config hides the picker and sends no mode intent", async () => {
+test("S4D damaged canonical config sends no mode intent and shows no picker", async () => {
   const damagedFixtures = [{ integrationMode: "opencodex" }, { integrationMode: 5 }, [], "not-an-object"];
   for (const canonicalConfig of damagedFixtures) {
     const result = await rendererSetupRequest({ canonicalConfig, routingChoice: "direct" });
@@ -684,14 +684,14 @@ test("unexpected supervisor misuse throws instead of looking damaged", () => {
   assert.throws(() => readIntegrationInstallationState({}), /no configuration reader/);
 });
 
-test("setup success refreshes the renderer to configured without a restart", async () => {
+test("S4D setup success refreshes the renderer to configured with no mode intent", async () => {
   const result = await rendererSetupRequest({
     canonicalConfig: null,
     afterSetupConfig: { mode: "browser-only", integrationMode: "external-provider" },
     routingChoice: "external-provider",
   });
   assert.equal(result.installationState, "missing");
-  assert.deepEqual(result.setupCalls, [[{ integrationMode: "external-provider" }]]);
+  assert.deepEqual(result.setupCalls, [[]]);
   assert.equal(result.refreshed.length, 1, "setup must refresh through a full snapshot");
   assert.equal(result.refreshed[0].integrationInstallationState, "configured");
   assert.equal(rendererPickerGate()({
@@ -700,7 +700,7 @@ test("setup success refreshes the renderer to configured without a restart", asy
   }), false);
 });
 
-test("Remove success refreshes the renderer to missing so intent may legitimately return", async () => {
+test("S4D Remove success refreshes the renderer to missing with still no mode intent", async () => {
   const removed = await rendererRemoveRequest({ installationStateAfterRemove: "missing" });
   assert.equal(removed.snapshotCalls, 1, "Remove must re-read canonical state");
   assert.equal(removed.refreshed.length, 1, "Remove must refresh through a full snapshot");
@@ -709,10 +709,12 @@ test("Remove success refreshes the renderer to missing so intent may legitimatel
   assert.equal(rendererPickerGate()({
     integrationInstallationState: removed.refreshed[0].integrationInstallationState,
     state: removed.refreshed[0].state,
-  }), true);
+  }), false);
+  const reinstall = await rendererSetupRequest({ canonicalConfig: null, routingChoice: "direct" });
+  assert.deepEqual(reinstall.setupCalls, [[]]);
 });
 
-test("Remove that leaves damaged canonical config refreshes to damaged with no intent", async () => {
+test("S4D Remove that leaves damaged canonical config refreshes to damaged with no intent", async () => {
   const removed = await rendererRemoveRequest({ installationStateAfterRemove: "damaged" });
   assert.equal(removed.refreshed.length, 1);
   assert.equal(removed.refreshed[0].integrationInstallationState, "damaged");

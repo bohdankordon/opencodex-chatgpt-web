@@ -8,17 +8,18 @@
 // never branched on process ownership (launcher/external/none): route policy
 // follows integrationMode alone.
 
-const { DIRECT, isLauncherIntegrationMode } = require("./integration-mode.cjs");
+const { EXTERNAL_PROVIDER, isLauncherIntegrationMode } = require("./integration-mode.cjs");
 
 function buildStartupRoutePolicy(integrationMode) {
-  if (!isLauncherIntegrationMode(integrationMode)) {
+  // S4D OpenCodex-only: validate old values but always return the provider-only
+  // policy. Launcher startup never connects or restores a Direct Codex route.
+  if (integrationMode !== undefined && !isLauncherIntegrationMode(integrationMode)) {
     throw new Error("Startup route policy requires direct or external-provider");
   }
-  const direct = integrationMode === DIRECT;
   return Object.freeze({
-    integrationMode: integrationMode,
-    connectDirectRoute: direct,
-    restoreDirectRouteOnFailure: direct,
+    integrationMode: EXTERNAL_PROVIDER,
+    connectDirectRoute: false,
+    restoreDirectRouteOnFailure: false,
   });
 }
 

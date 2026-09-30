@@ -123,7 +123,7 @@ test("external-provider refuses stripped turns when OpenCodex native metadata is
   expect(adapterStarted).toBe(false);
   expect(response.status).toBe(400);
   const payload = await response.json() as { error?: { message?: string } };
-  expect(payload.error?.message).toBe("External-provider ChatGPT Web requests require native Codex turn metadata in client_metadata");
+  expect(payload.error?.message).toBe("OpenCodex ChatGPT Web requests require native Codex turn metadata in client_metadata");
   if (prevHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME; else process.env.CODEX_CHATGPT_WEB_HOME = prevHome;
 });
 

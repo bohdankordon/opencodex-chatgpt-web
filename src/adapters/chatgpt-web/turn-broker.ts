@@ -263,6 +263,11 @@ export class TurnBroker implements TurnBrokerOwner {
   private readonly retiredTokens = new Map<string, string>();
   private acceptingExternalOwners = true;
   private server?: Server;
+  // S4D: an aborted owner_next long-poll is inherent to fresh-turn-per-request
+  // provider semantics (the losing side of the browser/tools race is always
+  // aborted). A stale client connection must never wedge server shutdown, so
+  // close() destroys any sockets still open after channels are revoked.
+  private readonly openSockets = new Set<Socket>();
   private startPromise?: Promise<void>;
   private socketIdentity?: { dev: number; ino: number };
 
@@ -748,6 +753,7 @@ export class TurnBroker implements TurnBrokerOwner {
     this.startPromise = undefined;
     if (brokers.get(this.socketPath) === this) brokers.delete(this.socketPath);
     if (server?.listening) {
+      for (const socket of [...this.openSockets]) socket.destroy();
       await new Promise<void>((resolveClose, rejectClose) => server.close(error => {
         if (!error || (error as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolveClose();
         else rejectClose(error);
@@ -782,7 +788,11 @@ export class TurnBroker implements TurnBrokerOwner {
         mkdirSync(dirname(this.socketPath), { recursive: true, mode: 0o700 });
       }
       const listen = () => {
-        const server = createServer(socket => this.handleSocket(socket));
+        const server = createServer(socket => {
+          this.openSockets.add(socket);
+          socket.once("close", () => this.openSockets.delete(socket));
+          this.handleSocket(socket);
+        });
         this.server = server;
         server.once("error", rejectStart);
         server.on("error", error => {

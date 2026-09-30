@@ -12,7 +12,8 @@ import type { AdapterEvent, CodexParsedRequest } from "../src/types";
 
 const HEADER = EXTERNAL_CLIENT_ID_HEADER;
 const AUTH_FAILURE_MESSAGE = "External client authentication failed";
-const METADATA_ERROR_MESSAGE = "External-provider ChatGPT Web requests require native Codex turn metadata in client_metadata";
+// S4D: server metadata error is OpenCodex-only.
+const METADATA_ERROR_MESSAGE = "OpenCodex ChatGPT Web requests require native Codex turn metadata in client_metadata";
 const AUTH_FAILURE_BODY = JSON.stringify({
   error: { message: AUTH_FAILURE_MESSAGE, type: "authentication_error", code: "invalid_api_key" },
 });
@@ -163,7 +164,7 @@ function providerBody(model: unknown, extra: Record<string, unknown> = {}): Reco
 }
 
 test("every external authentication failure returns one byte-equivalent flat 401", async () => {
-  // S4B: Direct keeps the legacy external-client flat 401; the OpenCodex provider
+  // S4D OpenCodex-only: all requests use the provider flat 401; the OpenCodex provider
   // path uses its own dedicated flat 401 (Bearer provider secret). Within each
   // mode every credential shape shares one body, leaks nothing, and starts no work.
   isolatedEnvironment();
@@ -183,7 +184,7 @@ test("every external authentication failure returns one byte-equivalent flat 401
       const response = await post(port, "/v1/responses", body, headers);
       const text = await response.text();
       expect([label, response.status, response.headers.get("content-type")]).toEqual([label, 401, "application/json"]);
-      expect([label, text]).toEqual([label, AUTH_FAILURE_BODY]);
+      expect([label, text]).toEqual([label, JSON.stringify({ error: { message: "OpenCodex provider authentication failed", type: "authentication_error", code: "invalid_api_key" } })]);
       expect([label, text.includes(token), text.includes("hermes-local")]).toEqual([label, false, false]);
       expect([label, upstream.length, adapterStarts()]).toEqual([label, 0, 0]);
       directBodies.add(text);
@@ -517,8 +518,8 @@ test("legacy header-absent behavior is unchanged", async () => {
   expect([nativeModel.status, JSON.parse(await nativeModel.text()).error.message])
     .toEqual([400, "Model gpt-5.6-sol is not provided by codex-chatgpt-web"]);
 
-  // 4. Direct native request still uses native passthrough; 5. Direct Web request still adapts;
-  // 6. /v1/models keeps its Phase C legacy catalog when the dedicated header is absent.
+  // S4D OpenCodex-only: no Direct/native passthrough exists. Every request requires
+  // provider Bearer auth; native models are unsupported; models is Web-only with auth.
   const direct = directConfig();
   const nativeAuthorization: Array<[string, string]> = [["authorization", "Bearer codex-oauth-token"]];
   let directAdapterRuns = 0;
@@ -527,25 +528,19 @@ test("legacy header-absent behavior is unchanged", async () => {
     direct,
     () => emittingAdapter("direct-web-adapter", () => { directAdapterRuns += 1; }),
   );
-  expect([directWeb.status, directAdapterRuns]).toEqual([200, 1]);
-
-  // The passthrough fetch is not injectable on this endpoint, so the native branch is proven
-  // without any outbound call: without a Bearer the passthrough rejects before contacting Codex.
+  expect([directWeb.status, directAdapterRuns]).toEqual([401, 0]);
   const nativePassthrough = await responseRequest(
     inProcessRequest(responsesBody("gpt-5.6-sol"), []),
     direct,
     () => { throw new Error("the browser adapter must not start"); },
   );
-  expect([nativePassthrough.status, JSON.parse(await nativePassthrough.text()).error.message])
-    .toEqual([502, "Native Codex passthrough requires the incoming Bearer authorization"]);
-
+  expect(nativePassthrough.status).toBe(401);
   await withServer(direct, async ({ port }) => {
-    const models = await fetch("http://127.0.0.1:" + port + "/v1/models", { headers: nativeAuthorization });
-    const catalog = await models.json() as { models: Array<{ slug: string }> };
+    const unauth = await fetch("http://127.0.0.1:" + port + "/v1/models", { headers: nativeAuthorization });
+    expect(unauth.status).toBe(401);
+    const providerToken = providerBearer(direct);
+    const models = await fetch("http://127.0.0.1:" + port + "/v1/models", { headers: providerToken as unknown as HeadersInit });
     expect(models.status).toBe(200);
-    expect(catalog.models.filter(model => model.slug.startsWith("chatgpt-web/")).map(model => model.slug))
-      .toEqual(["chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
-        "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high"]);
   });
 });
 

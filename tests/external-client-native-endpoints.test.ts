@@ -52,7 +52,8 @@ const IMAGES_UNSUPPORTED_BODY = JSON.stringify({
     code: "unsupported_operation",
   },
 });
-const METADATA_ERROR_MESSAGE = "External-provider ChatGPT Web requests require native Codex turn metadata in client_metadata";
+// S4D: server metadata error is OpenCodex-only.
+const METADATA_ERROR_MESSAGE = "OpenCodex ChatGPT Web requests require native Codex turn metadata in client_metadata";
 
 const roots: string[] = [];
 const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
@@ -198,7 +199,7 @@ test("Direct models rejects every dedicated header shape without contacting upst
     for (const [label, headers] of variants) {
       const response = await fetch("http://127.0.0.1:" + port + "/v1/models", { headers });
       const text = await response.text();
-      expect([label, response.status, text]).toEqual([label, 401, AUTH_FAILURE_BODY]);
+      expect([label, response.status, text]).toEqual([label, 401, PROVIDER_AUTH_FAILURE_BODY]);
       bodies.push(text);
     }
     expect(new Set(bodies).size).toBe(1);
@@ -207,38 +208,31 @@ test("Direct models rejects every dedicated header shape without contacting upst
   });
 });
 
-test("Direct models keeps its native request when the dedicated header is absent", async () => {
+// S4D OpenCodex-only: no native models request exists; provider auth is required.
+test("OpenCodex-only models require provider auth when the dedicated header is absent", async () => {
   isolatedEnvironment();
   const config = directConfig();
   await withServer(config, async ({ port, upstream }) => {
     const response = await fetch("http://127.0.0.1:" + port + "/v1/models", {
       headers: { authorization: "Bearer codex-oauth-token" },
     });
-    expect(response.status).toBe(200);
-    expect(upstream).toHaveLength(1);
-    expect(upstream[0]!.url.startsWith("https://chatgpt.com/backend-api/codex/models")).toBe(true);
-    expect(upstream[0]!.headers.get("authorization")).toBe("Bearer codex-oauth-token");
+    expect(response.status).toBe(401);
+    expect(upstream).toHaveLength(0);
   });
 });
 
-test("compact classifies the dedicated header before promotion and native identity extraction", () => {
+// S4D OpenCodex-only: compact is provider-auth before unsupported; no native path exists.
+test("compact is provider-only without native promotion or passthrough", () => {
   const source = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
   const compactStart = source.indexOf("export async function compactRequest(");
   const startServerAt = source.indexOf("export function startServer(", compactStart);
   expect(compactStart).toBeGreaterThan(0);
   expect(startServerAt).toBeGreaterThan(compactStart);
   const compact = source.slice(compactStart, startServerAt);
-  const classify = compact.indexOf("authenticateExternalClientRequest(req, config)");
-  const promotion = compact.indexOf("applyCodexTurnMetadataHeader(raw, req, { headerWins: true })");
-  const identity = compact.indexOf("extractCodexTurnIdentityFromBody(raw)");
-  const metadataError = compact.indexOf("externalProviderTurnMetadataError(config, raw.model");
-  const passthrough = compact.indexOf("forwardNativeCodexRequest(nativeRequest, \"responses/compact\"");
-  expect([classify > 0, promotion > 0, identity > 0, metadataError > 0, passthrough > 0])
-    .toEqual([true, true, true, true, true]);
-  expect(classify).toBeLessThan(promotion);
-  expect(classify).toBeLessThan(identity);
-  expect(classify).toBeLessThan(metadataError);
-  expect(classify).toBeLessThan(passthrough);
+  expect(compact.includes("requireOpencodexProviderAuth(req, config)")).toBe(true);
+  expect(compact.includes("OPENCODEX_PROVIDER_COMPACT_ENDPOINT_MESSAGE")).toBe(true);
+  expect(compact.includes("forwardNativeCodexRequest")).toBe(false);
+  expect(compact.includes("authenticateExternalClientRequest")).toBe(false);
 });
 
 test("authenticated external compact gets one unsupported answer and binds no native identity", async () => {
@@ -284,10 +278,12 @@ test("authenticated external compact gets one unsupported answer and binds no na
   expect(chatGptTurnSessions.activeCount()).toBe(0);
 });
 
-test("Direct compact rejects the dedicated header before any native work", async () => {
+// S4D OpenCodex-only: compact always requires provider auth; no native work exists.
+test("OpenCodex-only compact rejects non-provider credentials before any work", async () => {
   isolatedEnvironment();
   const token = generateExternalClientToken();
   const config = withExternalClient(directConfig(), token);
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
   const bound: Array<{ threadId: string; turnId: string }> = [];
   let adapterStarts = 0;
   const variants: Array<Array<[string, string]>> = [
@@ -302,7 +298,7 @@ test("Direct compact rejects the dedicated header before any native work", async
       () => { adapterStarts += 1; throw new Error("the browser adapter must not start"); },
       { onTurnIdentity: identity => bound.push(identity) },
     );
-    expect([response.status, await response.text()]).toEqual([401, AUTH_FAILURE_BODY]);
+    expect([response.status, await response.text()]).toEqual([401, PROVIDER_AUTH_FAILURE_BODY]);
   }
   expect(bound).toEqual([]);
   expect(adapterStarts).toBe(0);
@@ -353,7 +349,7 @@ test("Direct search and image endpoints reject the dedicated header before upstr
       ];
       for (const headers of variants) {
         const response = await post(port, path, { model: "gpt-5.6-sol" }, headers);
-        expect([path, response.status, await response.text()]).toEqual([path, 401, AUTH_FAILURE_BODY]);
+        expect([path, response.status, await response.text()]).toEqual([path, 401, PROVIDER_AUTH_FAILURE_BODY]);
       }
     }
     expect(upstream).toHaveLength(0);
@@ -369,9 +365,9 @@ test("external-provider search and image endpoints authenticate before their uns
     const providerToken = readOpencodexProviderTokenFile(config.providerTokenFile);
     const goodAuth: Array<[string, string]> = [["authorization", "Bearer " + providerToken]];
     const expected: Record<string, string> = {
-      "/v1/alpha/search": JSON.stringify({ error: { message: "Native search is not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }),
-      "/v1/images/generations": JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }),
-      "/v1/images/edits": JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }),
+      "/v1/alpha/search": JSON.stringify({ error: { message: "Native search is not provided by codex-chatgpt-web in OpenCodex-only mode", type: "unsupported_operation", code: "unsupported_operation" } }),
+      "/v1/images/generations": JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in OpenCodex-only mode", type: "unsupported_operation", code: "unsupported_operation" } }),
+      "/v1/images/edits": JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in OpenCodex-only mode", type: "unsupported_operation", code: "unsupported_operation" } }),
     };
     for (const path of Object.keys(expected)) {
       const wrong = await post(port, path, { model: "gpt-5.6-sol" }, [["authorization", "Bearer " + "W".repeat(43)]]);
@@ -391,10 +387,11 @@ test("header-absent legacy behavior on the corrected endpoints is unchanged", as
   await withServer(directConfig(), async ({ port, upstream }) => {
     const nativeAuthorization: Array<[string, string]> = [["authorization", "Bearer codex-oauth-token"]];
     const search = await post(port, "/v1/alpha/search", { query: "x" }, nativeAuthorization);
-    expect(search.status).toBe(200);
+    // S4D OpenCodex-only: native search/images no longer exist; provider auth required.
+    expect(search.status).toBe(401);
     const images = await post(port, "/v1/images/generations", { prompt: "x" }, nativeAuthorization);
-    expect(images.status).toBe(200);
-    expect(upstream).toHaveLength(2);
+    expect(images.status).toBe(401);
+    expect(upstream).toHaveLength(0);
   });
   await withServer(external, async ({ port, upstream }) => {
     for (const path of ["/v1/alpha/search", "/v1/images/generations", "/v1/images/edits", "/v1/responses/compact"]) {

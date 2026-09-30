@@ -17,29 +17,32 @@ const {
 // G1 (PR #2) contract tests. Semantics mirror src/config.ts so the Electron
 // host cannot drift from core ownership rules. Numbers map to the G1 test plan.
 
-test("G1.1 missing fields resolve to direct", () => {
-  assert.equal(resolveIntegrationModeFromRaw({}), "direct");
-  assert.equal(resolveIntegrationModeFromRaw({ mode: "full" }), "direct");
-  assert.equal(resolveIntegrationModeFromRaw({ integrationMode: undefined }), "direct");
+// S4D OpenCodex-only: every valid raw config normalizes to
+// external-provider. Legacy "direct" values validate but can never resolve to
+// Direct; malformed values still throw.
+test("G1.1 missing fields normalize to external-provider", () => {
+  assert.equal(resolveIntegrationModeFromRaw({}), "external-provider");
+  assert.equal(resolveIntegrationModeFromRaw({ mode: "full" }), "external-provider");
+  assert.equal(resolveIntegrationModeFromRaw({ integrationMode: undefined }), "external-provider");
 });
 
-test("G1.2 explicit direct resolves to direct", () => {
-  assert.equal(resolveIntegrationModeFromRaw({ integrationMode: "direct" }), "direct");
+test("G1.2 legacy direct value normalizes to external-provider", () => {
+  assert.equal(resolveIntegrationModeFromRaw({ integrationMode: "direct" }), "external-provider");
 });
 
 test("G1.3 explicit external-provider is preserved", () => {
   assert.equal(resolveIntegrationModeFromRaw({ integrationMode: "external-provider" }), "external-provider");
 });
 
-test("G1.4 legacy codexIntegrationMode alias is honored", () => {
-  assert.equal(resolveIntegrationModeFromRaw({ codexIntegrationMode: "direct" }), "direct");
+test("G1.4 legacy codexIntegrationMode alias validates but normalizes to provider", () => {
+  assert.equal(resolveIntegrationModeFromRaw({ codexIntegrationMode: "direct" }), "external-provider");
   assert.equal(resolveIntegrationModeFromRaw({ codexIntegrationMode: "external-provider" }), "external-provider");
 });
 
-test("G1.5 matching aliases are accepted", () => {
+test("G1.5 matching aliases normalize to provider", () => {
   assert.equal(
     resolveIntegrationModeFromRaw({ integrationMode: "direct", codexIntegrationMode: "direct" }),
-    "direct",
+    "external-provider",
   );
   assert.equal(
     resolveIntegrationModeFromRaw({ integrationMode: "external-provider", codexIntegrationMode: "external-provider" }),
@@ -98,10 +101,10 @@ test("G1.11 absent config reads as a new installation", () => {
   assert.deepEqual(state, { kind: "missing" });
 });
 
-test("G1.12 valid config reads as configured with its canonical mode", () => {
+test("G1.12 valid config reads as configured with provider mode", () => {
   const direct = readCanonicalIntegrationState({ readSetupConfig: () => ({ mode: "full" }) });
   assert.equal(direct.kind, "configured");
-  assert.equal(direct.integrationMode, "direct");
+  assert.equal(direct.integrationMode, "external-provider");
   const external = readCanonicalIntegrationState({
     readSetupConfig: () => ({ mode: "full", integrationMode: "external-provider" }),
   });
@@ -124,10 +127,11 @@ test("G1.13 malformed config is damaged, never a new installation", () => {
   );
 });
 
-test("G1.14-16 new installation accepts omitted, direct and external modes", () => {
+// S4D: every requested mode normalizes to provider; malformed still throws.
+test("G1.14-16 new installation resolves omitted, direct and external modes to provider", () => {
   const missing = { kind: "missing" };
-  assert.equal(resolveLauncherIntegrationMode({ requestedMode: undefined, canonical: missing }), "direct");
-  assert.equal(resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: missing }), "direct");
+  assert.equal(resolveLauncherIntegrationMode({ requestedMode: undefined, canonical: missing }), "external-provider");
+  assert.equal(resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: missing }), "external-provider");
   assert.equal(
     resolveLauncherIntegrationMode({ requestedMode: "external-provider", canonical: missing }),
     "external-provider",
@@ -138,31 +142,33 @@ test("G1.14-16 new installation accepts omitted, direct and external modes", () 
   );
 });
 
-test("G1.17-20 existing installation preserves canonical on omitted or equal modes", () => {
+test("G1.17-20 existing installation always resolves to provider", () => {
   const direct = { kind: "configured", integrationMode: "direct", config: {} };
   const external = { kind: "configured", integrationMode: "external-provider", config: {} };
-  assert.equal(resolveLauncherIntegrationMode({ requestedMode: undefined, canonical: direct }), "direct");
+  assert.equal(resolveLauncherIntegrationMode({ requestedMode: undefined, canonical: direct }), "external-provider");
   assert.equal(resolveLauncherIntegrationMode({ requestedMode: undefined, canonical: external }), "external-provider");
-  assert.equal(resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: direct }), "direct");
+  assert.equal(resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: direct }), "external-provider");
   assert.equal(resolveLauncherIntegrationMode({ requestedMode: "external-provider", canonical: external }), "external-provider");
 });
 
-test("G1.21-22 ownership mismatch rejects as CLI-only migration", () => {
+// S4D: ownership migration no longer exists. Requested modes are accepted and
+// ignored; no requested/canonical combination can re-enable Direct.
+test("G1.21-22 requested modes are accepted and ignored, never a mismatch", () => {
   const direct = { kind: "configured", integrationMode: "direct", config: {} };
   const external = { kind: "configured", integrationMode: "external-provider", config: {} };
-  assert.throws(
-    () => resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: external, action: "setup-core" }),
-    /ownership mismatch.*external-provider.*direct.*CLI-only/,
+  assert.equal(
+    resolveLauncherIntegrationMode({ requestedMode: "direct", canonical: external, action: "setup-core" }),
+    "external-provider",
   );
-  assert.throws(
-    () => resolveLauncherIntegrationMode({ requestedMode: "external-provider", canonical: direct, action: "setup-mcp" }),
-    /ownership mismatch.*direct.*external-provider.*CLI-only/,
+  assert.equal(
+    resolveLauncherIntegrationMode({ requestedMode: "external-provider", canonical: direct, action: "setup-mcp" }),
+    "external-provider",
   );
 });
 
 test("ownership context combines the canonical read with request resolution", () => {
   const fresh = resolveOwnershipContext({ requestedMode: undefined, supervisor: { readSetupConfig: () => null } });
-  assert.deepEqual({ integrationMode: fresh.integrationMode, newInstallation: fresh.newInstallation }, { integrationMode: "direct", newInstallation: true });
+  assert.deepEqual({ integrationMode: fresh.integrationMode, newInstallation: fresh.newInstallation }, { integrationMode: "external-provider", newInstallation: true });
   const kept = resolveOwnershipContext({
     requestedMode: undefined,
     supervisor: { readSetupConfig: () => ({ integrationMode: "external-provider" }) },
@@ -278,7 +284,7 @@ test("expectations are frozen and branded", () => {
   assert.ok(Object.isFrozen(context.expectation));
   assert.deepEqual(
     { expectedKind: context.expectation.expectedKind, integrationMode: context.expectation.integrationMode },
-    { expectedKind: "missing", integrationMode: "direct" },
+    { expectedKind: "missing", integrationMode: "external-provider" },
   );
 });
 
@@ -316,7 +322,7 @@ test("A1 configured external deleted before revalidation fails closed", () => {
 test("A2 configured direct deleted before revalidation fails closed", () => {
   const supervisor = scriptedSupervisor([{ mode: "browser-only" }, null]);
   const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-mcp" });
-  assert.equal(context.integrationMode, "direct");
+  assert.equal(context.integrationMode, "external-provider");
   assert.throws(
     () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-mcp" }),
     /changed while preparing setup-mcp/,
@@ -333,23 +339,23 @@ test("A3 missing with config appearing before revalidation fails closed", () => 
   );
 });
 
-test("A4 configured external flipping to direct fails closed", () => {
+// S4D: raw mode flips normalize to the same provider ownership, so
+// revalidation passes with provider mode instead of failing closed.
+test("A4 raw external-to-direct flip revalidates cleanly under provider normalization", () => {
   const supervisor = scriptedSupervisor([{ integrationMode: "external-provider" }, { integrationMode: "direct" }]);
   const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
-  assert.throws(
-    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
-    /changed while preparing setup-core/,
-  );
+  const rechecked = assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" });
+  assert.equal(rechecked.kind, "configured");
+  assert.equal(rechecked.integrationMode, "external-provider");
 });
 
-test("A5 configured direct flipping to external fails closed", () => {
+test("A5 raw direct-to-external flip revalidates cleanly under provider normalization", () => {
   const supervisor = scriptedSupervisor([{}, { integrationMode: "external-provider" }]);
   const context = resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "setup-core" });
-  assert.equal(context.integrationMode, "direct");
-  assert.throws(
-    () => assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" }),
-    /changed while preparing setup-core/,
-  );
+  assert.equal(context.integrationMode, "external-provider");
+  const rechecked = assertOwnershipExpectationCurrent({ supervisor, expectation: context.expectation, action: "setup-core" });
+  assert.equal(rechecked.kind, "configured");
+  assert.equal(rechecked.integrationMode, "external-provider");
 });
 
 test("A6 configured valid becoming malformed fails closed", () => {
@@ -380,12 +386,12 @@ function continuityContext(supervisor) {
   return resolveOwnershipContext({ requestedMode: undefined, supervisor, action: "runtime-startup" });
 }
 
-test("continuity passes for unchanged Direct ownership", () => {
+test("continuity passes for unchanged legacy Direct ownership", () => {
   const supervisor = { readSetupConfig: () => ({ mode: "browser-only" }) };
   const before = continuityContext(supervisor);
   const after = continuityContext(supervisor);
   const kept = assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" });
-  assert.equal(kept.integrationMode, "direct");
+  assert.equal(kept.integrationMode, "external-provider");
 });
 
 test("continuity passes for unchanged External ownership", () => {
@@ -406,28 +412,26 @@ test("continuity passes when only bridge metadata changes", () => {
   assert.equal(kept.integrationMode, "external-provider");
 });
 
-test("continuity rejects Direct to External drift", () => {
+// S4D: raw Direct/External drift normalizes to identical provider ownership,
+// so continuity passes instead of rejecting.
+test("continuity tolerates raw Direct to External drift under provider normalization", () => {
   let config = { mode: "browser-only" };
   const supervisor = { readSetupConfig: () => ({ ...config }) };
   const before = continuityContext(supervisor);
   config = { mode: "browser-only", integrationMode: "external-provider" };
   const after = continuityContext(supervisor);
-  assert.throws(
-    () => assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" }),
-    /changed while preparing runtime-startup/,
-  );
+  const kept = assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "external-provider");
 });
 
-test("continuity rejects External to Direct drift", () => {
+test("continuity tolerates raw External to Direct drift under provider normalization", () => {
   let config = { mode: "browser-only", integrationMode: "external-provider" };
   const supervisor = { readSetupConfig: () => ({ ...config }) };
   const before = continuityContext(supervisor);
   config = { mode: "browser-only" };
   const after = continuityContext(supervisor);
-  assert.throws(
-    () => assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" }),
-    /changed while preparing runtime-startup/,
-  );
+  const kept = assertOwnershipContinuity({ before: before.expectation, after: after.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "external-provider");
 });
 
 test("continuity rejects missing and configured transitions", () => {

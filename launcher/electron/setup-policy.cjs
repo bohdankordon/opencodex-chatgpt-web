@@ -60,41 +60,40 @@ function normalizeSetupOperation(operation) {
 }
 
 function buildSetupOwnershipPolicy(options) {
-  const settings = options || {};
+  let settings = options || {};
   // Validate ALL inputs before any profile branching: malformed, missing, or
   // external modes, operations, or profiles must never silently become policy.
   if (!isLauncherIntegrationMode(settings.integrationMode)) {
-    throw new Error("Setup ownership policy requires direct or external-provider");
+    // S4D: tolerate omitted mode (always provider-only); malformed still throws.
+    if (settings.integrationMode === undefined) settings = { ...settings, integrationMode: EXTERNAL_PROVIDER };
+    if (!isLauncherIntegrationMode(settings.integrationMode)) {
+      throw new Error("Setup ownership policy requires direct or external-provider");
+    }
   }
   const operation = normalizeSetupOperation(settings.operation);
   if (settings.profile !== "production" && settings.profile !== "development") {
     throw new Error("Setup ownership policy profile must be production or development");
   }
   if (settings.profile === "development") {
-    if (settings.integrationMode !== DIRECT) {
-      throw new Error("DEV setup ownership is Direct-only; external-provider is unavailable in the isolated DEV launcher profile");
-    }
+    // S4D: DEV harness has no Codex routing; keep no-flag contract, normalize to provider.
     return brandPolicy({
-      integrationMode: DIRECT,
+      integrationMode: EXTERNAL_PROVIDER,
       operation: operation,
       profile: "development",
       integrationArgs: [],
       replaceCodexRoute: false,
-      checkpointScope: DIRECT_INTEGRATION_SCOPE,
+      checkpointScope: BRIDGE_ONLY_SCOPE,
     });
   }
-  const replaceCodexRoute = settings.integrationMode === DIRECT
-    && DIRECT_REPLACE_BY_OPERATION[operation] === true;
-  if (settings.integrationMode === EXTERNAL_PROVIDER && replaceCodexRoute) {
-    throw new Error("External-provider setup must never replace the Codex route");
-  }
+  // S4D OpenCodex-only: never replace the Codex route; always bridge-only scope.
+  const replaceCodexRoute = false;
   return brandPolicy({
-    integrationMode: settings.integrationMode,
+    integrationMode: EXTERNAL_PROVIDER,
     operation: operation,
     profile: "production",
-    integrationArgs: ["--integration-mode", settings.integrationMode],
+    integrationArgs: ["--integration-mode", EXTERNAL_PROVIDER],
     replaceCodexRoute: replaceCodexRoute,
-    checkpointScope: settings.integrationMode === EXTERNAL_PROVIDER ? BRIDGE_ONLY_SCOPE : DIRECT_INTEGRATION_SCOPE,
+    checkpointScope: BRIDGE_ONLY_SCOPE,
   });
 }
 

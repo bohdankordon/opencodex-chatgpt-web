@@ -110,26 +110,55 @@ function journalProtocol(journal: Exclude<AnyCodexIntegrationJournal, { version:
 }
 
 /**
- * All Codex route mutations pass through this boundary. The external-provider mode intentionally
- * fails closed: a missing or stale external router is an operational problem, not permission for
- * this process to take ownership of the user's Codex configuration.
+ * S4D: product is OpenCodex-only. All Codex route mutations are disabled in normal
+ * production. OpenCodex owns Codex injection; this fork never installs, switches,
+ * repairs, or restores Codex routing. A missing or stale OpenCodex router is an
+ * operational problem, never permission to take ownership of the user's Codex config.
  */
 function configuredIntegrationMode(): IntegrationMode {
-  // Ownership guards intentionally parse only the ownership fields. Full runtime validation may
-  // reject an otherwise usable Direct config for unrelated reasons (for example a missing tunnel),
-  // while malformed ownership itself must still fail closed.
+  // S4D migration-only: always reports the single OpenCodex-only mode.
   return readPersistedIntegrationMode();
 }
 
 export function assertDirectCodexIntegration(
-  config?: Pick<AppConfig, "integrationMode"> | { integrationMode?: unknown; codexIntegrationMode?: unknown },
+  _config?: Pick<AppConfig, "integrationMode"> | { integrationMode?: unknown; codexIntegrationMode?: unknown },
 ): void {
-  if (isExternalProviderMode(config ?? { integrationMode: configuredIntegrationMode() })) {
-    throw new Error(
-      "Codex routing is managed by an external provider in external-provider mode; "
-      + "route connect, disconnect, install, and restore are disabled",
-    );
+  // S4D: Direct routing no longer exists as a product architecture. Every Direct
+  // mutation entry point fails closed unconditionally.
+  throw new Error(
+    "Codex routing is owned by OpenCodex; "
+    + "route connect, disconnect, install, and restore are disabled in this OpenCodex-only release",
+  );
+}
+
+/**
+ * S4D read-only legacy detection. Never repairs, never writes, never restores.
+ * Used by setup/doctor/route status to DETECT/EXPLAIN without mutating live files.
+ */
+export function detectLegacyDirectRoute(): {
+  hasJournal: boolean;
+  journalPath: string;
+  recoveryPath: string;
+  codexConfigPath: string;
+  detail: string;
+} {
+  const journalPath = getCodexJournalPath();
+  const recoveryPath = getCodexJournalRecoveryPath();
+  const codexConfigPath = getCodexConfigPath();
+  let hasJournal = false;
+  let detail = "No legacy Direct route journal was found.";
+  try {
+    const journal = readJournal({ repair: false });
+    if (journal) {
+      hasJournal = true;
+      detail = `Legacy Direct route journal still exists at ${journalPath}; OpenCodex now owns Codex routing and this file is ignored. Remove it manually only after pointing Codex at OpenCodex.`;
+    }
+  } catch (error) {
+    hasJournal = true;
+    const message = error instanceof Error ? error.message : String(error);
+    detail = `Legacy Direct route journal at ${journalPath} could not be parsed and is ignored: ${message}`;
   }
+  return { hasJournal, journalPath, recoveryPath, codexConfigPath, detail };
 }
 
 /**
@@ -217,9 +246,10 @@ export type {
 
 export function readCodexSubagentProtocol(
   fallback: AppConfig["subagentProtocol"] = "compatibility-v1",
-  options: { repairJournal?: boolean } = {},
+  _options: { repairJournal?: boolean } = {},
 ): AppConfig["subagentProtocol"] {
-  const journal = readJournal({ repair: options.repairJournal });
+  // S4D: never repair or mutate the legacy journal during normal reads.
+  const journal = readJournal({ repair: false });
   return journal?.version === 8 || journal?.version === 9 || journal?.version === 10
     ? journal.installed.subagent_protocol
     : fallback;

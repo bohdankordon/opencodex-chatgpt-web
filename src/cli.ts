@@ -10,7 +10,6 @@ import {
   defaultConfig,
   getConfigDir,
   getConfigPath,
-  isExternalProviderMode,
   loadConfig,
   loadConfigForSetup,
 } from "./config";
@@ -19,14 +18,7 @@ import {
   inspectLauncherBrowserHostLiveness,
   readLauncherBrowserHostDescriptor,
 } from "./launcher-browser-host";
-import {
-  activateCodexIntegration,
-  deactivateCodexIntegration,
-  inspectCodexIntegration,
-  readCodexSubagentProtocol,
-  setCodexSubagentProtocol,
-  uninstallCodexIntegration,
-} from "./codex-integration";
+import { detectLegacyDirectRoute, uninstallCodexIntegration } from "./codex-integration";
 import { formatDoctorReport, runDoctor } from "./doctor";
 import { runChatGptMcpMain } from "./adapters/chatgpt-web/mcp-main";
 import { runCommand } from "./process";
@@ -53,8 +45,8 @@ Usage:
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
-  codex-chatgpt-web route <status|connect|disconnect>
-  codex-chatgpt-web subagents <status|compatibility-v1|native>
+  codex-chatgpt-web route status
+  codex-chatgpt-web subagents status
   codex-chatgpt-web browser check
   codex-chatgpt-web dev launcher
   codex-chatgpt-web dev status [--json]
@@ -68,7 +60,7 @@ Usage:
   codex-chatgpt-web tunnel <status|start|restart|stop|key-import>
   codex-chatgpt-web open <tunnels|runtime-keys|connectors>
   codex-chatgpt-web uninstall --yes
-  codex-chatgpt-web uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct
+  codex-chatgpt-web uninstall --yes --launcher-control --expected-installation-kind configured
   codex-chatgpt-web uninstall --yes --launcher-control --expected-installation-kind missing
 
 Setup options:
@@ -88,8 +80,8 @@ Setup options:
                                Re-read the authenticated account's available Web models
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
-  --replace-codex-route        Reversibly replace existing Responses or Voice route settings
-  --integration-mode MODE      direct (default) or external-provider (OpenCodex owns routing)
+  --replace-codex-route        Retired; OpenCodex owns Codex routing (using it errors)
+  --integration-mode MODE      Deprecated and ignored; routing is always OpenCodex-only
   --subagent-protocol MODE     compatibility-v1 (default) or native (advanced)
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
@@ -109,7 +101,7 @@ Global:
   --expected-installation-kind KIND
                                Launcher-controlled uninstall only: configured or missing
   --expected-integration-mode MODE
-                               Launcher-controlled uninstall only: direct or external-provider
+                               Deprecated and ignored; routing is always OpenCodex-only
   -h, --help
   -v, --version
 `;
@@ -301,7 +293,9 @@ async function setupCommand(args: string[]): Promise<void> {
     if (integrationMode !== "direct" && integrationMode !== "external-provider") {
       throw new Error("--integration-mode must be direct or external-provider");
     }
-    options.integrationMode = integrationMode;
+    // S4D: accepted and ignored; product is always OpenCodex-only. Old scripts
+    // passing --integration-mode continue to work without manual edits.
+    process.stderr.write("--integration-mode is deprecated and ignored; routing is always OpenCodex-only.\n");
   }
   const automaticBrowserInteraction = takeFlag(args, "--automatic-browser-interaction");
   const manualBrowserInteraction = takeFlag(args, "--zero-risk-browser-interaction");
@@ -416,32 +410,28 @@ async function routeCommand(args: string[]): Promise<void> {
   const action = args.shift() ?? "status";
   assertNoArgs(args);
   if (action === "status") {
-    // Read-only: never serialized.
+    // S4D OpenCodex-only: read-only legacy detection; never mutates.
     const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
-    const status = inspectCodexIntegration();
+    const legacy = detectLegacyDirectRoute();
     stdout.write(`${JSON.stringify({
-      integrationMode: config?.integrationMode ?? "direct",
-      routingOwner: config && isExternalProviderMode(config) ? "external-router" : "codex-chatgpt-web",
-      installed: status.installed,
-      active: status.active,
-      ...(status.routeUrl ? { routeUrl: status.routeUrl } : {}),
-      errors: status.errors,
+      integrationMode: "external-provider",
+      routingOwner: "external-router",
+      routing: "opencodex-only",
+      installed: false,
+      active: false,
+      legacyDirectJournal: legacy.hasJournal,
+      legacyDetail: legacy.detail,
+      ...(config ? { providerBaseUrl: `http://${config.host}:${config.port}/v1` } : {}),
     }, null, 2)}\n`);
     return;
   }
-  if (action !== "connect" && action !== "disconnect") throw new Error(`Unknown route action: ${action}`);
-  // Mutating route commands share the lifecycle lock: they rewrite the same
-  // Direct config.toml / models-cache / journal artifacts uninstall restores.
-  // The External refusal is re-checked under the lock against fresh state.
-  await withLifecycleLock(`route-${action}`, async () => {
-    const config = existsSync(getConfigPath()) ? loadConfig() : undefined;
-    if (config && isExternalProviderMode(config)) {
-      throw new Error("Codex routing is managed by OpenCodex in external-provider mode; route mutations are disabled");
-    }
-    const result = action === "connect" ? activateCodexIntegration() : deactivateCodexIntegration();
-    stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    if (result.changed) process.stderr.write("Fully restart Codex to apply the route change.\n");
-  });
+  if (action === "connect" || action === "disconnect") {
+    throw new Error(
+      `route ${action} is retired; OpenCodex owns Codex routing in this OpenCodex-only release. ` +
+      "Use `route status` for read-only legacy detection and register this fork as an OpenCodex provider instead.",
+    );
+  }
+  throw new Error(`Unknown route action: ${action}`);
 }
 
 async function subagentsCommand(args: string[]): Promise<void> {
@@ -452,33 +442,24 @@ async function subagentsCommand(args: string[]): Promise<void> {
     throw new Error("The isolated DEV harness has no Codex subagent protocol to configure");
   }
   if (action === "status") {
-    const integration = inspectCodexIntegration();
     stdout.write(`${JSON.stringify({
-      integrationMode: config.integrationMode,
-      routingOwner: isExternalProviderMode(config) ? "external-router" : "codex-chatgpt-web",
-      protocol: readCodexSubagentProtocol(config.subagentProtocol),
-      installed: integration.installed,
-      active: integration.active,
+      integrationMode: "external-provider",
+      routingOwner: "external-router",
+      routing: "opencodex-only",
+      protocol: config.subagentProtocol,
     }, null, 2)}\n`);
     return;
   }
   if (action !== "compatibility-v1" && action !== "native") {
     throw new Error("Subagent protocol must be one of: status, compatibility-v1, native");
   }
-  // The protocol switch rewrites the integration journal: same lock as the
-  // other lifecycle mutators, with the External refusal re-checked inside.
-  const journal = await withLifecycleLock("subagents", async () => {
-    const fresh = loadConfig();
-    if (isExternalProviderMode(fresh)) {
-      throw new Error("Codex feature overrides are owned by OpenCodex in external-provider mode; subagent protocol mutations are disabled");
-    }
-    return setCodexSubagentProtocol(fresh, action);
-  });
-  stdout.write(`${JSON.stringify({
-    protocol: journal.installed.subagent_protocol,
-    codexRestartRequired: true,
-    launcherRestartRequired: true,
-  }, null, 2)}\n`);
+  // S4D: subagent protocol Codex overrides are owned by OpenCodex; this fork never
+  // rewrites Codex routing/journal. Protocol selection for the provider catalog is
+  // owned by app config via setup; direct journal mutation is retired.
+  throw new Error(
+    "Subagent protocol Codex overrides are owned by OpenCodex in this OpenCodex-only release; " +
+    "subagent protocol mutations via Codex routing are disabled. Configure subagentProtocol via setup instead.",
+  );
 }
 
 async function serviceCommand(args: string[]): Promise<void> {
@@ -614,13 +595,13 @@ async function uninstallCommand(args: string[]): Promise<void> {
   if (launcherControl && !expectedOwnership) {
     throw new Error("Launcher-controlled uninstall requires --expected-installation-kind (configured|missing) from the trusted launcher ownership state");
   }
-  if (!yes && !await confirm("Restore Codex config, stop services, and remove this installation?")) {
+  if (!yes && !await confirm("Stop services and remove this installation (Codex routing is left untouched for OpenCodex)?")) {
     throw new Error("Uninstall cancelled");
   }
-  // The lifecycle lock is held continuously across expected-state validation,
-  // service/tunnel stop, Codex route cleanup, journal mutation and bridge
-  // config deletion, so a concurrent setup migration can neither slip in
-  // before the ownership check nor interleave the destructive work.
+  // S4D OpenCodex-only: the lifecycle lock is held across expected-state validation,
+  // service/tunnel stop, and bridge config deletion. Codex routing/journal files are
+  // never mutated here (uninstallCodexIntegration is a no-op in OpenCodex-only mode);
+  // legacy Direct journals are left for read-only detection, never silently restored.
   await withLifecycleLock("uninstall", async () => {
     const actual = readActualLifecycleOwnership();
     if (expectedOwnership) assertLifecycleOwnershipMatch(expectedOwnership, actual, "uninstall");

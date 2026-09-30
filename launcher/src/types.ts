@@ -4,6 +4,7 @@ import type { LimitsSnapshot } from "./limits-types";
 export type Language = keyof typeof languages;
 export type LauncherProfile = "production" | "development";
 export type BrowserInteractionMode = "automatic" | "manual";
+/** S4D deprecated: product is always OpenCodex-only; accepted and ignored. */
 export type LauncherIntegrationMode = "direct" | "external-provider";
 
 // Canonical read-only installation existence for first-install-only ownership

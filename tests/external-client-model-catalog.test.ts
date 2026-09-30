@@ -429,64 +429,21 @@ test("catalog construction imports no credential primitive", () => {
   }
 });
 
-test("Direct mode rejects the dedicated header instead of forwarding it upstream", async () => {
+// S4D OpenCodex-only: no Direct/native catalog exists. Every models request requires
+// provider Bearer auth; the dedicated external-client header is ignored on this path.
+test("OpenCodex-only models require provider auth and never call native", async () => {
   isolatedEnvironment();
   const config = { ...defaultConfig("browser-only"), port: 0 };
-  expect(config.integrationMode).toBe("direct");
+  expect(config.integrationMode).toBe("external-provider");
   await withServer(config, async (port, upstream) => {
-    const common = { authorization: "Bearer codex-oauth-token" };
-    const withoutHeader = await fetch(catalogUrl(port), { headers: common });
-    const withoutBody = await withoutHeader.text();
-    // Security correction (Phase D follow-up): Direct mode has no external-client lifecycle, so a
-    // dedicated header fails closed instead of entering the native models request. This
-    // intentionally supersedes the earlier Phase C expectation that Direct kept native behavior
-    // with the header present, because that forwarded an external credential into the native
-    // Codex trust domain.
+    const withoutAuth = await fetch(catalogUrl(port), { headers: { authorization: "Bearer codex-oauth-token" } });
+    expect(withoutAuth.status).toBe(401);
+    expect(upstream).toHaveLength(0);
     const withHeader = await fetch(catalogUrl(port), {
-      headers: { ...common, [EXTERNAL_CLIENT_ID_HEADER]: "hermes-local" },
-    });
-    const withBody = await withHeader.text();
-
-    expect(withoutHeader.status).toBe(200);
-    expect(upstream).toHaveLength(1);
-    expect(upstream[0]!.url.startsWith("https://chatgpt.com/backend-api/codex/models")).toBe(true);
-    expect(upstream[0]!.method).toBe("GET");
-    expect(upstream[0]!.headers.get("authorization")).toBe("Bearer codex-oauth-token");
-    expect(upstream.every(request => request.headers.get(EXTERNAL_CLIENT_ID_HEADER) === null)).toBe(true);
-
-    expect([withHeader.status, withHeader.headers.get("content-type")]).toEqual([401, "application/json"]);
-    expect(JSON.parse(withBody)).toEqual({
-      error: { message: "External client authentication failed", type: "authentication_error", code: "invalid_api_key" },
-    });
-
-    const body = JSON.parse(withoutBody) as { models: Array<{ slug: string; supported_in_api?: boolean }> };
-    expect(body.models.map(model => model.slug)).toEqual([
-      "gpt-5.6-sol", "chatgpt-web/gpt-5.6-sol-instant", "chatgpt-web/gpt-5.6-sol",
-      "chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high",
-    ]);
-    expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))).toHaveLength(5);
-  });
-});
-
-test("the external-client profile is never served on the Direct models path", async () => {
-  isolatedEnvironment();
-  const config = { ...defaultConfig("browser-only"), port: 0, solAvailable: false };
-  await withServer(config, async (port, upstream) => {
-    // Header absent keeps legacy Luna-only Direct discovery.
-    const legacy = await fetch(catalogUrl(port), { headers: { authorization: "Bearer codex-oauth-token" } });
-    const legacyBody = await legacy.json() as { models: Array<{ slug: string }> };
-    expect(legacy.status).toBe(200);
-    expect(upstream).toHaveLength(1);
-    expect(legacyBody.models[0]!.slug).toBe("gpt-5.6-sol");
-    expect(legacyBody.models.filter(model => model.slug.startsWith("chatgpt-web/")).map(model => model.slug))
-      .toEqual(["chatgpt-web/gpt-5.6-luna", "chatgpt-web/luna", "chatgpt-web/think"]);
-
-    // Header present is a flat 401 in Direct mode: the restricted catalog is never served here.
-    const restricted = await fetch(catalogUrl(port), {
       headers: { authorization: "Bearer codex-oauth-token", [EXTERNAL_CLIENT_ID_HEADER]: "hermes-local" },
     });
-    expect(restricted.status).toBe(401);
-    expect(upstream).toHaveLength(1);
+    expect(withHeader.status).toBe(401);
+    expect(upstream).toHaveLength(0);
   });
 });
 

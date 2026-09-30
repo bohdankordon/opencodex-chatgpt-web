@@ -28,10 +28,10 @@ function normalizeRequestedIntegrationMode(value) {
 }
 
 // Resolve routing ownership from a raw runtime config object.
-// Honors the legacy codexIntegrationMode alias. Missing fields default to
-// direct. Conflicting aliases resolve conservatively to external-provider so
-// an explicit external intent is never silently demoted. Malformed values
-// throw instead of falling back to direct.
+// S4D OpenCodex-only: honors the legacy alias for validation but always
+// normalizes to external-provider. Missing fields default to external-provider.
+// Conflicting valid aliases no longer fail; neither can re-enable Direct.
+// Malformed values still throw instead of falling back.
 function resolveIntegrationModeFromRaw(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("Invalid integrationMode; expected direct or external-provider");
@@ -45,13 +45,7 @@ function resolveIntegrationModeFromRaw(raw) {
   if (legacy !== undefined && !valid(legacy)) {
     throw new Error("Invalid codexIntegrationMode; expected direct or external-provider");
   }
-  if (valid(primary) && valid(legacy) && primary !== legacy) {
-    if (primary === EXTERNAL_PROVIDER || legacy === EXTERNAL_PROVIDER) return EXTERNAL_PROVIDER;
-    throw new Error("Conflicting integrationMode and codexIntegrationMode");
-  }
-  if (valid(primary)) return primary;
-  if (valid(legacy)) return legacy;
-  return DIRECT;
+  return EXTERNAL_PROVIDER;
 }
 
 // User-facing damaged-config errors stay bounded: the raw parser/fs detail is
@@ -104,11 +98,9 @@ function readCanonicalIntegrationState(supervisor) {
 }
 
 // Resolve requested vs canonical ownership.
-// NEW INSTALL (canonical.kind === "missing"): omitted defaults to direct;
-// explicit direct/external-provider accepted; malformed throws.
-// EXISTING INSTALL: canonical always wins; omitted preserves it; equal
-// accepts; different throws BEFORE any lifecycle mutation. Ownership
-// migration is CLI-only, so a mismatch is a hard error, not a switch.
+// S4D OpenCodex-only: always resolves to external-provider. Old requested values
+// are accepted and ignored for backwards compatibility; malformed still throws.
+// Existing installs always normalize to provider; no ownership migration exists.
 function resolveLauncherIntegrationMode(options) {
   const settings = options || {};
   const canonical = settings.canonical;
@@ -117,13 +109,10 @@ function resolveLauncherIntegrationMode(options) {
   if (!canonical || typeof canonical !== "object") {
     throw new Error("Launcher routing ownership state is invalid");
   }
-  if (canonical.kind === "missing") return requested !== undefined ? requested : DIRECT;
-  if (canonical.kind !== "configured") {
+  if (canonical.kind !== "missing" && canonical.kind !== "configured") {
     throw new Error("Launcher routing ownership state is invalid");
   }
-  if (requested === undefined) return canonical.integrationMode;
-  if (requested === canonical.integrationMode) return requested;
-  throw new Error("Integration ownership mismatch: installation is " + canonical.integrationMode + " but " + requested + " was requested; ownership migration is CLI-only (action: " + action + ").");
+  return EXTERNAL_PROVIDER;
 }
 
 // Convenience for main-process handlers and RuntimeHost methods: read

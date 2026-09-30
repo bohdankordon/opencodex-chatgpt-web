@@ -80,8 +80,7 @@ test("core setup preserves an existing full-harness installation", async () => {
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
     "--integration-mode",
-    "direct",
-    "--replace-codex-route",
+    "external-provider",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -100,7 +99,14 @@ test("core setup starts in browser-only mode when no installation exists", async
   assert.equal(result.mode, "browser-only");
   assert.deepEqual(fixture.invocation().args.slice(0, 2), ["setup", "--browser-only"]);
   assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), true);
-  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+  assert.deepEqual(
+    fixture.invocation().args.slice(
+      fixture.invocation().args.indexOf("--integration-mode"),
+      fixture.invocation().args.indexOf("--integration-mode") + 2,
+    ),
+    ["--integration-mode", "external-provider"],
+  );
   assert.equal(fixture.invocation().args.includes("--chrome"), false);
 });
 
@@ -195,8 +201,7 @@ test("Bigger Context uses the setup transaction and refreshes the production Cod
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
       "--integration-mode",
-      "direct",
-      "--replace-codex-route",
+      "external-provider",
       "--acknowledge-unofficial",
       "--restart-service",
       "--bigger-context",
@@ -246,8 +251,7 @@ test("Zero Risk Pro transaction installs or removes only its explicit model prof
       "--standard-context",
       "--zero-risk-pro",
       "--integration-mode",
-      "direct",
-      "--replace-codex-route",
+      "external-provider",
       "--restart-service",
     ],
   });
@@ -400,7 +404,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
     "--integration-mode",
-    "direct",
+    "external-provider",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -411,7 +415,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     toVersion: "1.1.3",
     connectorMigrated: false,
     stdout: "",
-    integrationMode: "direct",
+    integrationMode: "external-provider",
   });
 });
 
@@ -434,7 +438,7 @@ test("launcher migrates the legacy connector identity even when the release vers
     "--automatic-browser-interaction",
     "--refresh-account-capabilities",
     "--integration-mode",
-    "direct",
+    "external-provider",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -513,13 +517,12 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
       "/runtime/launcher-browser.json",
       "--automatic-browser-interaction",
       "--integration-mode",
-      "direct",
-      "--replace-codex-route",
+      "external-provider",
       "--acknowledge-unofficial",
       "--restart-service",
     ]);
     assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), false);
-    assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
+    assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -642,7 +645,9 @@ test("startup recovery can restore the Codex route without requiring a healthy l
   assert.deepEqual(fixture.calls, ["route status", "route disconnect", "route status"]);
 });
 
-test("failed runtime cleanup during removal still restores the previous Codex route", async () => {
+// S4D: removal never touches Codex routing. A stop failure keeps the
+// original error with zero route commands and no route compensation.
+test("failed runtime cleanup during removal keeps the original error with zero route commands", async () => {
   const calls = [];
   const config = { mode: "full", browserHost: "launcher", releaseVersion: "1.1.2" };
   const host = new RuntimeHost({
@@ -659,38 +664,37 @@ test("failed runtime cleanup during removal still restores the previous Codex ro
       },
     },
   });
-  let routeActive = true;
   host.run = async (_name, args) => {
     const action = args.join(" ");
     calls.push(action);
-    if (action === "route status") {
-      return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
-    }
-    if (action === "route disconnect") {
-      routeActive = false;
-      return { stdout: JSON.stringify({ changed: true, active: false }) };
-    }
     throw new Error(`Unexpected command: ${action}`);
   };
 
   await assert.rejects(
     host.uninstallIntegration(),
-    /previous Codex route was restored, but launcher runtime cleanup did not complete/,
+    /Tunnel health probe timed out after 5000ms/,
   );
-  assert.deepEqual(calls, ["runtime:stop", "route status", "route disconnect", "route status"]);
+  assert.deepEqual(calls, ["runtime:stop"]);
 });
 
-test("integration removal is accepted only after a new status process observes it absent", async () => {
+// S4D: provider removal needs no route verification. The destructive child
+// carries provider ownership flags and issues zero route commands; absence
+// of the bridge config afterwards is the success signature.
+test("S4D integration removal succeeds with provider flags and zero route commands", async () => {
   const calls = [];
   const config = { mode: "browser-only", browserHost: "launcher", releaseVersion: "2.1.8" };
+  const coreHome = path.join(os.tmpdir(), "codex-web-gpt-uninstall-success-core");
+  let uninstalled = false;
+  const readConfig = () => (uninstalled ? null : config);
   const host = new RuntimeHost({
     app: { getPath: () => path.join(os.tmpdir(), "codex-web-gpt-uninstall-success") },
     logger: { info() {}, warn() {}, error() {} },
     sourceRoot: "/source",
     browserDescriptorPath: "/runtime/launcher-browser.json",
     supervisor: {
-      readConfig: () => config,
-      readSetupConfig: () => config,
+      coreHome,
+      readConfig,
+      readSetupConfig: readConfig,
       stopForSetup: async () => { calls.push("runtime:stop"); },
     },
   });
@@ -699,31 +703,36 @@ test("integration removal is accepted only after a new status process observes i
     const action = args.join(" ");
     calls.push(action);
     if (action.startsWith("uninstall --yes --launcher-control")) {
+      uninstalled = true;
       return { stdout: "uninstalled\n" };
     }
-    if (action === "route status") {
-      return { stdout: JSON.stringify({ installed: false, active: false, errors: [] }) };
-    }
-    throw new Error(`Unexpected command: ${action}`);
+    throw new Error("Unexpected command: " + action);
   };
 
   await host.uninstallIntegration();
   assert.deepEqual(calls, [
     "runtime:stop",
-    "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct",
-    "route status",
+    "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode external-provider",
   ]);
 });
 
-test("integration removal rejects a command that leaves an inactive journal behind", async () => {
-  const calls = [];
+// S4D: stale Direct evidence under canonical provider ownership blocks
+// removal. A leftover integration journal fails closed (CLI-only) with zero
+// destructive spawns instead of granting route cleanup permission.
+test("S4D integration removal refuses while a stale Direct journal exists", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-uninstall-stale-"));
+  const coreHome = path.join(root, "core");
+  fs.mkdirSync(path.join(coreHome, "codex"), { recursive: true });
+  fs.writeFileSync(path.join(coreHome, "codex", "integration-journal.json"), "stale direct journal\n");
   const config = { mode: "browser-only", browserHost: "launcher", releaseVersion: "2.1.8" };
+  const calls = [];
   const host = new RuntimeHost({
-    app: { getPath: () => path.join(os.tmpdir(), "codex-web-gpt-uninstall-stale") },
+    app: { getPath: () => root },
     logger: { info() {}, warn() {}, error() {} },
     sourceRoot: "/source",
     browserDescriptorPath: "/runtime/launcher-browser.json",
     supervisor: {
+      coreHome,
       readConfig: () => config,
       readSetupConfig: () => config,
       stopForSetup: async () => { calls.push("runtime:stop"); },
@@ -731,27 +740,18 @@ test("integration removal rejects a command that leaves an inactive journal behi
   });
   host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "test-token" });
   host.run = async (_name, args) => {
-    const action = args.join(" ");
-    calls.push(action);
-    if (action.startsWith("uninstall --yes --launcher-control")) {
-      return { stdout: "uninstalled\n" };
-    }
-    if (action === "route status") {
-      return { stdout: JSON.stringify({ installed: true, active: false, errors: [] }) };
-    }
-    throw new Error(`Unexpected command: ${action}`);
+    calls.push(args.join(" "));
+    return { code: 0, stdout: "", stderr: "" };
   };
-
-  await assert.rejects(
-    host.uninstallIntegration(),
-    /integration removal did not persist in the active config/,
-  );
-  assert.deepEqual(calls, [
-    "runtime:stop",
-    "uninstall --yes --launcher-control --expected-installation-kind configured --expected-integration-mode direct",
-    "route status",
-    "route status",
-  ]);
+  try {
+    await assert.rejects(
+      host.uninstallIntegration(),
+      /Refusing External removal while a Direct integration journal exists/,
+    );
+    assert.deepEqual(calls, ["runtime:stop"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("connector verification uses the current identity and rejects a legacy local runtime", () => {
@@ -800,7 +800,7 @@ test("launcher-controlled CLI operations use the live descriptor token", () => {
   }
 });
 
-test("failed first-time setup removes its route before restoring the unconfigured state", async () => {
+test("S4D failed first-time setup rolls back bridge-only without touching Codex routes", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-first-setup-rollback-"));
   const coreHome = path.join(root, "core");
   const codexHome = path.join(root, "codex");
@@ -839,19 +839,16 @@ test("failed first-time setup removes its route before restoring the unconfigure
   host.run = async (_name, args) => {
     calls.push(args);
     if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
-    fs.mkdirSync(path.dirname(journalPath), { recursive: true });
+    // S4D bridge-only setup touches no Codex routing: the failed subprocess
+    // only manages bridge state, which first-time rollback removes.
     fs.writeFileSync(configPath, `${JSON.stringify({ mode: "browser-only", browserHost: "launcher" })}\n`);
-    fs.writeFileSync(journalPath, "partial integration journal\n");
-    fs.writeFileSync(recoveryJournalPath, "partial recovery journal\n");
-    fs.writeFileSync(codexConfigPath, "partially changed codex config\n");
-    fs.rmSync(codexModelsCachePath);
     throw setupError;
   };
   try {
     await assert.rejects(
       host.runSetup(
         "core-setup",
-        ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
+        ["setup", "--browser-only", "--integration-mode", "external-provider"],
         { ownershipPolicy: directTransactionPolicy("setup-core") },
       ),
       error => {
@@ -861,8 +858,8 @@ test("failed first-time setup removes its route before restoring the unconfigure
       },
     );
     assert.deepEqual(calls.map((args) => args.join(" ")), [
-      "setup --browser-only --integration-mode direct --replace-codex-route --preflight-only",
-      "setup --browser-only --integration-mode direct --replace-codex-route",
+      "setup --browser-only --integration-mode external-provider --preflight-only",
+      "setup --browser-only --integration-mode external-provider",
     ]);
     assert.equal(fs.existsSync(configPath), false);
     assert.equal(fs.existsSync(journalPath), false);
@@ -905,7 +902,7 @@ test("a failed setup preflight leaves the previous runtime running and untouched
     await assert.rejects(
       host.runSetup(
         "runtime-upgrade",
-        ["setup", "--browser-only", "--integration-mode", "direct"],
+        ["setup", "--browser-only", "--integration-mode", "external-provider"],
         { ownershipPolicy: directTransactionPolicy("runtime-upgrade") },
       ),
       /multi_agent_v2 in Codex \[features\] is unsupported$/,
@@ -939,11 +936,11 @@ test("setup preflight keeps the requested setup budget before stopping the curre
     return { code: 0, stdout: "", stderr: "" };
   };
   // Fork ownership lifecycle requires a canonical transaction policy for runSetup.
-  // Direct policy preserves the upstream assertion: the requested 300 s setup budget
-  // reaches preflight before the current runtime is stopped. Production injects the
-  // mode flag and --replace-codex-route via ownershipArgs(policy); the fixture
-  // states them explicitly.
-  await host.runSetup("core-setup", ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"], {
+  // The provider policy preserves the upstream assertion: the requested 300 s
+  // setup budget reaches preflight before the current runtime is stopped.
+  // Production injects the mode flag via ownershipArgs(policy); the fixture
+  // states it explicitly.
+  await host.runSetup("core-setup", ["setup", "--full", "--integration-mode", "external-provider"], {
     ownershipPolicy: directTransactionPolicy("setup-core"),
     timeoutMs: 300_000,
   });
@@ -985,7 +982,7 @@ test("a browser-mode commit failure restores the previous runtime inside setup",
   await assert.rejects(
     host.runSetup(
       "browser-interaction-mode",
-      ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+      ["setup", "--full", "--integration-mode", "external-provider"],
       {
         afterRuntimeReady: async () => { throw new Error("surface ownership failed"); },
         ownershipPolicy: directTransactionPolicy("browser-interaction-mode"),
@@ -1033,7 +1030,7 @@ test("launcher delegates an existing terminal-managed installation to the migrat
 
   await host.runSetup(
     "core-setup",
-    ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+    ["setup", "--full", "--integration-mode", "external-provider"],
     { ownershipPolicy: directTransactionPolicy("setup-core") },
   );
   assert.equal(prepared, 1);
@@ -1069,19 +1066,21 @@ test("failed terminal migration verifies the unchanged previous runtime instead 
   await assert.rejects(
     host.runSetup(
       "core-setup",
-      ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
+      ["setup", "--browser-only", "--integration-mode", "external-provider"],
       { ownershipPolicy: directTransactionPolicy("setup-core") },
     ),
     /synthetic migration failure$/,
   );
   assert.deepEqual(calls, [
-    "setup --browser-only --integration-mode direct --replace-codex-route --preflight-only",
-    "setup --browser-only --integration-mode direct --replace-codex-route",
+    "setup --browser-only --integration-mode external-provider --preflight-only",
+    "setup --browser-only --integration-mode external-provider",
     "doctor --json",
   ]);
 });
 
-test("failed fresh-conversation setting restores every mutable setup file before restarting the previous runtime", async () => {
+// S4D: bridge-only rollback restores bridge-owned setup files (bridge config,
+// tunnel keys/profiles) while leaving Codex routing files alone.
+test("S4D failed fresh-conversation setting restores bridge-owned files before restarting the previous runtime", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-setup-checkpoint-"));
   const coreHome = path.join(root, "core");
   const codexHome = path.join(root, "codex");
@@ -1164,24 +1163,24 @@ test("failed fresh-conversation setting restores every mutable setup file before
     await assert.rejects(
       host.runSetup(
         "core-setup",
-        ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+        ["setup", "--full", "--integration-mode", "external-provider"],
         { ownershipPolicy: directTransactionPolicy("setup-core") },
       ),
       /synthetic updated runtime startup failure$/,
     );
     assert.equal(startAttempts, 2);
     assert.deepEqual(readConfig(), oldConfig);
-    assert.equal(fs.readFileSync(journalPath, "utf8"), "old journal\n");
-    assert.equal(fs.readFileSync(recoveryJournalPath, "utf8"), "old recovery journal\n");
+    assert.equal(fs.readFileSync(journalPath, "utf8"), "new journal\n");
+    assert.equal(fs.readFileSync(recoveryJournalPath, "utf8"), "new recovery journal\n");
     assert.equal(fs.readFileSync(keyPath, "utf8"), "old key\n");
     assert.equal(fs.readFileSync(profilePath, "utf8"), "old profile\n");
-    assert.equal(fs.readFileSync(codexConfigPath, "utf8"), "old codex config\n");
+    assert.equal(fs.readFileSync(codexConfigPath, "utf8"), "new codex config\n");
     assert.equal(fs.lstatSync(codexConfigPath).isSymbolicLink(), true);
     assert.equal(fs.lstatSync(codexConfigPath).ino, linkInode);
     assert.equal(fs.readlinkSync(codexConfigPath), linkTarget);
     assert.equal(fs.statSync(sharedDirectory).mode & 0o777, directoryMode);
     assert.equal(fs.statSync(sharedConfigPath).mode & 0o777, fileMode);
-    assert.equal(fs.readFileSync(codexModelsCachePath, "utf8"), "old codex models cache\n");
+    assert.equal(fs.existsSync(codexModelsCachePath), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1250,7 +1249,7 @@ test("failed terminal migration restores removed launchd ownership before verify
     await assert.rejects(
       host.runSetup(
         "core-setup",
-        ["setup", "--full", "--integration-mode", "direct", "--replace-codex-route"],
+        ["setup", "--full", "--integration-mode", "external-provider"],
         { ownershipPolicy: directTransactionPolicy("setup-core") },
       ),
       /synthetic launcher startup failure$/,
@@ -1260,8 +1259,8 @@ test("failed terminal migration restores removed launchd ownership before verify
     assert.equal(fs.readFileSync(daemonPlist, "utf8"), "old daemon plist\n");
     assert.equal(fs.readFileSync(tunnelPlist, "utf8"), "old tunnel plist\n");
     assert.deepEqual(calls, [
-      "setup --full --integration-mode direct --replace-codex-route --preflight-only",
-      "setup --full --integration-mode direct --replace-codex-route",
+      "setup --full --integration-mode external-provider --preflight-only",
+      "setup --full --integration-mode external-provider",
       "service install",
       "tunnel start",
       "doctor --json",
@@ -1379,50 +1378,48 @@ test("G1.24 setup-mcp rejects a malformed integrationMode before any mutation", 
   assert.equal(fixture.invocation(), undefined);
 });
 
-test("G1.25 existing external install rejects direct setup-core before spawn or stop", async () => {
+// S4D: renderer requested modes are accepted and ignored. A direct request
+// against an external install reaches setup with provider ownership args.
+test("G1.25 existing external install accepts direct setup-core request as provider", async () => {
   const fixture = hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
-  let stopped = false;
-  const stop = fixture.host.supervisor.stopForSetup;
-  fixture.host.supervisor.stopForSetup = async () => {
-    stopped = true;
-    return stop();
-  };
-  await assert.rejects(fixture.host.setupCore({ integrationMode: "direct" }), /ownership mismatch/);
-  assert.equal(fixture.invocation(), undefined);
-  assert.equal(stopped, false);
-});
-
-test("G1.26 existing external install rejects direct setup-mcp before any mutation", async () => {
-  const fixture = hostFor({ mode: "full", browserHost: "launcher", integrationMode: "external-provider" });
-  await assert.rejects(
-    Promise.resolve().then(() => fixture.host.setupMcp({
-      replace: true,
-      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
-      runtimeKey: "new-private-runtime-key-0123456789",
-      integrationMode: "direct",
-    })),
-    /ownership mismatch/,
+  const result = await fixture.host.setupCore({ integrationMode: "direct" });
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+  assert.deepEqual(
+    fixture.invocation().args.slice(
+      fixture.invocation().args.indexOf("--integration-mode"),
+      fixture.invocation().args.indexOf("--integration-mode") + 2,
+    ),
+    ["--integration-mode", "external-provider"],
   );
-  assert.equal(fixture.invocation(), undefined);
 });
 
-test("G1.27 existing external install rejects direct feature changes before any mutation", async () => {
+test("G1.26 existing external install accepts direct setup-mcp request as provider", async () => {
+  const fixture = hostFor({ mode: "full", browserHost: "launcher", integrationMode: "external-provider" });
+  await fixture.host.setupMcp({
+    replace: true,
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    runtimeKey: "new-private-runtime-key-0123456789",
+    integrationMode: "direct",
+  });
+  assert.notEqual(fixture.invocation(), undefined);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("G1.27 existing external install accepts direct feature requests as provider", async () => {
   const external = () => hostFor({ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" });
   const bigger = external();
-  await assert.rejects(bigger.host.setBiggerContext(true, { integrationMode: "direct" }), /ownership mismatch/);
-  assert.equal(bigger.invocation(), undefined);
+  await bigger.host.setBiggerContext(true, { integrationMode: "direct" });
+  assert.notEqual(bigger.invocation(), undefined);
   const skills = external();
-  await assert.rejects(skills.host.setSkillAttachments(true, { integrationMode: "direct" }), /ownership mismatch/);
-  assert.equal(skills.invocation(), undefined);
+  await skills.host.setSkillAttachments(true, { integrationMode: "direct" });
+  assert.notEqual(skills.invocation(), undefined);
   const pro = hostFor({ mode: "full", browserHost: "launcher", browserInteractionMode: "manual", integrationMode: "external-provider" }, "manual");
-  await assert.rejects(pro.host.setZeroRiskPro(true, { integrationMode: "direct" }), /ownership mismatch/);
-  assert.equal(pro.invocation(), undefined);
+  await pro.host.setZeroRiskPro(true, { integrationMode: "direct" });
+  assert.notEqual(pro.invocation(), undefined);
   const interaction = external();
-  await assert.rejects(
-    interaction.host.setBrowserInteractionMode("automatic", undefined, { integrationMode: "direct" }),
-    /ownership mismatch/,
-  );
-  assert.equal(interaction.invocation(), undefined);
+  await interaction.host.setBrowserInteractionMode("automatic", undefined, { integrationMode: "direct" });
+  assert.notEqual(interaction.invocation(), undefined);
 });
 
 test("G1.28 canonical external install with omitted renderer mode still reaches setup", async () => {
@@ -1439,13 +1436,18 @@ test("G1.28 existing external install with matching renderer mode still reaches 
   assert.notEqual(fixture.invocation(), undefined);
 });
 
-test("existing direct install rejects an external request as CLI-only migration", async () => {
+// S4D: no requested/canonical combination can re-enable Direct or migrate
+// ownership. An external request against a legacy direct install reaches
+// setup with provider ownership args.
+test("S4D legacy direct install accepts an external request as provider", async () => {
   const fixture = hostFor({ mode: "browser-only", browserHost: "launcher" });
-  await assert.rejects(fixture.host.setupCore({ integrationMode: "external-provider" }), /CLI-only/);
-  assert.equal(fixture.invocation(), undefined);
+  const result = await fixture.host.setupCore({ integrationMode: "external-provider" });
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
 });
 
-test("G1.29 launcher-state-like fields cannot override canonical runtime ownership", async () => {
+test("G1.29 launcher-state-like fields are ignored under canonical provider ownership", async () => {
   const fixture = hostFor({
     mode: "browser-only",
     browserHost: "launcher",
@@ -1453,8 +1455,9 @@ test("G1.29 launcher-state-like fields cannot override canonical runtime ownersh
     coreSetupComplete: false,
     bridgeEnabled: true,
   });
-  await assert.rejects(fixture.host.setupCore({ integrationMode: "direct" }), /ownership mismatch/);
-  assert.equal(fixture.invocation(), undefined);
+  const result = await fixture.host.setupCore({ integrationMode: "direct" });
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
 });
 
 test("G1.30-31 legacy install without integrationMode resolves direct and reaches setup", async () => {
@@ -1518,11 +1521,11 @@ test("G2.6 Bigger Context External emits explicit mode without replace-route", a
   assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
 });
 
-test("G2.7-8 Skill Attachments Direct keeps replace while External omits it", async () => {
+test("G2.7-8 Skill Attachments is provider-only with no replace for every mode", async () => {
   const direct = hostFor({ mode: "browser-only", browserHost: "launcher" });
   await direct.host.setSkillAttachments(true);
-  assert.deepEqual(ownershipArgPair(direct.invocation().args), ["--integration-mode", "direct"]);
-  assert.equal(direct.invocation().args.includes("--replace-codex-route"), true);
+  assert.deepEqual(ownershipArgPair(direct.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(direct.invocation().args.includes("--replace-codex-route"), false);
   const external = externalHostFor({ mode: "browser-only" });
   await external.host.setSkillAttachments(true, { integrationMode: "external-provider" });
   assert.deepEqual(ownershipArgPair(external.invocation().args), ["--integration-mode", "external-provider"]);
@@ -1536,11 +1539,11 @@ test("G2.10 Zero Risk Pro External emits explicit mode without replace-route", a
   assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
 });
 
-test("G2.11-12 Browser Interaction Direct keeps replace while External omits it", async () => {
+test("G2.11-12 Browser Interaction is provider-only with no replace for every mode", async () => {
   const direct = hostFor({ mode: "full", browserHost: "launcher", appName: "Codex Native2" });
   await direct.host.setBrowserInteractionMode("manual");
-  assert.deepEqual(ownershipArgPair(direct.invocation().args), ["--integration-mode", "direct"]);
-  assert.equal(direct.invocation().args.includes("--replace-codex-route"), true);
+  assert.deepEqual(ownershipArgPair(direct.invocation().args), ["--integration-mode", "external-provider"]);
+  assert.equal(direct.invocation().args.includes("--replace-codex-route"), false);
   const external = externalHostFor({ mode: "full", appName: "Codex Native2" });
   await external.host.setBrowserInteractionMode("manual", undefined, { integrationMode: "external-provider" });
   assert.deepEqual(ownershipArgPair(external.invocation().args), ["--integration-mode", "external-provider"]);
@@ -1563,7 +1566,7 @@ test("G2.14 runtime-upgrade External emits explicit mode without replace-route",
   assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
 });
 
-test("upgrade result propagates the trusted integration mode", async () => {
+test("S4D upgrade result always reports provider ownership", async () => {
   const direct = hostFor({
     mode: "full",
     browserHost: "launcher",
@@ -1573,7 +1576,7 @@ test("upgrade result propagates the trusted integration mode", async () => {
     extraHighAvailable: false,
     proAvailable: false,
   });
-  assert.equal((await direct.host.upgradeManagedRuntime()).integrationMode, "direct");
+  assert.equal((await direct.host.upgradeManagedRuntime()).integrationMode, "external-provider");
   const external = externalHostFor({
     mode: "full",
     appName: "Codex Native2",
@@ -1791,6 +1794,8 @@ test("G2.32 setupCheckpointChanged respects the selected scope", () => {
 });
 
 test("G2.16 preflight and real setup use identical ownership args", async () => {
+  // S4D: every requested mode normalizes to provider-only ownership args
+  // with no replace flag, identically in preflight and real setup.
   for (const integrationMode of ["direct", "external-provider"]) {
     const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher", integrationMode });
     const invocations = [];
@@ -1805,15 +1810,18 @@ test("G2.16 preflight and real setup use identical ownership args", async () => 
       assert.deepEqual(preflight.args.slice(0, -1), real.args);
       assert.equal(preflight.args[preflight.args.length - 1], "--preflight-only");
       const at = real.args.indexOf("--integration-mode");
-      assert.deepEqual(real.args.slice(at, at + 2), ["--integration-mode", integrationMode]);
-      assert.equal(real.args.includes("--replace-codex-route"), integrationMode === "direct");
+      assert.deepEqual(real.args.slice(at, at + 2), ["--integration-mode", "external-provider"]);
+      assert.equal(real.args.includes("--replace-codex-route"), false);
     } finally {
       fixture.cleanup();
     }
   }
 });
 
-test("G2.29 failed Direct transaction restores Direct-owned files exactly", async () => {
+// S4D: the failed transaction rolls back bridge-only. Bridge config is
+// restored while Codex routing files keep the in-transaction mutation
+// (launcher never owns them).
+test("G2.29 failed legacy Direct transaction rolls back bridge-only", async () => {
   const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
   const artifacts = routeArtifactPaths(fixture);
   const before = {
@@ -1839,10 +1847,10 @@ test("G2.29 failed Direct transaction restores Direct-owned files exactly", asyn
   try {
     await assert.rejects(fixture.host.setupCore(), /synthetic Direct setup failure/);
     assert.equal(fs.readFileSync(fixture.configPath, "utf8"), before.bridge);
-    assert.equal(fs.readFileSync(artifacts.journal, "utf8"), before.journal);
-    assert.equal(fs.readFileSync(artifacts.recovery, "utf8"), before.recovery);
-    assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), before.codex);
-    assert.equal(fs.readFileSync(artifacts.modelsCache, "utf8"), before.cache);
+    assert.equal(fs.readFileSync(artifacts.journal, "utf8"), "mutated\n");
+    assert.equal(fs.readFileSync(artifacts.recovery, "utf8"), "mutated\n");
+    assert.equal(fs.readFileSync(artifacts.codexConfig, "utf8"), "mutated\n");
+    assert.equal(fs.readFileSync(artifacts.modelsCache, "utf8"), "mutated\n");
   } finally {
     fixture.cleanup();
   }
@@ -1994,26 +2002,28 @@ test("M canonical External policy with missing mode flag rejects", async () => {
   }
 });
 
-test("N canonical Direct replace policy with missing replace flag rejects", async () => {
+// S4D: a legacy direct input builds the provider policy, so legacy direct
+// mode args no longer bind (the canonical value is external-provider).
+test("N normalized provider policy rejects legacy direct mode args", async () => {
   const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
   try {
     await expectTransactionBoundaryReject(fixture, {
       policy: directTransactionPolicy("setup-core"),
       args: ["setup", "--browser-only", "--integration-mode", "direct"],
-      match: /expected exactly one --replace-codex-route/,
+      match: /expected --integration-mode external-provider/,
     });
   } finally {
     fixture.cleanup();
   }
 });
 
-test("O canonical Direct upgrade policy with unexpected replace flag rejects", async () => {
+test("O normalized provider upgrade policy rejects an unexpected replace flag", async () => {
   const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
   try {
     await expectTransactionBoundaryReject(fixture, {
       policy: directTransactionPolicy("runtime-upgrade"),
       name: "runtime-upgrade",
-      args: ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route"],
+      args: ["setup", "--browser-only", "--integration-mode", "external-provider", "--replace-codex-route"],
       match: /unexpected --replace-codex-route/,
     });
   } finally {
@@ -2034,13 +2044,13 @@ test("P duplicate integration-mode flags reject", async () => {
   }
 });
 
-test("Q duplicate replace flags reject", async () => {
+test("Q duplicate replace flags reject under the provider policy", async () => {
   const fixture = transactionHost({ mode: "browser-only", browserHost: "launcher" });
   try {
     await expectTransactionBoundaryReject(fixture, {
       policy: directTransactionPolicy("setup-core"),
-      args: ["setup", "--browser-only", "--integration-mode", "direct", "--replace-codex-route", "--replace-codex-route"],
-      match: /expected exactly one --replace-codex-route/,
+      args: ["setup", "--browser-only", "--integration-mode", "external-provider", "--replace-codex-route", "--replace-codex-route"],
+      match: /unexpected --replace-codex-route/,
     });
   } finally {
     fixture.cleanup();
@@ -2204,54 +2214,62 @@ test("C11 expected missing with config appearing before runtime mutation rejects
   assert.equal(fixture.stops(), 0);
 });
 
-test("C12 direct RuntimeHost caller with existing external and requested direct rejects", async () => {
+// S4D: a direct RuntimeHost request against canonical provider ownership is
+// accepted and ignored; setup proceeds with provider args.
+test("C12 direct RuntimeHost caller with existing external reaches setup as provider", async () => {
   const fixture = provenanceHost([{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }]);
-  await assert.rejects(fixture.host.setupCore({ integrationMode: "direct" }), /ownership mismatch/);
-  assert.equal(fixture.invocation(), undefined);
-  assert.equal(fixture.stops(), 0);
+  const result = await fixture.host.setupCore({ integrationMode: "direct" });
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
+  assert.deepEqual(
+    fixture.invocation().args.slice(
+      fixture.invocation().args.indexOf("--integration-mode"),
+      fixture.invocation().args.indexOf("--integration-mode") + 2,
+    ),
+    ["--integration-mode", "external-provider"],
+  );
 });
 
-test("D13 setupDevCore rejects canonical external-provider", async () => {
+// S4D: the DEV harness has no Codex routing and normalizes every valid mode
+// to provider-only, so canonical or requested external-provider reaches DEV
+// setup instead of failing closed.
+test("D13 setupDevCore accepts canonical external-provider", async () => {
   const fixture = provenanceHost(
     [{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }],
     { launcherProfile: "development" },
   );
-  await assert.rejects(fixture.host.setupDevCore(), /unavailable in the isolated DEV/);
-  assert.equal(fixture.invocation(), undefined);
+  const result = await fixture.host.setupDevCore();
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
 });
 
-test("D13 setupDevCore rejects requested external-provider on a fresh DEV home", async () => {
+test("D13 setupDevCore accepts requested external-provider on a fresh DEV home", async () => {
   const fixture = provenanceHost([null], { launcherProfile: "development" });
-  await assert.rejects(
-    fixture.host.setupDevCore({ integrationMode: "external-provider" }),
-    /unavailable in the isolated DEV/,
-  );
-  assert.equal(fixture.invocation(), undefined);
+  const result = await fixture.host.setupDevCore({ integrationMode: "external-provider" });
+  assert.equal(result.mode, "browser-only");
+  assert.notEqual(fixture.invocation(), undefined);
 });
 
-test("D14 setupDevMcp rejects canonical external-provider", async () => {
+test("D14 setupDevMcp accepts canonical external-provider", async () => {
   const fixture = provenanceHost(
     [{ mode: "full", browserHost: "launcher", integrationMode: "external-provider" }],
     { launcherProfile: "development" },
   );
-  await assert.rejects(
-    Promise.resolve().then(() => fixture.host.setupDevMcp({
-      replace: true,
-      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
-      runtimeKey: "new-private-runtime-key-0123456789",
-    })),
-    /unavailable in the isolated DEV/,
-  );
-  assert.equal(fixture.invocation(), undefined);
+  await fixture.host.setupDevMcp({
+    replace: true,
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    runtimeKey: "new-private-runtime-key-0123456789",
+  });
+  assert.notEqual(fixture.invocation(), undefined);
 });
 
-test("D15 DEV feature setter rejects canonical external-provider before setup", async () => {
+test("D15 DEV feature setter accepts canonical external-provider before setup", async () => {
   const fixture = provenanceHost(
     [{ mode: "browser-only", browserHost: "launcher", integrationMode: "external-provider" }],
     { launcherProfile: "development" },
   );
-  await assert.rejects(fixture.host.setBiggerContext(true), /unavailable in the isolated DEV/);
-  assert.equal(fixture.invocation(), undefined);
+  await fixture.host.setBiggerContext(true);
+  assert.notEqual(fixture.invocation(), undefined);
 });
 
 test("D16 DEV missing home remains Direct and reaches setup", async () => {
@@ -2286,7 +2304,8 @@ test("fresh-conversation preference uses production and DEV setup without forcin
         assert.equal(args.includes(enabled ? "--retained-conversation" : "--fresh-conversation"), false);
         assert.equal(args.includes("--auto-approve-tool-calls"), true);
         assert.equal(args.includes("--restart-service"), makeHost === hostFor);
-        assert.equal(args.includes("--replace-codex-route"), makeHost === hostFor);
+        // S4D: no setup path may replace the Codex route, in production or DEV.
+        assert.equal(args.includes("--replace-codex-route"), false);
         assert.equal(args.includes("--integration-mode"), makeHost === hostFor);
         assert.equal(existing.experimentalFreshConversationPerTurn, false, "setter must delegate persistence to setup");
         assert.equal(existing.experimentalSkillAttachments, true);
@@ -2325,8 +2344,14 @@ test("conversation preferences preserve external route ownership", async () => {
       ["--integration-mode", "external-provider"]);
     assert.equal(args.includes("--replace-codex-route"), false);
     const mismatch = hostFor(external);
-    await assert.rejects(mismatch.host[setter](enabled, { integrationMode: "direct" }), /ownership mismatch/);
-    assert.equal(mismatch.invocation(), undefined);
+    // S4D: a legacy direct request is accepted and ignored; canonical
+    // provider ownership is preserved with no replace flag.
+    const directResult = await mismatch.host[setter](enabled, { integrationMode: "direct" });
+    assert.equal(directResult.enabled, true);
+    const directArgs = mismatch.invocation().args;
+    assert.deepEqual(directArgs.slice(directArgs.indexOf("--integration-mode"), directArgs.indexOf("--integration-mode") + 2),
+      ["--integration-mode", "external-provider"]);
+    assert.equal(directArgs.includes("--replace-codex-route"), false);
   }
 });
 

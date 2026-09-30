@@ -14,8 +14,9 @@ import {
   resolveChatGptWebContextLimits,
 } from "../chatgpt-web-models";
 import type { AppConfig } from "../config";
+import { ensureOpencodexProviderTokenFile, readOpencodexProviderTokenFile } from "../opencodex-provider-auth";
 import { parseRequest } from "../responses/parser";
-import { compactRequest, responseRequest, routeChatGptWebRequest } from "../server";
+import { responseRequest, routeChatGptWebRequest } from "../server";
 import { namespacedToolName, type AdapterEvent, type CodexProviderConfig } from "../types";
 import {
   createDevCoherentContextPayload,
@@ -514,9 +515,12 @@ export class DevChatDriver {
     let finalText = "";
     for (let round = 0; round < 64; round += 1) {
       const body = requestBody(state, this.cwd, turnId, workingInput, false, this.config.mode === "full");
+      // S4D OpenCodex-only: every Responses request requires provider Bearer auth.
+      ensureOpencodexProviderTokenFile(this.config.providerTokenFile, this.config.controlToken);
+      const devProviderAuth = { authorization: "Bearer " + readOpencodexProviderTokenFile(this.config.providerTokenFile) };
       const response = await responseRequest(new Request("http://codex-web-gpt.dev/v1/responses", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", ...devProviderAuth },
         body: JSON.stringify(body),
       }), this.config, this.adapterFactory, {
         rememberState: false,
@@ -628,19 +632,20 @@ export class DevChatDriver {
     }
     const compactTurnId = id("dev_compact_turn");
     emit({ type: "compaction_start", reason, inputItems: input.length });
-    const response = await compactRequest(new Request("http://codex-web-gpt.dev/v1/responses/compact", {
+    // S4D: ordinary Responses compaction via the OpenCodex route; legacy compact endpoint retired.
+    ensureOpencodexProviderTokenFile(this.config.providerTokenFile, this.config.controlToken);
+    const compactProviderAuth = { authorization: "Bearer " + readOpencodexProviderTokenFile(this.config.providerTokenFile) };
+    const compactMetadata = JSON.stringify({ thread_id: state.threadId, turn_id: compactTurnId });
+    const response = await responseRequest(new Request("http://codex-web-gpt.dev/v1/responses", {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-codex-turn-metadata": turnMetadata(state.threadId, compactTurnId, this.cwd),
-      },
+      headers: { "content-type": "application/json", ...compactProviderAuth },
       body: JSON.stringify({
         model: state.model,
-        input,
-        instructions: DEV_CHAT_SYSTEM_INSTRUCTIONS,
+        input: [...input, { type: "compaction_trigger" }],
+        client_metadata: { "x-codex-turn-metadata": compactMetadata },
         store: false,
       }),
-    }), this.config, this.adapterFactory);
+    }), this.config, this.adapterFactory, { rememberState: false });
     if (!response.ok) {
       let message = `DEV compaction failed with HTTP ${response.status}`;
       try {

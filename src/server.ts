@@ -426,59 +426,23 @@ function modelCatalogFailure(stage: ModelCatalogFailure["stage"], error: unknown
 export async function modelsRequest(
   req: Request,
   config: AppConfig,
-  fetchUpstream?: NativeFetch,
-  contextOverride?: () => CodexModelContextOverride | undefined,
-  onFailure?: (failure: ModelCatalogFailure) => void,
+  _fetchUpstream?: NativeFetch,
+  _contextOverride?: () => CodexModelContextOverride | undefined,
+  _onFailure?: (failure: ModelCatalogFailure) => void,
 ): Promise<Response> {
-  if (isExternalProviderMode(config)) {
-    // S4B OpenCodex provider boundary: Bearer auth BEFORE catalog work. Ignores
-    // the generic external-client header; never reads externalClients. Web-only.
-    const authFailure = requireOpencodexProviderAuth(req, config);
-    if (authFailure) return authFailure;
-    const catalog = buildExternalProviderModelCatalog(config, "legacy");
-    const body = JSON.stringify(catalog);
-    return new Response(body, {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        etag: `W/\"${createHash("sha256").update(body).digest("base64url")}\"`,
-      },
-    });
-  }
-  // Direct mode has no external-client lifecycle. Any dedicated header fails closed here, before
-  // the native models request, so neither the client id nor an external token can be forwarded
-  // into the native Codex trust domain. No credential is validated and no client id is inspected,
-  // so this cannot become a credential oracle.
-  if (readExternalClientHeader(req.headers).present) return externalClientAuthFailure();
-  let upstream: Response;
-  let sent = false;
-  try {
-    upstream = await forwardNativeCodexRequest(req, "models", input => {
-      sent = true;
-      return (fetchUpstream ?? fetchNativeCodex)(input);
-    });
-  } catch (error) {
-    onFailure?.(modelCatalogFailure(sent ? "transport" : "request", error));
-    return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
-  }
-  if (!upstream.ok) {
-    onFailure?.({ stage: "upstream" });
-    return upstream;
-  }
-  let catalog: Record<string, unknown>;
-  try {
-    catalog = augmentNativeModelCatalog(await upstream.json(), config, contextOverride?.());
-  } catch (error) {
-    onFailure?.(modelCatalogFailure("catalog", error));
-    return formatErrorResponse(502, "invalid_response_error", error instanceof Error ? error.message : String(error));
-  }
+  // S4D OpenCodex-only: Bearer auth BEFORE catalog work. Ignores the generic
+  // external-client header; never reads externalClients. Web-only. No native fallback.
+  const authFailure = requireOpencodexProviderAuth(req, config);
+  if (authFailure) return authFailure;
+  const catalog = buildExternalProviderModelCatalog(config, "legacy");
   const body = JSON.stringify(catalog);
-  const headers = new Headers(upstream.headers);
-  headers.delete("content-encoding");
-  headers.delete("content-length");
-  headers.set("content-type", "application/json");
-  headers.set("etag", `W/\"${createHash("sha256").update(body).digest("base64url")}\"`);
-  return new Response(body, { status: upstream.status, statusText: upstream.statusText, headers });
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      etag: `W/\"${createHash("sha256").update(body).digest("base64url")}\"`,
+    },
+  });
 }
 
 export async function nativeSearchRequest(
@@ -550,16 +514,17 @@ function applyCodexTurnMetadataHeader(
 }
 
 function externalProviderTurnMetadataError(
-  config: AppConfig,
+  _config: AppConfig,
   model: unknown,
   identity: ReturnType<typeof extractCodexTurnIdentityFromBody>,
 ): Response | undefined {
-  if (!isExternalProviderMode(config) || typeof model !== "string" || !isChatGptWebModelSlug(model)) return undefined;
+  // S4D OpenCodex-only: always enforce for Web models; no Direct bypass.
+  if (typeof model !== "string" || !isChatGptWebModelSlug(model)) return undefined;
   if (identity.threadId && identity.turnId) return undefined;
   return formatErrorResponse(
     400,
     "invalid_request_error",
-    "External-provider ChatGPT Web requests require native Codex turn metadata in client_metadata",
+    "OpenCodex ChatGPT Web requests require native Codex turn metadata in client_metadata",
   );
 }
 
@@ -1079,247 +1044,16 @@ export async function responseRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: ResponseRequestOptions = {},
 ): Promise<Response> {
-  // S4B OpenCodex provider boundary: Bearer auth BEFORE body parsing, model
-  // discovery, or browser work. The generic external-client header is ignored on
-  // this path; OpenCodex owns provider configuration, this fork only verifies
-  // its own provider secret.
-  if (isExternalProviderMode(config)) {
+  // S4D OpenCodex-only: Bearer auth BEFORE body parsing, model discovery, or
+  // browser work. The generic external-client header is ignored; OpenCodex owns
+  // provider configuration, this fork only verifies its own provider secret.
+  // No Direct/native fallback exists on this path. (Legacy Direct branch below
+  // is unreachable and reserved for S4E deletion.)
+  {
     const authFailure = requireOpencodexProviderAuth(req, config);
     if (authFailure) return authFailure;
     return opencodexProviderResponse(req, config, adapterFactory, options);
   }
-  const nativeRequest = req.clone();
-  let raw: unknown;
-  try {
-    raw = await readJsonRequestBody(req);
-  } catch (error) {
-    return formatErrorResponse(
-      400,
-      "invalid_request_error",
-      error instanceof Error ? error.message : "Request body must be valid JSON",
-    );
-  }
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    raw = applyCodexTurnMetadataHeader(raw as Record<string, unknown>, req);
-  }
-  const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as { model?: unknown }).model
-    : undefined;
-  // The dedicated header classifies admission before any native authority is read: a
-  // present-invalid header must never fall through to the legacy path, and only the legacy branch
-  // below may extract native Codex identity from the body.
-  const externalClientHeader = readExternalClientHeader(req.headers);
-  const externalAuthentication = authenticateExternalClientRequest(req, config, externalClientHeader);
-  if (externalAuthentication.kind === "rejected") return externalAuthentication.response;
-  if (externalAuthentication.kind === "authenticated") {
-    return externalClientRouteAdmission(req, config, externalAuthentication.authority, requestedModel, raw, adapterFactory, options);
-  }
-  let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
-  try {
-    nativeIdentity = extractCodexTurnIdentityFromBody(raw);
-    if (nativeIdentity.threadId && nativeIdentity.turnId) {
-      options.onTurnIdentity?.({ threadId: nativeIdentity.threadId, turnId: nativeIdentity.turnId });
-    }
-  } catch (error) {
-    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
-  }
-  if (isExternalProviderMode(config)
-    && (typeof requestedModel !== "string" || !isChatGptWebModelSlug(requestedModel))) {
-    return formatErrorResponse(
-      400,
-      "model_not_found",
-      typeof requestedModel === "string"
-        ? `Model ${requestedModel} is not provided by codex-chatgpt-web in external-provider mode`
-        : "A model is required in external-provider mode",
-    );
-  }
-  const metadataError = externalProviderTurnMetadataError(config, requestedModel, nativeIdentity);
-  if (metadataError) return metadataError;
-  if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
-    try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
-    } catch (error) {
-      return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
-    }
-  }
-  const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as { previous_response_id?: unknown }).previous_response_id
-    : undefined;
-  const expanded = expandPreviousResponseInput(raw);
-  let parsed: CodexParsedRequest;
-  let route: ChatGptWebModelRoute;
-  try {
-    parsed = parseRequest(expanded);
-    if (isExternalProviderMode(config)) parsed._externalProviderTrusted = true;
-    route = routeChatGptWebRequest(parsed, config);
-    const identity = extractChatGptTurnIdentity(parsed);
-    if (identity.threadId && identity.turnId) {
-      options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
-    }
-  } catch (error) {
-    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
-  }
-  if (parsed._opaqueMultiAgentV2Payload) {
-    return formatErrorResponse(
-      400,
-      "invalid_request_error",
-      "ChatGPT Web cannot read this encrypted cross-backend subagent payload. "
-        + "Start a new Compatibility V1 task, or delegate from a Web model whose collaboration call uses the plaintext-delivery marker.",
-    );
-  }
-  if (typeof requestedPreviousResponseId === "string" && expanded === raw) {
-    return formatErrorResponse(
-      409,
-      "invalid_request_error",
-      "Local continuation state for previous_response_id is unavailable; refusing to run ChatGPT Web with partial Codex context. Compact the Codex task or start a new task before retrying.",
-    );
-  }
-
-  const compaction = parsed._compactionRequest === true;
-  const compactionItem = compaction && parsed._compactionResponseFormat !== "message";
-  const rememberCompletedResponse = (response: Record<string, unknown>): void => {
-    if (!compaction) {
-      if (options.rememberState !== false) rememberResponseState(parsed._rawBody, response, { force: true });
-      return;
-    }
-    if (response.status !== "completed") return;
-    const identity = extractChatGptTurnIdentity(parsed);
-    if (!identity.threadId || !identity.turnId || !Array.isArray(response.output)) return;
-    const items = response.output.filter(item => item?.type === (compactionItem ? "compaction" : "message"));
-    if (items.length !== 1 || (compactionItem && response.output.length !== 1)) return;
-    const item = items[0];
-    const summary = compactionItem
-      ? (typeof item?.encrypted_content === "string" ? decodeCompactionSummary(item.encrypted_content) : null)
-      : (item?.role === "assistant" && Array.isArray(item.content)
-        ? item.content.filter((part: { type?: string; text?: unknown }) => part.type === "output_text" && typeof part.text === "string")
-          .map((part: { text: string }) => part.text).join("")
-        : null);
-    if (!summary) return;
-    const source = extractChatGptCompactionSourceRevision(parsed);
-    const body = parsed._rawBody as { input?: unknown[] };
-    // v1 installs the bounded user-message output, whereas v2 retains the original source.
-    // Authenticate both exact producer-defined representations, never arbitrary rewrites.
-    const v1Source = extractChatGptCompactionSourceRevision({
-      ...parsed,
-      _rawBody: { ...body, input: buildCompactV1Output(extractCompactUserMessages(body.input), summary) },
-    });
-    rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
-  };
-  if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
-    return formatErrorResponse(
-      409,
-      "invalid_request_error",
-      "ChatGPT Web Luna uses a rolling checkpoint on every completed browser turn; separate Codex compaction is disabled for this route.",
-    );
-  }
-  if (compaction) {
-    // History compaction is a dedicated summarization turn. It must never bind the active Codex
-    // tool bridge or continue an in-flight MCP round; the returned summary becomes the next turn's
-    // replacement history through the Responses compaction contract.
-    delete parsed.context.tools;
-    delete parsed.options.toolChoice;
-    delete parsed.options.parallelToolCalls;
-    parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
-  }
-
-  const provider = providerConfig(config);
-  let traceId: string | undefined;
-  try {
-    traceId = chatGptWebTraceId(provider, parsed);
-  } catch (error) {
-    // A cancelled browser session can only exist after the adapter accepted canonical native
-    // turn identity and user-revision metadata. Requests without that identity have no matching
-    // trace tombstone; preserve the adapter's existing strict validation/error path below.
-    const message = error instanceof Error ? error.message : String(error);
-    if (message === CHATGPT_TURN_REVISION_CONFLICT_MESSAGE) {
-      // Codex can reopen an interrupted task with only refreshed developer/skill context under a
-      // new turn_id. Its last human prompt still belongs to the stopped turn and must not be
-      // replayed as new work. HTTP 400 makes that malformed recovery request terminal instead of
-      // allowing Codex to retry it as an upstream 502.
-      return formatErrorResponse(400, "invalid_request_error", message);
-    }
-    if (!message.includes("requires native Codex turn_id metadata")
-      && !message.includes("requires a current-turn user message")) throw error;
-  }
-  const cancelledError = traceId ? chatGptTurnSessions.cancelledError(traceId) : undefined;
-  if (cancelledError) {
-    // Codex retries unknown streamed response.failed codes. A replay after the user explicitly
-    // closed the only browser document is instead a terminal client state: repeating that exact
-    // request is invalid and must not recreate the DOM. Codex maps HTTP 400 to its non-retryable
-    // InvalidRequest category while the body preserves the real client_cancelled classification.
-    return new Response(JSON.stringify({
-      error: {
-        type: "client_closed_request",
-        code: "client_cancelled",
-        message: cancelledError.message,
-      },
-    }), {
-      status: 400,
-      headers: { "content-type": "application/json" },
-    });
-  }
-  const adapter = adapterFactory(provider);
-  const queue = new AsyncEventQueue<AdapterEvent>();
-  const abort = new AbortController();
-  if (req.signal.aborted) abort.abort();
-  else req.signal.addEventListener("abort", () => abort.abort(), { once: true });
-  const run = async () => {
-    try {
-      await adapter.runTurn!(parsed, { headers: req.headers, abortSignal: abort.signal }, event => {
-        options.onAdapterEvent?.(event);
-        queue.push(event);
-      });
-    } catch (error) {
-      const event: AdapterEvent = { type: "error", message: error instanceof Error ? error.message : String(error) };
-      options.onAdapterEvent?.(event);
-      queue.push(event);
-    } finally {
-      queue.close();
-    }
-  };
-  const maps = toolBridgeMaps(parsed);
-  const responseModel = route.slug;
-
-  if (parsed.stream) {
-    void run();
-    const stream = bridgeToResponsesSSE(
-      queue,
-      responseModel,
-      maps.toolNsMap,
-      maps.freeformToolNames,
-      maps.toolSearchToolNames,
-      () => abort.abort(),
-      2_000,
-      {
-        hideThinkingSummary: parsed.options.hideThinkingSummary,
-        ...(provider.chatgptWeb?.stallTimeoutSec !== undefined
-          ? { stallTimeoutSec: provider.chatgptWeb.stallTimeoutSec }
-          : {}),
-        ...(compactionItem ? { compaction: true } : {}),
-        onCompletedResponse: rememberCompletedResponse,
-      },
-    );
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "X-Accel-Buffering": "no",
-      },
-    });
-  }
-
-  await run();
-  const events = await queue.collect();
-  const json = buildResponseJSON(events, responseModel, {
-    hideThinkingSummary: parsed.options.hideThinkingSummary,
-    toolNsMap: maps.toolNsMap,
-    freeformToolNames: maps.freeformToolNames,
-    toolSearchToolNames: maps.toolSearchToolNames,
-    ...(compactionItem ? { compaction: true } : {}),
-  });
-  rememberCompletedResponse(json);
-  return Response.json(json);
 }
 
 export async function compactRequest(
@@ -1328,128 +1062,14 @@ export async function compactRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: Pick<ResponseRequestOptions, "onTurnIdentity"> = {},
 ): Promise<Response> {
-  // S4B: OpenCodex compaction travels via ordinary POST /v1/responses, never via
-  // this legacy endpoint. Authenticate the provider BEFORE body parsing, then
-  // answer unsupported so callers cannot depend on /compact on this path.
-  if (isExternalProviderMode(config)) {
+  // S4D OpenCodex-only: compaction travels via ordinary POST /v1/responses, never
+  // via this legacy endpoint. Authenticate BEFORE body parsing, then answer
+  // unsupported. (Legacy Direct branch below is unreachable, reserved for S4E.)
+  {
     const authFailure = requireOpencodexProviderAuth(req, config);
     if (authFailure) return authFailure;
     return new Response(JSON.stringify({ error: { message: OPENCODEX_PROVIDER_COMPACT_ENDPOINT_MESSAGE, type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
   }
-  const nativeRequest = req.clone();
-  let raw: Record<string, unknown>;
-  try {
-    const parsed = await readJsonRequestBody(req);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
-    raw = parsed as Record<string, unknown>;
-  } catch (error) {
-    return formatErrorResponse(
-      400,
-      "invalid_request_error",
-      error instanceof Error ? error.message : "Compaction request body must be a JSON object",
-    );
-  }
-  // External clients never reach the legacy compact implementation: classification happens before
-  // metadata promotion, native identity extraction, model validation, route resolution, and any
-  // continuation state, so spoofed native metadata cannot bind native authority and no pre-auth
-  // model or metadata oracle exists. Every authenticated external compact request gets the same
-  // unsupported answer whatever it asked for.
-  const externalCompact = authenticateExternalClientRequest(req, config);
-  if (externalCompact.kind === "rejected") return externalCompact.response;
-  if (externalCompact.kind === "authenticated") {
-    return externalClientUnsupportedResponse(EXTERNAL_CLIENT_COMPACT_UNSUPPORTED_MESSAGE);
-  }
-  raw = applyCodexTurnMetadataHeader(raw, req, { headerWins: true });
-  let nativeIdentity: ReturnType<typeof extractCodexTurnIdentityFromBody>;
-  try {
-    nativeIdentity = extractCodexTurnIdentityFromBody(raw);
-    if (nativeIdentity.threadId && nativeIdentity.turnId) {
-      options.onTurnIdentity?.({ threadId: nativeIdentity.threadId, turnId: nativeIdentity.turnId });
-    }
-  } catch (error) {
-    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
-  }
-  if (typeof raw.model !== "string" || !raw.model) {
-    return formatErrorResponse(400, "invalid_request_error", "Compaction request requires a model");
-  }
-  if (isExternalProviderMode(config) && !isChatGptWebModelSlug(raw.model)) {
-    return formatErrorResponse(
-      400,
-      "model_not_found",
-      `Model ${raw.model} is not provided by codex-chatgpt-web in external-provider mode`,
-    );
-  }
-  const metadataError = externalProviderTurnMetadataError(config, raw.model, nativeIdentity);
-  if (metadataError) return metadataError;
-  if (!isChatGptWebModelSlug(raw.model)) {
-    try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses/compact", undefined, raw);
-    } catch (error) {
-      return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
-    }
-  }
-  let route: ChatGptWebModelRoute;
-  try {
-    route = requireChatGptWebModelRoute(raw.model, config);
-  } catch (error) {
-    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
-  }
-  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
-    return formatErrorResponse(
-      409,
-      "invalid_request_error",
-      "ChatGPT Web Luna uses a rolling checkpoint on every completed browser turn; separate Codex compaction is disabled for this route.",
-    );
-  }
-  const input = Array.isArray(raw.input) ? raw.input : [];
-  const headers = new Headers(req.headers);
-  headers.set("content-type", "application/json");
-  const internal = new Request("http://127.0.0.1/v1/responses", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ ...raw, stream: false, input: [...input, { type: "compaction_trigger" }] }),
-    signal: req.signal,
-  });
-  const response = await responseRequest(internal, config, adapterFactory, options);
-  if (!response.ok) return response;
-  let body: {
-    output?: unknown[];
-    status?: unknown;
-    error?: { message?: unknown; type?: unknown; code?: unknown } | null;
-  };
-  try {
-    body = await response.json() as typeof body;
-  } catch {
-    return formatErrorResponse(502, "invalid_response_error", "Compaction turn returned invalid JSON");
-  }
-  if (body.error) {
-    const error = {
-      message: typeof body.error.message === "string" ? body.error.message : "Compaction turn failed",
-      type: typeof body.error.type === "string" ? body.error.type : "upstream_error",
-      code: typeof body.error.code === "string" ? body.error.code : null,
-    };
-    return Response.json(
-      { error },
-      { status: httpStatusFromTerminalError(error) },
-    );
-  }
-  if (body.status !== "completed") {
-    return formatErrorResponse(502, "upstream_error", `Compaction turn failed (status: ${String(body.status ?? "unknown")})`);
-  }
-  const items = (body.output ?? []).filter(
-    (item): item is { type: "compaction"; encrypted_content?: string } =>
-      Boolean(item && typeof item === "object" && (item as { type?: string }).type === "compaction"),
-  );
-  if (items.length !== 1) {
-    return formatErrorResponse(502, "invalid_response_error", `Compaction turn produced ${items.length} compaction items; expected one`);
-  }
-  const summary = typeof items[0]!.encrypted_content === "string"
-    ? decodeCompactionSummary(items[0]!.encrypted_content)
-    : null;
-  if (!summary?.trim()) {
-    return formatErrorResponse(502, "invalid_response_error", "Compaction turn produced an empty summary");
-  }
-  return Response.json({ output: buildCompactV1Output(extractCompactUserMessages(input), summary) });
 }
 
 export function startServer(
@@ -1459,9 +1079,8 @@ export function startServer(
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
   }
-  if (isExternalProviderMode(config)) {
-    ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
-  }
+  // S4D OpenCodex-only: always ensure the provider secret; never touches Codex routing.
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
   const startedAt = Date.now();
   const turnBroker = config.mode === "full" ? TurnBroker.forSocket(config.brokerSocketPath) : undefined;
   if (config.mode === "full") {
@@ -1502,8 +1121,9 @@ export function startServer(
           service: "codex-chatgpt-web",
           version: VERSION,
           mode: config.mode,
-          integration_mode: config.integrationMode,
-          routing_owner: isExternalProviderMode(config) ? "external-router" : "codex-chatgpt-web",
+          // S4D OpenCodex-only: fixed single production mode.
+          integration_mode: "external-provider",
+          routing_owner: "external-router",
           provider_base_url: `http://${config.host}:${config.port}/v1`,
           pid: process.pid,
           port: config.port,
@@ -1742,49 +1362,23 @@ export function startServer(
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
-        // S4B: provider path requires Bearer auth before the unsupported answer;
-        // Direct keeps the legacy external-client fail-closed gate.
-        if (isExternalProviderMode(config)) {
+        // S4D OpenCodex-only: Bearer auth before the unsupported answer. No native fallback.
+        // (Legacy Direct/external-client branch below is unreachable, reserved for S4E.)
+        {
           const authFailure = requireOpencodexProviderAuth(req, config);
           if (authFailure) return authFailure;
-          return new Response(JSON.stringify({ error: { message: "Native search is not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
+          return new Response(JSON.stringify({ error: { message: "Native search is not provided by codex-chatgpt-web in OpenCodex-only mode", type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
         }
-        const externalSearch = authenticateExternalClientRequest(req, config);
-        if (externalSearch.kind === "rejected") return externalSearch.response;
-        if (externalSearch.kind === "authenticated") {
-          return externalClientUnsupportedResponse(EXTERNAL_CLIENT_SEARCH_UNSUPPORTED_MESSAGE);
-        }
-        return httpTurns.track(
-          signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),
-          req.signal,
-          process.platform,
-          "search",
-        );
       }
       if (req.method === "POST"
         && (url.pathname === "/v1/images/generations" || url.pathname === "/v1/images/edits")) {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
-        if (isExternalProviderMode(config)) {
+        // S4D OpenCodex-only: Bearer auth before the unsupported answer. No native fallback.
+        {
           const authFailure = requireOpencodexProviderAuth(req, config);
           if (authFailure) return authFailure;
-          return new Response(JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in external-provider mode", type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
+          return new Response(JSON.stringify({ error: { message: "Native image endpoints are not provided by codex-chatgpt-web in OpenCodex-only mode", type: "unsupported_operation", code: "unsupported_operation" } }), { status: 501, headers: { "Content-Type": "application/json" } });
         }
-        // Same trust-domain gate as search: no image request may carry an external credential or
-        // the dedicated client header into the native Codex boundary.
-        const externalImages = authenticateExternalClientRequest(req, config);
-        if (externalImages.kind === "rejected") return externalImages.response;
-        if (externalImages.kind === "authenticated") {
-          return externalClientUnsupportedResponse(EXTERNAL_CLIENT_IMAGES_UNSUPPORTED_MESSAGE);
-        }
-        const endpoint: NativeImageEndpoint = url.pathname === "/v1/images/generations"
-          ? "images/generations"
-          : "images/edits";
-        return httpTurns.track(
-          signal => nativeImagesRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream),
-          req.signal,
-          process.platform,
-          endpoint,
-        );
       }
       return new Response("Not found", { status: 404 });
     },

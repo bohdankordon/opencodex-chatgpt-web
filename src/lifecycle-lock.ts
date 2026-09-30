@@ -214,10 +214,12 @@ export async function withLifecycleLock<T>(
 // ---------------------------------------------------------------------------
 
 export type ExpectedInstallationKind = "configured" | "missing";
+/** S4D deprecated: accepted and ignored; product is always OpenCodex-only. */
 export type ExpectedIntegrationMode = "direct" | "external-provider";
 
 export interface ExpectedLifecycleOwnership {
   kind: ExpectedInstallationKind;
+  /** S4D deprecated: always normalized/ignored; only kind is authority. */
   integrationMode?: ExpectedIntegrationMode;
 }
 
@@ -239,17 +241,14 @@ export function parseExpectedLifecycleOwnership(options: {
   if (mode !== undefined && mode !== "direct" && mode !== "external-provider") {
     throw new Error("--expected-integration-mode must be direct or external-provider");
   }
-  if (kind === "configured" && mode === undefined) {
-    throw new Error("--expected-integration-mode is required with --expected-installation-kind configured");
-  }
-  if (kind === "missing" && mode !== undefined) {
-    throw new Error("--expected-integration-mode cannot accompany --expected-installation-kind missing");
-  }
+  // S4D: integration mode is no longer ownership authority; accept and ignore it for
+  // backwards compatibility with older launchers. Only installation kind is checked.
   return mode === undefined ? { kind } : { kind, integrationMode: mode };
 }
 
 export type ActualLifecycleOwnership =
   | { kind: "missing" }
+  // S4D: integrationMode retained as deprecated fixed value; only kind is authority.
   | { kind: "configured"; integrationMode: IntegrationMode; config: AppConfig };
 
 /**
@@ -267,15 +266,15 @@ export function readActualLifecycleOwnership(): ActualLifecycleOwnership {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Refusing lifecycle mutation: runtime configuration is damaged and cannot prove ownership (${detail})`);
   }
-  return { kind: "configured", integrationMode: config.integrationMode, config };
+  return { kind: "configured", integrationMode: "external-provider", config };
 }
 
 function describeExpected(expected: ExpectedLifecycleOwnership): string {
-  return expected.kind === "missing" ? "missing" : `configured ${expected.integrationMode}`;
+  return expected.kind === "missing" ? "missing" : "configured opencodex-only";
 }
 
 function describeActual(actual: ActualLifecycleOwnership): string {
-  return actual.kind === "missing" ? "missing" : `configured ${actual.integrationMode}`;
+  return actual.kind === "missing" ? "missing" : "configured opencodex-only";
 }
 
 /**
@@ -288,9 +287,8 @@ export function assertLifecycleOwnershipMatch(
   actual: ActualLifecycleOwnership,
   operation: string,
 ): void {
-  const matches = expected.kind === actual.kind
-    && (expected.kind === "missing"
-      || (actual.kind === "configured" && expected.integrationMode === actual.integrationMode));
+  // S4D: only installation kind is authority; integrationMode is accepted and ignored.
+  const matches = expected.kind === actual.kind;
   if (!matches) {
     throw new Error(
       `Lifecycle ownership changed during ${operation}: expected ${describeExpected(expected)} but found ${describeActual(actual)}; retry the operation`,

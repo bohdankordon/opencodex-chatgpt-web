@@ -45,7 +45,8 @@ test("configuration written before external clients existed still loads unchange
 
   const config = loadConfig();
   expect(config.externalClients).toEqual([]);
-  expect(config.integrationMode).toBe("direct");
+  // S4D OpenCodex-only: legacy configs without the field normalize to provider.
+  expect(config.integrationMode).toBe("external-provider");
   expect(config.mode).toBe(base.mode);
   expect(config.port).toBe(base.port);
   expect(config.appName).toBe(base.appName);

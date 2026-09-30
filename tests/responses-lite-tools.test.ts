@@ -1,7 +1,14 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import { defaultConfig } from "../src/config";
+import { ensureOpencodexProviderTokenFile, readOpencodexProviderTokenFile } from "../src/opencodex-provider-auth";
 import { parseRequest } from "../src/responses/parser";
 import { responseRequest } from "../src/server";
+import { isolateTestAppHome, restoreTestAppHome } from "./helpers/isolated-app-home";
+
+// S4D area C: resolve the provider-token file under an isolated temp home so test
+// runs never create or touch the real user app home.
+isolateTestAppHome("s4d-responses-lite-");
+afterAll(() => restoreTestAppHome());
 
 const freeformFormat = {
   type: "grammar",
@@ -58,13 +65,18 @@ test("Responses Lite native exec survives a complete server request as one custo
   config.solAvailable = false;
   config.proAvailable = false;
   const turnId = "turn_responses_lite_exec_regression";
+  // S4D: provider auth + native turn metadata are required on the OpenCodex-only path.
+  ensureOpencodexProviderTokenFile(config.providerTokenFile, config.controlToken);
+  const providerAuth = { authorization: "Bearer " + readOpencodexProviderTokenFile(config.providerTokenFile) };
+  const turnMetadata = JSON.stringify({ thread_id: "thread_responses_lite_exec_regression", turn_id: turnId });
   const response = await responseRequest(new Request("http://127.0.0.1:17841/v1/responses", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...providerAuth },
     body: JSON.stringify({
       model: "chatgpt-web/luna",
       stream: false,
       metadata: { turn_id: turnId, thread_id: "thread_responses_lite_exec_regression" },
+      client_metadata: { "x-codex-turn-metadata": turnMetadata },
       input: [{
         type: "additional_tools",
         role: "developer",

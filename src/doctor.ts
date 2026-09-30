@@ -1,8 +1,8 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import type { AppConfig } from "./config";
-import { getConfigDir, getConfigPath, isExternalProviderMode, loadConfig } from "./config";
+import { getConfigDir, getConfigPath, loadConfig } from "./config";
 import { join } from "node:path";
-import { inspectCodexIntegration } from "./codex-integration";
+import { detectLegacyDirectRoute } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
@@ -26,6 +26,7 @@ export interface DoctorCheck {
 export interface DoctorReport {
   ok: boolean;
   mode?: AppConfig["mode"];
+  /** S4D deprecated fixed value; always "external-provider". */
   integrationMode?: AppConfig["integrationMode"];
   checks: DoctorCheck[];
 }
@@ -109,20 +110,13 @@ export async function runDoctor(): Promise<DoctorReport> {
     return { ok: false, checks };
   }
 
-  if (isExternalProviderMode(config)) {
-    checks.push({
-      id: "integration",
-      status: "ok",
-      message: "Integration mode is external-provider; Codex routing is owned by OpenCodex",
-      detail: `Provider URL: http://${config.host}:${config.port}/v1`,
-    });
-  } else {
-    checks.push({
-      id: "integration",
-      status: "ok",
-      message: "Integration mode is direct; this process owns the Codex Responses route",
-    });
-  }
+  // S4D OpenCodex-only: single production routing mode.
+  checks.push({
+    id: "integration",
+    status: "ok",
+    message: "Routing is OpenCodex-only; Codex routing is owned by OpenCodex",
+    detail: `Provider URL: http://${config.host}:${config.port}/v1`,
+  });
 
   if (config.browserHost === "launcher") {
     try {
@@ -164,21 +158,16 @@ export async function runDoctor(): Promise<DoctorReport> {
     }
   }
 
-  const codex = inspectCodexIntegration();
-  if (isExternalProviderMode(config)) {
-    checks.push({
-      id: "codex",
-      status: "ok",
-      message: "Codex routing is managed by OpenCodex; this process does not install openai_base_url",
-      detail: `Register http://${config.host}:${config.port}/v1 as an openai-responses provider in OpenCodex.`,
-    });
-  } else if (!codex.installed) {
-    checks.push({ id: "codex", status: "error", message: "Codex model route is not installed" });
-  } else if (codex.errors.length > 0) {
-    checks.push({ id: "codex", status: "error", message: "Codex integration is inconsistent", detail: codex.errors.join("; ") });
-  } else {
-    checks.push({ id: "codex", status: "ok", message: "Codex native model route is installed" });
-  }
+  // S4D: read-only legacy detection; never mutates Codex config or journals.
+  const legacy = detectLegacyDirectRoute();
+  checks.push({
+    id: "codex",
+    status: "ok",
+    message: "Codex routing is managed by OpenCodex; this process does not install openai_base_url",
+    detail: legacy.hasJournal
+      ? `Register http://${config.host}:${config.port}/v1 as an openai-responses provider in OpenCodex. ${legacy.detail}`
+      : `Register http://${config.host}:${config.port}/v1 as an openai-responses provider in OpenCodex.`,
+  });
 
   const service = getServiceStatus();
   if (config.browserHost === "launcher") {
@@ -245,7 +234,8 @@ export async function runDoctor(): Promise<DoctorReport> {
   return {
     ok: !checks.some(check => check.status === "error"),
     mode: config.mode,
-    integrationMode: config.integrationMode,
+    // S4D: single OpenCodex-only mode; old configs already normalized on load.
+    integrationMode: "external-provider",
     checks,
   };
 }

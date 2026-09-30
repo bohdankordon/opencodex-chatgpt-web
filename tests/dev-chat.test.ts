@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterAll, afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +22,7 @@ import {
 } from "../src/dev-chat/session";
 import { startDevChatTransport } from "../src/dev-chat/transport";
 import type { CodexProviderConfig } from "../src/types";
+import { isolateTestAppHome, restoreTestAppHome } from "./helpers/isolated-app-home";
 
 const roots: string[] = [];
 
@@ -35,6 +36,13 @@ afterEach(() => {
   chatGptTurnSessions.clear();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
+
+// S4D area C: the DEV driver ensures the provider-token file on startup; keep it
+// under an isolated temp home so test runs never create or touch the real user app
+// home. defaultConfig() resolves the home at call time, so module-scope isolation
+// covers every test below.
+isolateTestAppHome("s4d-dev-chat-");
+afterAll(() => restoreTestAppHome());
 
 test("remote outer harness owns a turn through the live broker protocol", async () => {
   const root = scratch("cgw-dev-owner");
@@ -383,10 +391,28 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
   const worker = ChatGptBrowserWorker.forProvider(devProvider(providerConfig(config)));
   const originalRun = worker.run.bind(worker);
   let browserStarts = 0;
+  let toolRoundServed = false;
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
     const prepared = await turn.prepare();
     try {
+      // S4D: ordinary Responses compaction via the OpenCodex route carries the
+      // checkpoint prompt with no tools; return a summary without tool calls.
+      if (prepared.text.includes("CONTEXT CHECKPOINT COMPACTION")) {
+        const summary = "DEV compaction summary for ordinary OpenCodex route.";
+        turn.onTextDelta(summary);
+        return summary;
+      }
+      // S4D OpenCodex-only: each Responses request is an independent sampling turn
+      // (exact retries replay; different full-replay input gets a fresh turn). A real
+      // Web endpoint answers from history once the tool result is present, so the
+      // mock serves exactly one tool round and then converges to the final answer.
+      if (toolRoundServed) {
+        const answer = `DEV receipt simulated=true`;
+        turn.onTextDelta(answer);
+        return answer;
+      }
+      toolRoundServed = true;
       const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
       if (!token) throw new Error("missing DEV broker token");
       const claimed = await callTurnBroker<{ bindingId: string }>(config.brokerSocketPath, { method: "claim", token });
@@ -422,7 +448,9 @@ test("DEV driver uses shared browser methods and its own broker while an unrelat
     expect(result).toMatchObject({ text: "DEV receipt simulated=true", toolCalls: 1 });
     expect(state.input.find(item => (item as { role?: string }).role === "assistant"))
       .toMatchObject({ internal_chat_message_metadata_passthrough: { turn_id: expect.stringContaining("dev_turn_") } });
-    expect(browserStarts).toBe(1);
+    // S4D OpenCodex-only: round 2 is a fresh Web turn that answers from history
+    // (Direct session continuation no longer exists), so the browser runs twice.
+    expect(browserStarts).toBe(2);
     expect(await (await fetch(`http://127.0.0.1:${occupied.port}`)).text()).toBe("live");
     expect(readFileSync(codexConfig, "utf8")).toBe(sentinel);
   } finally {

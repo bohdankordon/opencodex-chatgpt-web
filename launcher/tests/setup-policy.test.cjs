@@ -36,31 +36,30 @@ test("operation set is closed and rejects arbitrary strings", () => {
   }
 });
 
-test("direct production policy preserves the exact replace-route matrix", () => {
-  const expected = {
-    "setup-core": true,
-    "setup-mcp": true,
-    "bigger-context": true,
-    "skill-attachments": true,
-    "fresh-conversation-per-turn": true,
-    "use-saved-chats": true,
-    "zero-risk-pro": true,
-    "browser-interaction-mode": true,
-    "connector-name": true,
-    "runtime-upgrade": false,
-  };
-  assert.deepEqual({ ...DIRECT_REPLACE_BY_OPERATION }, expected);
-  for (const [operation, replaceCodexRoute] of Object.entries(expected)) {
+// S4D OpenCodex-only: legacy "direct" input normalizes to the provider-only
+// policy. No production operation may replace the Codex route; every
+// operation uses the bridge-only checkpoint scope with an explicit
+// external-provider mode flag.
+test("production policy is provider-only with no replace-route for every operation and mode", () => {
+  for (const operation of SETUP_OPERATIONS) {
+    for (const integrationMode of ["direct", "external-provider"]) {
+      const policy = buildSetupOwnershipPolicy({ integrationMode, operation, profile: "production" });
+      assert.equal(policy.integrationMode, "external-provider");
+      assert.equal(policy.replaceCodexRoute, false);
+      assert.equal(policy.checkpointScope, BRIDGE_ONLY_SCOPE);
+      assert.deepEqual(policy.integrationArgs, ["--integration-mode", "external-provider"]);
+      assert.deepEqual(ownershipArgs(policy), ["--integration-mode", "external-provider"]);
+      assert.equal(ownershipArgs(policy).includes("--replace-codex-route"), false);
+    }
+  }
+});
+
+test("legacy direct replace matrix export stays frozen but no longer drives policy", () => {
+  assert.deepEqual(Object.keys({ ...DIRECT_REPLACE_BY_OPERATION }).sort(), [...SETUP_OPERATIONS].sort());
+  assert.ok(Object.isFrozen(DIRECT_REPLACE_BY_OPERATION));
+  for (const operation of SETUP_OPERATIONS) {
     const policy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation, profile: "production" });
-    assert.equal(policy.replaceCodexRoute, replaceCodexRoute);
-    assert.equal(policy.checkpointScope, DIRECT_INTEGRATION_SCOPE);
-    assert.deepEqual(policy.integrationArgs, ["--integration-mode", "direct"]);
-    assert.deepEqual(
-      ownershipArgs(policy),
-      replaceCodexRoute
-        ? ["--integration-mode", "direct", "--replace-codex-route"]
-        : ["--integration-mode", "direct"],
-    );
+    assert.equal(policy.replaceCodexRoute, false);
   }
 });
 
@@ -103,7 +102,9 @@ test("dev policy preserves the isolated-harness contract for every operation", (
     const policy = buildSetupOwnershipPolicy({ integrationMode: "direct", operation, profile: "development" });
     assert.deepEqual(policy.integrationArgs, []);
     assert.equal(policy.replaceCodexRoute, false);
-    assert.equal(policy.checkpointScope, DIRECT_INTEGRATION_SCOPE);
+    // S4D: DEV harness has no Codex routing; scope is bridge-only.
+    assert.equal(policy.integrationMode, "external-provider");
+    assert.equal(policy.checkpointScope, BRIDGE_ONLY_SCOPE);
     assert.deepEqual(ownershipArgs(policy), []);
   }
 });
@@ -113,10 +114,12 @@ test("policy rejects malformed mode, profile and scope", () => {
     () => buildSetupOwnershipPolicy({ integrationMode: "opencodex", operation: "setup-core", profile: "production" }),
     /requires direct or external-provider/,
   );
-  assert.throws(
-    () => buildSetupOwnershipPolicy({ operation: "setup-core", profile: "production" }),
-    /requires direct or external-provider/,
-  );
+  // S4D: omitted mode is tolerated and normalizes to provider-only.
+  const omitted = buildSetupOwnershipPolicy({ operation: "setup-core", profile: "production" });
+  assert.equal(omitted.integrationMode, "external-provider");
+  assert.equal(omitted.replaceCodexRoute, false);
+  assert.equal(omitted.checkpointScope, BRIDGE_ONLY_SCOPE);
+  assertSetupOwnershipPolicy(omitted);
   assert.throws(
     () => buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "qa" }),
     /profile must be production or development/,
@@ -163,10 +166,20 @@ test("B hand-built External policy with Direct args fails", () => {
   );
 });
 
-test("C hand-built Direct policy with a bridge-only scope fails", () => {
+// S4D: bridge-only is canonical for every production policy, including legacy
+// direct input. A legacy direct request can never produce a
+// direct-integration scope or a replace-route policy.
+test("C legacy direct input can never produce a direct-integration scope", () => {
   const canonical = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "production" });
+  assert.equal(canonical.checkpointScope, "bridge-only");
+  assert.equal(canonical.replaceCodexRoute, false);
+  assertSetupOwnershipPolicy(canonical);
   assert.throws(
-    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { checkpointScope: "bridge-only" })),
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { checkpointScope: "direct-integration" })),
+    /not canonical/,
+  );
+  assert.throws(
+    () => assertSetupOwnershipPolicy(tamperedClone(canonical, { replaceCodexRoute: true })),
     /not canonical/,
   );
 });
@@ -221,15 +234,20 @@ test("J policy arg arrays resist post-construction mutation", () => {
   assertSetupOwnershipPolicy(canonical);
 });
 
-test("DEV builder accepts only explicit direct", () => {
-  const dev = buildSetupOwnershipPolicy({ integrationMode: "direct", operation: "setup-core", profile: "development" });
-  assert.equal(dev.profile, "development");
-  assertSetupOwnershipPolicy(dev);
-  assert.throws(
-    () => buildSetupOwnershipPolicy({ integrationMode: "external-provider", operation: "setup-core", profile: "development" }),
-    /Direct-only/,
-  );
-  for (const bad of [undefined, null, "direct ", "DIRECT", 42]) {
+// S4D: DEV harness has no Codex routing. Direct, external-provider, and
+// omitted modes all normalize to the same provider-only DEV policy with the
+// no-flag command contract; malformed modes still throw.
+test("DEV builder normalizes every valid mode to provider-only", () => {
+  for (const integrationMode of ["direct", "external-provider", undefined]) {
+    const dev = buildSetupOwnershipPolicy({ integrationMode, operation: "setup-core", profile: "development" });
+    assert.equal(dev.profile, "development");
+    assert.equal(dev.integrationMode, "external-provider");
+    assert.equal(dev.replaceCodexRoute, false);
+    assert.equal(dev.checkpointScope, BRIDGE_ONLY_SCOPE);
+    assert.deepEqual(dev.integrationArgs, []);
+    assertSetupOwnershipPolicy(dev);
+  }
+  for (const bad of [null, "direct ", "DIRECT", 42, "opencodex"]) {
     assert.throws(
       () => buildSetupOwnershipPolicy({ integrationMode: bad, operation: "setup-core", profile: "development" }),
       /requires direct or external-provider/,

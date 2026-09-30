@@ -518,12 +518,14 @@ class RuntimeHost {
     return ["--expected-installation-kind", "configured", "--expected-integration-mode", ownership.integrationMode];
   }
 
-  // DEV profile is Direct-only. Central enforcement so every production and
-  // DEV setup path, including direct RuntimeHost callers, fails closed on
-  // external-provider instead of silently continuing as Direct.
+  // S4D OpenCodex-only: DEV profile has no Codex routing; both modes are accepted
+  // and normalized to provider by setup-policy. Allowlist both to avoid breaking
+  // isolated DEV callers while production stays provider-only.
   enforceProfileOwnership(integrationMode) {
-    if (this.launcherProfile === "development" && integrationMode !== DIRECT) {
-      throw new Error("External provider routing is unavailable in the isolated DEV launcher profile");
+    if (this.launcherProfile === "development"
+      && integrationMode !== DIRECT
+      && integrationMode !== EXTERNAL_PROVIDER) {
+      throw new Error("DEV launcher profile requires direct or external-provider");
     }
   }
 

@@ -185,24 +185,27 @@ function countOccurrences(haystack, needle) {
   return haystack.split(needle).length - 1;
 }
 
-test("startup route policy follows routing mode only", () => {
-  assert.deepEqual(buildStartupRoutePolicy("direct"), {
-    integrationMode: "direct",
-    connectDirectRoute: true,
-    restoreDirectRouteOnFailure: true,
-  });
-  assert.deepEqual(buildStartupRoutePolicy("external-provider"), {
-    integrationMode: "external-provider",
-    connectDirectRoute: false,
-    restoreDirectRouteOnFailure: false,
-  });
+// S4D OpenCodex-only: the startup route policy is provider-only for every
+// valid mode. Legacy "direct" validates but normalizes; malformed still
+// throws; omitted is tolerated. Launcher startup never connects or restores
+// a Direct Codex route.
+test("startup route policy is provider-only for every valid mode", () => {
+  for (const mode of ["direct", "external-provider", undefined]) {
+    assert.deepEqual(buildStartupRoutePolicy(mode), {
+      integrationMode: "external-provider",
+      connectDirectRoute: false,
+      restoreDirectRouteOnFailure: false,
+    });
+  }
   assert.throws(() => buildStartupRoutePolicy("opencodex"), /requires direct or external-provider/);
-  assert.throws(() => buildStartupRoutePolicy(undefined), /requires direct or external-provider/);
 });
 
-test("G3.13 Direct startup connects the Direct route as before", async () => {
-  const bed = startupSupervisor({ setupReads: [DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: directHealth() });
+// S4D: a legacy Direct config normalizes to provider ownership, so startup
+// runs the provider bridge with zero route connects.
+test("G3.13 legacy Direct config starts the provider bridge with zero route connects", async () => {
+  const bed = startupSupervisor({ setupReads: [DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: externalHealth() });
   const ownership = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
+  assert.equal(ownership.integrationMode, "external-provider");
   let connects = 0;
   const context = runStartBridge({
     runtimeHost: {
@@ -218,13 +221,13 @@ test("G3.13 Direct startup connects the Direct route as before", async () => {
     runtimeHost: context.runtimeHost,
     runtimeSupervisor: context.runtimeSupervisor,
   });
-  assert.equal(connects, 1);
+  assert.equal(connects, 0);
   assert.equal(started.runtime.status, "ready");
-  assert.equal(started.runtime.bridgeRouteChanged, true);
+  assert.equal(started.runtime.bridgeRouteChanged, false);
 });
 
-test("G3.13 Direct startup reports an unchanged route without restart churn", async () => {
-  const bed = startupSupervisor({ setupReads: [DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: directHealth() });
+test("G3.13 provider startup reports an unchanged route without restart churn", async () => {
+  const bed = startupSupervisor({ setupReads: [EXTERNAL_CONFIG], configReads: [EXTERNAL_CONFIG], health: externalHealth() });
   const ownership = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
   const context = runStartBridge({
     runtimeHost: { connectBridgeRoute: async () => ({ installed: true, active: true, changed: false }) },
@@ -334,8 +337,12 @@ test("G3.17 External health mismatch fails without route restore", async () => {
   assert.equal(recovery.restores, 0);
 });
 
-test("G3.18 Direct health mismatch never connects a wrong-owner bridge", async () => {
-  const bed = startupSupervisor({ setupReads: [DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: externalHealth() });
+// S4D: canonical ownership is always provider, so a bridge that still
+// reports "direct" is a wrong-owner bridge and must fail closed before any
+// route connect. A legacy Direct config paired with provider health agrees
+// after normalization and starts cleanly.
+test("G3.18 direct-reporting bridge never connects a wrong-owner bridge", async () => {
+  const bed = startupSupervisor({ setupReads: [EXTERNAL_CONFIG], configReads: [EXTERNAL_CONFIG], health: directHealth() });
   const ownership = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
   let connects = 0;
   const context = runStartBridge({
@@ -356,6 +363,15 @@ test("G3.18 Direct health mismatch never connects a wrong-owner bridge", async (
     /ownership mismatch/,
   );
   assert.equal(connects, 0);
+  const legacy = startupSupervisor({ setupReads: [DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: externalHealth() });
+  const legacyOwnership = resolveOwnershipContext({ requestedMode: undefined, supervisor: legacy.supervisor, action: "runtime-startup" });
+  const legacyContext = runStartBridge({ runtimeSupervisor: legacy.supervisor });
+  const legacyStarted = await legacyContext.startConfiguredBridgeRuntime({
+    startupOwnership: legacyOwnership,
+    runtimeHost: legacyContext.runtimeHost,
+    runtimeSupervisor: legacyContext.runtimeSupervisor,
+  });
+  assert.equal(legacyStarted.runtime.status, "ready");
 });
 
 test("G3.19 External startup requires no direct Codex route", async () => {
@@ -427,14 +443,17 @@ test("G3.23 External to Direct flip fails with zero route calls", async () => {
   assert.equal(recovery.restores, 0);
 });
 
-test("G3.24 Direct to External flip fails before Direct connect", async () => {
+// S4D: raw config mode flips across the startup window no longer change
+// ownership (both normalize to provider), so startup succeeds with zero
+// route calls and recovery stays skipped without ownership drift.
+test("G3.24 raw mode flip across the window keeps provider ownership with zero route calls", async () => {
   const bed = startupSupervisor({
     setupReads: [DIRECT_CONFIG, EXTERNAL_CONFIG],
     configReads: [EXTERNAL_CONFIG],
     health: externalHealth(),
   });
   const ownership = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
-  assert.equal(ownership.integrationMode, "direct");
+  assert.equal(ownership.integrationMode, "external-provider");
   let connects = 0;
   const context = runStartBridge({
     runtimeHost: {
@@ -445,14 +464,12 @@ test("G3.24 Direct to External flip fails before Direct connect", async () => {
     },
     runtimeSupervisor: bed.supervisor,
   });
-  await assert.rejects(
-    context.startConfiguredBridgeRuntime({
-      startupOwnership: ownership,
-      runtimeHost: context.runtimeHost,
-      runtimeSupervisor: context.runtimeSupervisor,
-    }),
-    /changed|mismatch/,
-  );
+  const started = await context.startConfiguredBridgeRuntime({
+    startupOwnership: ownership,
+    runtimeHost: context.runtimeHost,
+    runtimeSupervisor: context.runtimeSupervisor,
+  });
+  assert.equal(started.runtime.status, "ready");
   assert.equal(connects, 0);
   const recovery = recoverContext({ supervisor: bed.supervisor, ownership });
   const recovered = await recovery.recoverStartupRoute({
@@ -461,7 +478,7 @@ test("G3.24 Direct to External flip fails before Direct connect", async () => {
     stateStore: {},
   });
   assert.equal(recovered.skipped, true);
-  assert.equal(recovered.ownershipChanged, true);
+  assert.equal(recovered.ownershipChanged, undefined);
   assert.equal(recovery.restores, 0);
 });
 
@@ -677,16 +694,17 @@ function loadUpgradePatch() {
   return context;
 }
 
-test("G3.1 pre External to post Direct rejects before start or connect", async () => {
+// S4D: raw External-to-Direct drift across the window normalizes to unchanged
+// provider ownership, so continuity passes; a bridge that still reports
+// "direct" is a wrong-owner bridge and fails closed before any connect.
+test("G3.1 pre External to post Direct keeps provider ownership and rejects a direct-reporting bridge", async () => {
   const bed = startupSupervisor({ setupReads: [EXTERNAL_CONFIG, DIRECT_CONFIG], configReads: [DIRECT_CONFIG], health: directHealth() });
   const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
   assert.equal(pre.integrationMode, "external-provider");
   const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
-  assert.equal(post.integrationMode, "direct");
-  assert.throws(
-    () => assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" }),
-    /changed while preparing runtime-startup/,
-  );
+  assert.equal(post.integrationMode, "external-provider");
+  const kept = assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "external-provider");
   let connects = 0;
   const context = runStartBridge({
     runtimeHost: {
@@ -697,37 +715,57 @@ test("G3.1 pre External to post Direct rejects before start or connect", async (
     },
     runtimeSupervisor: bed.supervisor,
   });
-  const unguarded = await context.startConfiguredBridgeRuntime({
-    startupOwnership: post,
-    runtimeHost: context.runtimeHost,
-    runtimeSupervisor: context.runtimeSupervisor,
-  });
-  assert.equal(unguarded.runtime.status, "ready");
-  assert.equal(connects, 1);
-  const recovery = recoverContext({ supervisor: bed.supervisor, ownership: pre });
-  const recovered = await recovery.recoverStartupRoute({
+  await assert.rejects(
+    context.startConfiguredBridgeRuntime({
+      startupOwnership: post,
+      runtimeHost: context.runtimeHost,
+      runtimeSupervisor: context.runtimeSupervisor,
+    }),
+    /ownership mismatch/,
+  );
+  assert.equal(connects, 0);
+  const recoveryAfterMismatch = recoverContext({ supervisor: bed.supervisor, ownership: pre });
+  const recoveredAfterMismatch = await recoveryAfterMismatch.recoverStartupRoute({
     startupOwnership: pre,
-    logger: recovery.logger,
+    logger: recoveryAfterMismatch.logger,
     stateStore: {},
   });
-  assert.equal(recovered.skipped, true);
-  assert.equal(recovery.restores, 0);
+  assert.equal(recoveredAfterMismatch.skipped, true);
+  assert.equal(recoveryAfterMismatch.restores, 0);
 });
 
-test("G3.2 pre Direct to post External rejects with zero route calls", async () => {
+// S4D: raw Direct-to-External drift across the window normalizes to unchanged
+// provider ownership, so continuity passes and startup succeeds with zero
+// route calls.
+test("G3.2 pre Direct to post External keeps provider ownership with zero route calls", async () => {
   const bed = startupSupervisor({
     setupReads: [DIRECT_CONFIG, EXTERNAL_CONFIG],
     configReads: [EXTERNAL_CONFIG],
     health: externalHealth(),
   });
   const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
-  assert.equal(pre.integrationMode, "direct");
+  assert.equal(pre.integrationMode, "external-provider");
   const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
   assert.equal(post.integrationMode, "external-provider");
-  assert.throws(
-    () => assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" }),
-    /changed while preparing runtime-startup/,
-  );
+  const kept = assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" });
+  assert.equal(kept.integrationMode, "external-provider");
+  let connects = 0;
+  const context = runStartBridge({
+    runtimeHost: {
+      connectBridgeRoute: async () => {
+        connects += 1;
+        return { installed: true, active: true, changed: true };
+      },
+    },
+    runtimeSupervisor: bed.supervisor,
+  });
+  const started = await context.startConfiguredBridgeRuntime({
+    startupOwnership: post,
+    runtimeHost: context.runtimeHost,
+    runtimeSupervisor: context.runtimeSupervisor,
+  });
+  assert.equal(started.runtime.status, "ready");
+  assert.equal(connects, 0);
   const recovery = recoverContext({ supervisor: bed.supervisor, ownership: pre });
   const recovered = await recovery.recoverStartupRoute({
     startupOwnership: pre,
@@ -735,7 +773,7 @@ test("G3.2 pre Direct to post External rejects with zero route calls", async () 
     stateStore: {},
   });
   assert.equal(recovered.skipped, true);
-  assert.equal(recovered.ownershipChanged, true);
+  assert.equal(recovered.ownershipChanged, undefined);
   assert.equal(recovery.restores, 0);
 });
 
@@ -781,12 +819,14 @@ test("G3.4 pre configured to post damaged rejects", async () => {
 
 test("G3.5-6 unchanged ownership passes continuity across the window", async () => {
   for (const config of [DIRECT_CONFIG, EXTERNAL_CONFIG]) {
-    const health = config.integrationMode === "direct" ? directHealth() : externalHealth();
+    // S4D: every raw config normalizes to provider ownership; the live bridge
+    // must report provider health to agree with canonical ownership.
+    const health = externalHealth();
     const bed = startupSupervisor({ setupReads: [config, { ...config }], configReads: [{ ...config }], health });
     const pre = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
     const post = resolveOwnershipContext({ requestedMode: undefined, supervisor: bed.supervisor, action: "runtime-startup" });
     const kept = assertOwnershipContinuity({ before: pre.expectation, after: post.expectation, action: "runtime-startup" });
-    assert.equal(kept.integrationMode, config.integrationMode);
+    assert.equal(kept.integrationMode, "external-provider");
     let connects = 0;
     const context = runStartBridge({
       runtimeHost: {
@@ -803,7 +843,7 @@ test("G3.5-6 unchanged ownership passes continuity across the window", async () 
       runtimeSupervisor: context.runtimeSupervisor,
     });
     assert.equal(started.runtime.status, "ready");
-    assert.equal(connects, config.integrationMode === "direct" ? 1 : 0);
+    assert.equal(connects, 0);
   }
 });
 
